@@ -300,8 +300,9 @@ struct _Cs:
         self.deleting = True
 
 
-def gaf_line(p: ImmPointer[UInt8, _], a: Alignment, nodes: NodeTable, mut out: List[UInt8]) raises:
-    """Appends the GAF line (with its newline) vg convert writes for alignment `a` of the message at `p`."""
+def gaf_line[tags: Bool = True](p: ImmPointer[UInt8, _], a: Alignment, nodes: NodeTable, mut out: List[UInt8]) raises:
+    """Appends the GAF line (with its newline) vg convert writes for alignment `a` of the message at `p`; with
+    `tags` false, its 12 columns alone (no cs, bq, AS or dv, and no node letters needed)."""
     put_bytes(out, p, a.name_at, a.name_length)
     if not a.has_path or len(a.mappings) == 0:
         # Unaligned: the read as one insertion, no place.
@@ -311,11 +312,12 @@ def gaf_line(p: ImmPointer[UInt8, _], a: Alignment, nodes: NodeTable, mut out: L
         put_int(out, a.sequence_length)
         put_text(out, "\t*\t*\t*\t*\t*\t*\t*\t")
         put_int(out, a.mapping_quality)
-        put_text(out, "\tcs:Z:+")
-        put_bytes(out, p, a.sequence_at, a.sequence_length)
+        comptime if tags:
+            put_text(out, "\tcs:Z:+")
+            put_bytes(out, p, a.sequence_at, a.sequence_length)
         out.append(UInt8(ord("\n")))
         return
-    if not nodes.has_letters():
+    if tags and not nodes.has_letters():
         raise Error("GAM: the node table has no letters, which cs needs")
     var n_maps = len(a.mappings)
     var final_mapping = n_maps - 1
@@ -343,19 +345,21 @@ def gaf_line(p: ImmPointer[UInt8, _], a: Alignment, nodes: NodeTable, mut out: L
                 skip_step = True
             else:
                 # A split mapping: the start of the node it arrives at is deleted.
-                var deleted_from = prev_offset if m.node == pm.node else 0
-                if start > deleted_from:
-                    cs.flush()
-                    cs.delete_mark()
-                    for k in range(deleted_from, start):
-                        cs.text.append(nodes.letter(m.node, m.reverse, k))
+                comptime if tags:
+                    var deleted_from = prev_offset if m.node == pm.node else 0
+                    if start > deleted_from:
+                        cs.flush()
+                        cs.delete_mark()
+                        for k in range(deleted_from, start):
+                            cs.text.append(nodes.letter(m.node, m.reverse, k))
         for j in range(m.first_edit, m.first_edit + m.edit_count):
             var e = a.edits[j]
             if _is_match(e):
                 matches += e.from_length
-                cs.matches += e.from_length
-                cs.deleting = False
-            else:
+                comptime if tags:
+                    cs.matches += e.from_length
+                    cs.deleting = False
+            elif tags:
                 cs.flush()
                 if _is_sub(e):
                     for k in range(e.from_length):
@@ -382,10 +386,11 @@ def gaf_line(p: ImmPointer[UInt8, _], a: Alignment, nodes: NodeTable, mut out: L
             ref nm = a.mappings[i + 1]
             if m.node != nm.node or m.reverse != nm.reverse:
                 # Hopping off the middle of a node: the rest of it is deleted.
-                cs.flush()
-                cs.delete_mark()
-                for k in range(offset, node_length):
-                    cs.text.append(nodes.letter(m.node, m.reverse, k))
+                comptime if tags:
+                    cs.flush()
+                    cs.delete_mark()
+                    for k in range(offset, node_length):
+                        cs.text.append(nodes.letter(m.node, m.reverse, k))
             else:
                 # A duplicate mapping of the same node: no step of its own.
                 skip_step = True
@@ -420,6 +425,9 @@ def gaf_line(p: ImmPointer[UInt8, _], a: Alignment, nodes: NodeTable, mut out: L
     put_int(out, max(path_end - path_start, query_length))
     out.append(UInt8(ord("\t")))
     put_int(out, a.mapping_quality)
+    comptime if not tags:
+        out.append(UInt8(ord("\n")))
+        return
     # The optional fields in key order (gafkluge writes its std::map): AS, bq, cs, dv.
     if a.score > 0:
         put_text(out, "\tAS:i:")

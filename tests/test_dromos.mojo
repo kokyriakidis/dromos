@@ -152,6 +152,10 @@ def test_gaf_line_as_vg_writes_it() raises:
     var want = _text("r1\t13\t0\t13\t+\t>1>2>3\t16\t0\t13\t12\t13\t60\tAS:i:9\tbq:Z:?????????????")
     want.extend(Span(_text("\tcs:Z::4*AT:8\tdv:f:0.0124\n")))
     assert_true(out == want)
+    # --slim: the 12 columns alone.
+    var slim = List[UInt8]()
+    gaf_line[False](msg.unsafe_ptr(), a, nodes, slim)
+    assert_true(slim == _text("r1\t13\t0\t13\t+\t>1>2>3\t16\t0\t13\t12\t13\t60\n"))
 
 
 def test_unaligned_line() raises:
