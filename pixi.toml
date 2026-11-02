@@ -1,0 +1,24 @@
+[workspace]
+authors = ["Konstantinos Kyriakidis <kkyriaki@ucsc.edu>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+description = "Pangenome graph alignments in Mojo: vg's GAM read at the speed of the disk and written as GAF"
+name = "dromos"
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+version = "0.1.0"
+license = "MIT"
+license-file = "LICENSE"
+
+[dependencies]
+# The nightly karan, sporos and plegma build with, so they link into one program. Move it on purpose, rebuild and test.
+mojo = "==1.2.0.dev2026102005"
+libdeflate = ">=1.26,<2"
+
+[tasks]
+# `mojo build -o` writes into a directory but will not create one.
+prepare = "mkdir -p build"
+build = { cmd = "mojo build -I . cli/dromos_cli.mojo -o build/dromos", depends-on = ["prepare"] }
+build-tests = { cmd = "mojo build -I . tests/test_dromos.mojo -o build/test_dromos", depends-on = ["prepare"] }
+test = { cmd = "./build/test_dromos", depends-on = ["build-tests"] }
+format = "mojo format -l 120 dromos cli tests"
+# Pulls the latest Mojo skills from github.com/modular/skills into .claude/skills for coding agents.
+sync-skills = "bash .claude/sync-skills.sh"
