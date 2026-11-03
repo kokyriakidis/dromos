@@ -5,7 +5,6 @@ letters, and each node the contig's path visits once, with where and whether rev
 The contig's paths (fragments) are laid end to end in the order of their offsets (then of their paths), each step at
 its placement's start; bases no fragment covers are N, and the contig is as long as its farthest fragment end."""
 
-from dromos.linearize import upper
 from dromos.nodes import NodeTable, comp
 from dromos.parallel import ParallelTask, parallel_for
 from dromos.refmap import ContigPath, RefMap

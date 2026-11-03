@@ -15,7 +15,7 @@ from std.os import getenv
 from std.sys import stderr
 from std.time import perf_counter_ns
 
-from dromos.bam import BamIndex, FIXED, get32, get_signed32, record_end
+from dromos.bam import BamIndex, get32, get_signed32, record_end
 from dromos.bgzf import BLOCK, Deflater, load_libdeflate, load_zstd, zstd_compress_with, zstd_decompress_with
 from dromos.output import OutFile, errno
 from dromos.parallel import Background, ParallelTask, parallel_for

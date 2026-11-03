@@ -1,14 +1,16 @@
-"""`dromos surject`: reads' graph alignments as alignments to one reference contig (SAM), the records `pgcatalog
-surject` writes for them, in the input's order (pgcatalog's surject.rs `surject_line` and `run`, ported line for
-line; linearize.mojo ports the alignment it makes of each read).
+"""`dromos surject`: reads' graph alignments as alignments to the reference contigs, the records `pgcatalog surject`
+writes for them (pgcatalog's surject.rs `surject_line` and `run`, ported line for line; linearize.mojo ports the
+alignment it makes of each read), every contig in one pass: as SAM in the input's order, or as BAM records for the
+sort (bam_sort.mojo).
 
 Each read is rebuilt from its GAF line: the walk's node letters and the `cs` string (qualities from `bq`). A read
-base aligned to a node the contig visits once takes that node's position; the read's orientation is that of most such
+base aligned to a node a contig visits once takes that node's position; the read's orientation is that of most such
 bases, and its placed stretches (blocks) are linearized. Each end is then clipped where the read diverges from its
-own graph alignment. Reads with no base placed on the contig are left out.
+own graph alignment. A read gets a record on each contig it places a base on, the record that contig's own run makes;
+reads with no base placed on any are left out.
 
 A GAM's alignments are first written as the GAF lines `vg convert -G` writes (gam.mojo's `gaf_line`), so a GAM and
-its GAF give the same records; an alignment none of whose nodes the contig visits once has no record and is passed
+its GAF give the same records; an alignment none of whose nodes a contig visits once has no record and is passed
 over from its slim decode."""
 
 from std.atomic import Atomic
