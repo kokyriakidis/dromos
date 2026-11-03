@@ -15,7 +15,7 @@ from dromos.bgzf import BLOCK, Deflater, eof_block, load_libdeflate
 from dromos.parallel import ParallelTask, parallel_for
 from dromos.staging import Rec, Slot, Staging
 from dromos.stream import imm_untracked, mut_untracked
-from dromos.tabix import TbiBuilder
+from dromos.tabix import BlockIndex, TbiBuilder
 
 comptime BLOCKS_PER_TASK = 16
 
@@ -26,7 +26,7 @@ def write_sorted(mut staging: Staging, max_span: List[Int], out_path: String, le
     var t0 = Int(perf_counter_ns())
     var order = staging.order()
     var lib = load_libdeflate()
-    var w = IndexWriter(out_path, level)
+    var w = IndexWriter(out_path, level, TbiBuilder(staging.names.copy()), ".tbi")
     # The longest alignment on each contig, for pgphase: a site whose every allele spans more graph bases cannot
     # be traversed whole by any read. Every contig is listed, 0 for one without alignments.
     var header = String()
@@ -137,18 +137,18 @@ def write_sorted(mut staging: Staging, max_span: List[Int], out_path: String, le
                 var stream_end = w.text_base[x] + slots[x][k].at
                 for rec in slots[x][k].recs:
                     stream_end += rec.out_len
-                    w.pending.append(_Tab(contig, rec.start, rec.end, stream_end))
+                    w.pending.append(Tab(contig, rec.start, rec.end, stream_end))
                 slots[x][k].raw = List[UInt8]()
                 slots[x][k].recs = List[Rec]()
         if deflates > 0:
             w.addressed(dw % 2, deflates, w.text_base[dw % 2] + deflate_len)
-            w.index_written(staging.names)
+            w.index_written()
         step_ns += s2 - s1
         serial_ns += (s1 - s0) + (Int(perf_counter_ns()) - s2)
     # The last window's partial block (or the header alone), then the end.
     var last = (windows - 1) % 2 if windows > 0 else 0
     w.finish_tail(lib, last, end)
-    w.index_written(staging.names)
+    w.index_written()
     w.close(lib)
     var t1 = Int(perf_counter_ns())
     if Bool(getenv("DROMOS_TIMING")):
@@ -162,7 +162,7 @@ def write_sorted(mut staging: Staging, max_span: List[Int], out_path: String, le
 
 
 @fieldwise_init
-struct _Tab(TrivialRegisterPassable):
+struct Tab(TrivialRegisterPassable):
     """A line written, waiting for the block holding its end: its contig, interval, and its end in the stream."""
 
     var contig: Int
@@ -171,7 +171,7 @@ struct _Tab(TrivialRegisterPassable):
     var stream_end: Int
 
 
-struct IndexWriter(Movable):
+struct IndexWriter[Ix: BlockIndex](Movable):
     """The BGZF output, cut into blocks of exactly BLOCK bytes, so the virtual offset of any byte follows from its
     stream offset and the blocks' addresses (pgcat's IndexedWriter): lines are indexed once the block holding their
     end has its address."""
@@ -192,11 +192,12 @@ struct IndexWriter(Movable):
     """The compressed bytes of those blocks: the address of the next block."""
     var addrs: List[Int]
     """Every block's address, by block number."""
-    var pending: List[_Tab]
+    var pending: List[Tab]
     var head: Int
-    var index: TbiBuilder
+    var index: Self.Ix
+    var index_suffix: String
 
-    def __init__(out self, path: String, level: Int) raises:
+    def __init__(out self, path: String, level: Int, var index: Self.Ix, index_suffix: String) raises:
         self.path = path
         self.tmp = path + ".tmp"
         self.file = open(self.tmp, "w")
@@ -207,9 +208,10 @@ struct IndexWriter(Movable):
         self.base = 0
         self.written = 0
         self.addrs = List[Int]()
-        self.pending = List[_Tab]()
+        self.pending = List[Tab]()
         self.head = 0
-        self.index = TbiBuilder()
+        self.index = index^
+        self.index_suffix = index_suffix
 
     def header(mut self, text: String) raises:
         """Header lines (each starting with '#', with its newline), before any line: tabix skips them, and the index
@@ -219,6 +221,30 @@ struct IndexWriter(Movable):
             raise Error("header longer than a BGZF block")
         # Block 0 starts at address 0: the first line starts at (0, length).
         self.index.set_first_offset(len(self.texts[0]))
+
+    def header_bytes(mut self, lib: OwnedDLHandle, data: Span[UInt8, _]) raises -> Int:
+        """A binary header before any record, of any length: its whole blocks deflated and written now, the rest
+        kept for the first window; the index starts after it. Returns its length, the stream offset records start
+        at."""
+        var whole = len(data) // BLOCK * BLOCK
+        if whole > 0:
+            self.outs[0].clear()
+            self.outs[0].append(List[UInt8]())
+            var d = Deflater(lib, self.level)
+            var at = 0
+            while at < whole:
+                d.block(lib, data.unsafe_ptr().unsafe_offset(at), BLOCK, self.outs[0][0])
+                at += BLOCK
+            d.free(lib)
+            self.file.write_bytes(Span(self.outs[0][0]))
+            self.addressed(0, 1, whole)
+            self.outs[0].clear()
+        self.texts[0].clear()
+        self.texts[0].extend(data[whole:])
+        self.text_base[0] = whole
+        # The next block's address is the bytes written so far: the first record starts in it.
+        self.index.set_first_offset(self.written << 16 | (len(data) - whole))
+        return len(data)
 
     def addressed(mut self, x: Int, outputs: Int, through: Int):
         """The blocks in output set `x`'s first `outputs` outputs, deflated from the stream up to `through`, get
@@ -253,13 +279,13 @@ struct IndexWriter(Movable):
             return self.written << 16
         return self.addrs[s // BLOCK] << 16 | (s % BLOCK)
 
-    def index_written(mut self, contigs: List[String]) raises:
+    def index_written(mut self) raises:
         """Indexes the lines whose ends lie in blocks with addresses."""
         while self.head < len(self.pending):
             var t = self.pending[self.head]
             if t.stream_end > self.base:
                 break
-            self.index.push(t.contig, contigs[t.contig], t.beg, t.end, self._voffset(t.stream_end))
+            self.index.push(t.contig, t.beg, t.end, self._voffset(t.stream_end))
             self.head += 1
         if self.head == len(self.pending):
             self.pending.clear()
@@ -273,10 +299,10 @@ struct IndexWriter(Movable):
         self.file.write_bytes(Span(eof))
         self.file.close()
         self.index.finish(final_offset)
-        var tbi = self.path + ".tbi"
-        self.index.write(lib, tbi + ".tmp")
+        var index_path = self.path + self.index_suffix
+        self.index.write(lib, index_path + ".tmp")
         _rename(self.tmp, self.path)
-        _rename(tbi + ".tmp", tbi)
+        _rename(index_path + ".tmp", index_path)
 
 
 def _rename(src: String, dst: String) raises:
