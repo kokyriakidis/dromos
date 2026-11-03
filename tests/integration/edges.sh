@@ -87,7 +87,10 @@ head -c 30000 g.gaf.bgz > cut.gaf.bgz; fails "a BGZF GAF cut short" $D index $M 
 python3 -c "
 d = bytearray(open('g.gaf.bgz','rb').read()); d[5000] ^= 0xFF; open('bad.gaf.bgz','wb').write(d)"
 fails "a BGZF GAF with a flipped byte" $D index $M bad.gaf.bgz x.gz
-cp a.gaf a.gam; fails "a GAF named as a GAM" $D index $M a.gam x.gz
+cp a.gaf a.gam; rm -f n.gz* o.gz*; $D index -l 0 $M a.gam n.gz 2>/dev/null; $D index -l 0 --gaf $M a.gaf o.gz 2>/dev/null
+cmp -s n.gz o.gz && echo "ok    a GAF named as a GAM is read as a GAF" || echo "FAIL  a GAF named as a GAM"
+fails "a GAF given --gam" $D index --gam $M a.gaf x.gz
+fails "gam-to-gaf given a GAF" $D gam-to-gaf $NODES a.gaf
 fails "a missing input" $D index $M /nonexistent.gam x.gz
 fails "an unwritable output" $D index $M $SMALL_GAM /proc/nope/x.gz
 fails "a node table that is not one" $D gam-to-gaf $SMALL_GAF $SMALL_GAM

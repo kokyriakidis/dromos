@@ -54,6 +54,17 @@ same_index "index: the slice's GAF, gzip" "$WORK/d.gzip.gz" "$WORK/ref.slice.gz"
 same_index "index: the slice's GAF, BGZF" "$WORK/d.bgzf.gz" "$WORK/ref.slice.gz"
 "$DROMOS" index -l 0 --gaf "$REFMAP" - "$WORK/d.stdin.gz" < "$SLICE_SLIM" 2> /dev/null
 same_index "index: the slice's GAF, stdin" "$WORK/d.stdin.gz" "$WORK/ref.slice.gz"
+# The kind told from the bytes, not the name or a flag: a GAF named .gam, gzip named .gam, and on stdin.
+ln -sf "$SLICE_SLIM" "$WORK/slice-gaf.gam"
+"$DROMOS" index -l 0 "$REFMAP" "$WORK/slice-gaf.gam" "$WORK/d.named.gz" 2> /dev/null
+same_index "index: a GAF named .gam, told by its bytes" "$WORK/d.named.gz" "$WORK/ref.slice.gz"
+ln -sf "$WORK/slice.gaf.gz" "$WORK/slice-gz.gam"
+"$DROMOS" index -l 0 "$REFMAP" "$WORK/slice-gz.gam" "$WORK/d.namedgz.gz" 2> /dev/null
+same_index "index: a gzip GAF named .gam, told by its bytes" "$WORK/d.namedgz.gz" "$WORK/ref.slice.gz"
+"$DROMOS" index -l 0 "$REFMAP" - "$WORK/d.stdin2.gz" < "$SLICE_SLIM" 2> /dev/null
+same_index "index: a GAF on stdin, told by its bytes" "$WORK/d.stdin2.gz" "$WORK/ref.slice.gz"
+"$DROMOS" index -l 0 "$REFMAP" - "$WORK/d.gamstdin.gz" < "$SLICE_GAM" 2> /dev/null
+same_index "index: a GAM on stdin, told by its bytes" "$WORK/d.gamstdin.gz" "$WORK/ref.slice.gz"
 
 # index from vg's full GAF (its tags dropped), and from edge cases: tags kept and dropped, CRLF, empty and comment
 # lines, names starting with @, a short line, no final newline.

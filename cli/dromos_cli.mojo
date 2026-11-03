@@ -8,7 +8,7 @@ from dromos.index import IndexSink
 from dromos.nodes import NodeTable
 from dromos.parallel import default_threads
 from dromos.refmap import RefMap
-from dromos.stream import stream_gaf, stream_gam
+from dromos.stream import AUTO, GAF, GAM, stream_input
 
 comptime OVERVIEW = """dromos: pangenome graph alignments, fast
 
@@ -18,18 +18,18 @@ comptime OVERVIEW = """dromos: pangenome graph alignments, fast
 dromos COMMAND -h shows a command's usage. DROMOS_TIMING=1 reports where the time goes, on stderr.
 """
 
-comptime INDEX_USAGE = """dromos index [-t THREADS] [-l LEVEL] [--gaf] REFMAP IN OUT
+comptime INDEX_USAGE = """dromos index [-t THREADS] [-l LEVEL] [--gaf | --gam] REFMAP IN OUT
 
 IN's alignments placed on the reference, sorted, bgzipped and tabix-indexed as pgphase reads them: OUT and OUT.tbi,
 the files pgcat index-gaf --slim writes from the same alignments as GAF.
 
   REFMAP      the graph's reference map (pgcat ref-map)
-  IN          a GAM, or a GAF (plain, gzip or BGZF) when named *.gaf, *.gaf.gz, *.gaf.bgz or given --gaf;
-              - reads stdin
+  IN          a GAM, or a GAF (plain, gzip or BGZF), told apart by their first bytes; - reads stdin
   -t THREADS  threads [the machine's cores]
   -l LEVEL    BGZF compression level, 0-12 [1]: 1 deflates about 3 times as fast as 6 into a file 40% larger
               (as large as pgcat's, zlib at 6); 6 for a file to keep
-  --gaf       IN is a GAF, whatever its name
+  --gaf       IN is a GAF (not told from its bytes)
+  --gam       IN is a GAM (not told from its bytes)
 """
 
 comptime GAM_TO_GAF_USAGE = """dromos gam-to-gaf [-t THREADS] [--slim] NODES GAM
@@ -63,14 +63,6 @@ def _number(text: String, option: String, low: Int, high: Int, command: StaticSt
 
 def _input(path: String) -> String:
     return String("/dev/stdin") if path == "-" else path
-
-
-def _gaf_name(path: String) -> Bool:
-    """Whether `path` is named as a GAF."""
-    for suffix in [".gaf", ".gaf.gz", ".gaf.bgz", ".gaf.bgzf"]:
-        if path.endswith(suffix):
-            return True
-    return False
 
 
 struct _Args(Movable):
@@ -134,10 +126,12 @@ def index_main() raises:
     var level_arg = args.value("-l")
     var level = _number(level_arg.value(), "-l", 0, 12, "index") if level_arg else 1
     var gaf = args.flag("--gaf")
+    var gam = args.flag("--gam")
+    if gaf and gam:
+        _fail("--gaf or --gam, not both", "index")
     var pos = args.positional(3)
     var t0 = perf_counter_ns()
-    var lines = gaf or _gaf_name(pos[1])
-    var sink = IndexSink(RefMap(pos[0]), threads, lines)
+    var sink = IndexSink(RefMap(pos[0]), threads)
     print(
         (
             t"[dromos] reference map loaded: {len(sink.map.contigs)} contigs of {sink.map.sample}"
@@ -145,10 +139,7 @@ def index_main() raises:
         ),
         file=stderr,
     )
-    if lines:
-        stream_gaf(_input(pos[1]), threads, sink)
-    else:
-        stream_gam(_input(pos[1]), threads, sink)
+    stream_input(_input(pos[1]), threads, sink, GAF if gaf else (GAM if gam else AUTO))
     sink.finish(pos[2], level, threads)
 
 
@@ -163,13 +154,13 @@ def gam_to_gaf_main() raises:
     if slim:
         var sink = GafSink[False](NodeTable(pos[0]), threads)
         try:
-            stream_gam(_input(pos[1]), threads, sink)
+            stream_input(_input(pos[1]), threads, sink, AUTO)
         finally:
             sink.finish()
     else:
         var sink = GafSink[True](NodeTable(pos[0]), threads)
         try:
-            stream_gam(_input(pos[1]), threads, sink)
+            stream_input(_input(pos[1]), threads, sink, AUTO)
         finally:
             sink.finish()
 

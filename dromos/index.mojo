@@ -71,7 +71,7 @@ struct IndexSink(MessageSink, Movable):
     var lines: Bool
     """Whether the messages are a GAF's lines (else a GAM's alignments)."""
 
-    def __init__(out self, var map: RefMap, threads: Int, lines: Bool = False) raises:
+    def __init__(out self, var map: RefMap, threads: Int) raises:
         var n = len(map.contigs)
         # Output order is by contig name (bytes), then position, then the line itself.
         self.by_rank = List[Int](capacity=n)
@@ -94,6 +94,9 @@ struct IndexSink(MessageSink, Movable):
         self.staging = Staging(names^, threads)
         self.gatherers = threads
         self.gathering = False
+        self.lines = False
+
+    def begin(mut self, lines: Bool) raises:
         self.lines = lines
 
     def slices(self) -> Int:

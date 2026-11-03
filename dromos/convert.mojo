@@ -31,6 +31,10 @@ struct GafSink[tags: Bool](MessageSink, Movable):
         var header = "@HD\tVN:Z:1.0\n".as_bytes()
         write_all(1, header.unsafe_ptr(), len(header))
 
+    def begin(mut self, lines: Bool) raises:
+        if lines:
+            raise Error("a GAF, not a GAM (gam-to-gaf reads a GAM)")
+
     def slices(self) -> Int:
         return len(self.texts)
 

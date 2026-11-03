@@ -1,48 +1,113 @@
 # dromos
 
-Pangenome graph alignments in Mojo, read as fast as the disk delivers them.
+**Pangenome graph alignments, read as fast as the disk delivers them.**
 
-- `dromos index` turns vg's GAM, or a GAF, into pgphase's index in one pass: each alignment placed on the reference,
-  sorted, bgzipped and tabix-indexed. It writes the same file `pgcat index-gaf --slim` writes from the same
-  alignments as GAF, with no pipe and no second process. A GAF may be plain, gzip or BGZF, or come on stdin (`-`).
-- `dromos gam-to-gaf` writes the GAF lines `vg convert -G` writes for a GAM, in the input's order.
+dromos reads [vg](https://github.com/vgteam/vg)'s graph alignments, GAM or GAF, and turns them into what downstream
+tools need, in one pass over the file, on every core. It is written in [Mojo](https://www.modular.com/mojo) and is
+the indexing engine behind [pgphase](https://github.com/kokyriakidis/pgphase) (`pgphase index`).
+
+| Command | What it writes |
+|---|---|
+| `dromos index` | the alignments placed on the reference, sorted, bgzipped and tabix-indexed: the index pgphase reads |
+| `dromos gam-to-gaf` | a GAM as the GAF lines `vg convert -G` writes, in the GAM's order |
+
+## Speed
+
+HG002 PacBio HiFi on the HPRC v2.1 Minigraph-Cactus graph (a 155 GB GAM, 12.8 million alignments), on one 10-core
+workstation (Intel i9-7900X, NVMe):
+
+| From the GAM to pgphase's index | Wall time |
+|---|---|
+| `vg convert -G`, then `pgcat index-gaf` (before dromos) | about 2 h 50 min |
+| `dromos gam-to-gaf --slim \| pgcat index-gaf` | 412 s |
+| **`dromos index`** | **196 s**, in about 16 GB of memory |
+
+Inflating vg's DEFLATE is half the work. It runs at about 870 MB/s of output per core with
+[libdeflate](https://github.com/ebiggers/libdeflate), as fast as DEFLATE decoders go. A 10 GB GAF indexes in under
+5 s, about the speed of the disk.
+
+## Install
+
+dromos builds with [pixi](https://pixi.sh), which fetches the pinned Mojo toolchain and libraries:
 
 ```sh
-pgcat ref-map --graph graph.gbz --out graph.refmap         # once per graph: where each node lies on the reference
-pgcat node-table --graph graph.gbz --out graph.nodes       # once per graph, for gam-to-gaf: node lengths and letters
-pixi run build                                             # then ./build/dromos COMMAND -h for each command
-pixi run ./build/dromos index -t 16 graph.refmap reads.gam reads.coord.gaf.gz      # and reads.coord.gaf.gz.tbi
-pixi run ./build/dromos index -t 16 graph.refmap reads.gaf.gz reads.coord.gaf.gz   # a GAF: *.gaf[.gz|.bgz] or --gaf
-vg giraffe ... -o gaf | pixi run ./build/dromos index --gaf graph.refmap - reads.coord.gaf.gz
-pixi run ./build/dromos gam-to-gaf -t 16 graph.nodes reads.gam > reads.gaf
+git clone https://github.com/kokyriakidis/dromos && cd dromos
+pixi run build          # build/dromos
+pixi run test           # unit tests
 ```
 
-## How
+It is built and tested on Linux x86-64.
 
-- **BGZF, block-parallel.** The GAM is read 64 MiB at a time; each chunk's blocks inflate in parallel with libdeflate,
-  every block's CRC32 checked (after sporos).
-- **GAM groups framed, messages decoded on every thread.** A group is a varint count, the `GAM` tag and its messages;
-  each `vg.Alignment` is decoded by a small protobuf reader and written as GAF by a port of libvgio's
-  `alignment_to_gaf`, each thread its slice of the chunk, the slices written in order.
-- **No graph in memory.** GAF needs each node's length (and, for cs, its letters): a flat node table, written once per
-  graph by `pgcat node-table`, stands in for the GBZ. The index needs where each node lies on the reference, and the
-  node lengths, which pgcat's reference map holds.
-- **GAF too.** A GAF's lines are framed as a GAM's messages are, then classified and kept slim as pgcat does (its
-  12 columns, and its rq/pu/rs tags). BGZF inflates in parallel and plain text is copied in parallel; gzip that is
-  not BGZF is one stream, inflated by zlib on one thread of each step.
-- **One pass to the index.** Each alignment's 12 GAF columns are laid out and placed on the reference as pgcat places
-  them (a port of its rule), on every thread. Placed lines gather by 1 Mb bucket of the reference, compressed by
-  zstd a megabyte at a time beside the GAM's own tasks. Then a window of buckets at a time is inflated and sorted,
-  a bucket per thread, and its blocks deflated in parallel (libdeflate) and written in order, cut at exactly
-  0xff00 bytes as pgcat cuts them, the tabix index built as they go (a port of htslib's rules, via pgcat).
+## Usage
 
-## Checked
+Each command reads a file that pgcatalog (pgphase's graph tool, `tools/pgcatalog` in
+[pgphase](https://github.com/kokyriakidis/pgphase)) writes once per graph, so dromos never loads the graph itself:
 
-On HG002 HiFi alignments to the HPRC v2.1 Minigraph-Cactus graph (vg 1.70.0):
+```sh
+pgcatalog ref-map --graph graph.gbz --reference-sample CHM13 --out graph.refmap   # for index
+pgcatalog node-table --graph graph.gbz --out graph.nodes                         # for gam-to-gaf
+```
 
-- `gam-to-gaf`: the same lines as `vg convert -G`.
-- `index`: at level 0 (stored blocks) the same file as `pgcat index-gaf --slim --ref-map --level 0` byte for byte, and
-  a .tbi of the same content, from the GAM and from its GAF (plain, gzip, BGZF, stdin; vg's full GAF with its tags;
-  comments, CRLF, short lines, a last line without a newline); at other levels the same decompressed content and the same tabix queries. The default,
-  level 1, deflates about 3 times as fast as level 6 into a file the size of pgcat's (zlib at 6); at `-l 6`
-  libdeflate makes it about 30% smaller than pgcat's.
+### `dromos index`
+
+```sh
+dromos index graph.refmap reads.gam reads.coord.gaf.gz       # writes reads.coord.gaf.gz and its .tbi
+dromos index graph.refmap reads.gaf.gz reads.coord.gaf.gz    # a GAF: plain, gzip or bgzip
+vg giraffe ... -o gaf | dromos index graph.refmap - reads.coord.gaf.gz    # straight from the aligner
+```
+
+- **Any input.** A GAM, or a GAF that is plain, gzip or bgzip, told apart by its first bytes; `--gam` or `--gaf`
+  says which. `-` reads stdin. BGZF is read in parallel. Gzip that is not BGZF is a single stream and is read on
+  one thread, so bgzip a large GAF.
+- **What it writes.** Each alignment is placed on the reference by the nodes of its walk that lie on the reference
+  sample's paths, and written as `contig  start  end  <its 12 GAF columns>` (1-based, inclusive; the tags `rq`, `pu`
+  and `rs` are kept), sorted, bgzipped and tabix-indexed. Header lines `#max_span <contig> <bases>` give the longest
+  alignment on each contig. Unmapped alignments, and those with no unique place on the reference, are left out and
+  counted by reason.
+- **Options.** `-t THREADS` (all cores); `-l LEVEL`, the BGZF level, 0 to 12. The default, 1, writes about three
+  times as fast as 6, into a file 40% larger.
+
+### `dromos gam-to-gaf`
+
+```sh
+dromos gam-to-gaf graph.nodes reads.gam > reads.gaf     # the lines vg convert -G writes
+dromos gam-to-gaf --slim graph.nodes reads.gam          # their 12 columns alone
+```
+
+`dromos COMMAND -h` lists each command's options. `DROMOS_TIMING=1` reports where the time goes.
+
+## How it works
+
+- **Read once, straight from the disk.** The input is read with O_DIRECT, several requests at a time, 64 MiB per
+  chunk. Through the page cache, a file larger than memory reads at a fifth of the NVMe's speed.
+- **One pipeline, every core busy.** Each step reads the chunk after next, inflates the next chunk's BGZF blocks
+  (checking every CRC), and hands slices of the current chunk to the command, all at once.
+- **A GAM decoded only as far as needed.** A small protobuf reader frames GAM groups, resuming inside a group across
+  chunks. For the index it sums each mapping's edits as it reads them. GAF lines follow libvgio's
+  `alignment_to_gaf` line for line.
+- **No graph in memory.** The reference map and node table are memory-mapped, so their pages load as they are used.
+- **Sorted without spilling.** Placed alignments gather by megabase of the reference, compressed with zstd as they
+  arrive. At the end, windows of buckets are sorted, laid out, deflated and written in a three-deep pipeline, with
+  the tabix index built as each block's address becomes known.
+
+## Correctness
+
+dromos is checked byte for byte against the tools it replaces, on HG002 HiFi alignments to the HPRC graph:
+
+- `gam-to-gaf` writes the same lines as `vg convert -G` (vg 1.70.0).
+- `index` writes, at `-l 0`, the same file and `.tbi` as pgphase's previous indexer (`pgcat index-gaf --slim`),
+  from the GAM and from its GAF in every encoding. At other levels it writes the same decompressed content, with the
+  same answer to every tabix query. The whole-genome index matches the previous one record for record.
+- `tests/integration/edges.sh` covers odd and damaged inputs: empty files, multi-member gzip, lines across chunk
+  boundaries, any thread count, stdin, and truncated or corrupt files, which fail instead of leaving a partial
+  index.
+
+```sh
+pixi run check ENV_FILE [--full]        # end-to-end checks; ENV_FILE names the data (see tests/integration/check.sh)
+tests/integration/edges.sh ENV_FILE     # odd and damaged inputs
+```
+
+## License
+
+MIT; see [`LICENSE`](LICENSE). At run time dromos loads [libdeflate](https://github.com/ebiggers/libdeflate) (MIT),
+[zstd](https://github.com/facebook/zstd) (BSD-3-Clause) and [zlib](https://zlib.net) (zlib licence).

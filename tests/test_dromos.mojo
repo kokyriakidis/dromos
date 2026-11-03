@@ -8,6 +8,8 @@ from dromos.gam import Alignment, Framer, frame, gaf_line, slim_line, varint
 from dromos.nodes import NodeTable
 from dromos.gaf_text import MALFORMED, PLACED, SKIP, UNMAPPED, append_slim, classify
 from dromos.output import decimal_digits
+from dromos.bgzf import load_libdeflate
+from dromos.stream import BGZF, GZIP, PLAIN, looks_like_gaf
 from dromos.refmap import AMBIGUOUS, INCONSISTENT, MISSING_NODE, NO_ANCHOR, Anchor, Placed, RefMap
 from dromos.tabix import N_BINS, bin_level, bin_parent, reg2bin
 
@@ -332,6 +334,25 @@ def test_slim_keeps_columns_and_pgphase_tags() raises:
     var short = _text("a\tb\t")
     append_slim(out, short.unsafe_ptr(), len(short))
     assert_true(out == _text("a\tb\t"))
+
+
+def test_gam_told_from_gaf() raises:
+    var lib = load_libdeflate()
+    var gaf = _text("r1\t20\t0\t20\t+\t>1\t25\t2\t22\t20\t20\t60\n")
+    assert_true(looks_like_gaf(lib, Span(gaf), PLAIN, "t"))
+    assert_true(looks_like_gaf(lib, Span(_text("@HD\tVN:Z:1.0\n")), PLAIN, "t"))
+    assert_true(looks_like_gaf(lib, Span(List[UInt8]()), PLAIN, "t"))
+    assert_true(looks_like_gaf(lib, Span(gaf), GZIP, "t"))
+    # A GAM group: count, the tag's length, GAM, then a message.
+    var gam = List[UInt8]()
+    _varint(gam, 2)
+    _varint(gam, 3)
+    gam.extend(Span(_text("GAM")))
+    _varint(gam, 3)
+    gam.extend(Span(_text("abc")))
+    assert_true(not looks_like_gaf(lib, Span(gam), PLAIN, "t"))
+    # Text without a tab on its first line is no GAF either.
+    assert_true(not looks_like_gaf(lib, Span(_text("just words\n")), PLAIN, "t"))
 
 
 def main() raises:

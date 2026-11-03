@@ -31,6 +31,10 @@ from dromos.parallel import ParallelTask, parallel_for
 trait MessageSink:
     """What a GAM's messages become."""
 
+    def begin(mut self, lines: Bool) raises:
+        """Told, before any message, what the messages are: a GAF's lines (pieces of them), or a GAM's alignments."""
+        ...
+
     def slices(self) -> Int:
         """How many slices of a chunk's messages the sink takes at once (each with state of its own)."""
         ...
@@ -289,19 +293,62 @@ def frame_lines(data: Span[UInt8, _], mut messages: List[Int], final: Bool, piec
     return used
 
 
+comptime AUTO = 0
+"""The input's kind told from its first bytes (`looks_like_gaf`)."""
+comptime GAM = 1
+comptime GAF = 2
+
+
+def looks_like_gaf(lib: OwnedDLHandle, head: Span[UInt8, _], mode: Int, path: String) raises -> Bool:
+    """Whether a file starting with `head` (`mode` its encoding) is a GAF rather than a GAM: its first line (of the
+    first non-empty BGZF block, when BGZF) is text with a tab in it. A GAM starts with a group's varint count and
+    type tag, bytes no text has; empty input counts as a GAF with no lines. Gzip that is not BGZF is a GAF (vg writes
+    GAM as BGZF)."""
+    if mode == GZIP:
+        return True
+    var text = List[UInt8]()
+    if mode == PLAIN:
+        text.extend(head)
+    else:
+        var blocks = List[Int]()
+        _ = scan_blocks(head, 0, blocks, path)
+        for b in range(len(blocks) // 4):
+            var size = blocks[4 * b + 3]
+            if size == 0:
+                continue
+            text.resize(unsafe_uninit_length=size)
+            if not inflate_blocks(
+                lib, head.unsafe_ptr().as_imm(), blocks.unsafe_ptr().as_imm(), text.unsafe_ptr(), b, b + 1
+            ):
+                raise Error(t"{path}: does not inflate (corrupt, or not what it is named)")
+            break
+    if len(text) == 0:
+        return True
+    var tab = False
+    for c in text:
+        if c == UInt8(ord("\n")):
+            break
+        if c == UInt8(ord("\t")):
+            tab = True
+        elif c < 0x20 or c == 0x7F:
+            return False
+    return tab
+
+
 def stream_gam[S: MessageSink](gam_path: String, threads: Int, mut sink: S) raises:
     """Hands every message of the GAM at `gam_path`, in order, to `sink`."""
-    stream_input[lines=False](gam_path, threads, sink)
+    stream_input(gam_path, threads, sink, GAM)
 
 
 def stream_gaf[S: MessageSink](gaf_path: String, threads: Int, mut sink: S) raises:
     """Hands every line of the GAF at `gaf_path` (plain, gzip or BGZF), in order, to `sink`: each message is a piece
     of whole lines (`frame_lines`), its lines the sink's to find."""
-    stream_input[lines=True](gaf_path, threads, sink)
+    stream_input(gaf_path, threads, sink, GAF)
 
 
-def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mut sink: S) raises:
-    """`stream_gam`, or with `lines` `stream_gaf`."""
+def stream_input[S: MessageSink](path: String, threads: Int, mut sink: S, kind: Int) raises:
+    """Hands every message of the GAM or GAF at `path` to `sink`, in order: `kind` GAM, GAF, or AUTO to tell which
+    from the first bytes (`looks_like_gaf`); the sink is told which first (`MessageSink.begin`)."""
     var file = RawFile(path, direct=True)
     var lib = load_libdeflate()
     var zlib = load_zlib()
@@ -329,9 +376,13 @@ def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mu
         raise Error(t"cannot read {path}")
     raws[r].hi = raws[r].start + n0
     var mode = encoding(Span(raws[r].buf)[raws[r].lo : raws[r].hi])
-    comptime what = "a GAF line" if lines else "a GAM message"
+    var lines = kind == GAF or (
+        kind == AUTO and looks_like_gaf(lib, Span(raws[r].buf)[raws[r].lo : raws[r].hi], mode, path)
+    )
+    var what = "a GAF line" if lines else "a GAM message"
     if not lines and mode != BGZF:
         raise Error(t"{path}: not BGZF (a GAM is)")
+    sink.begin(lines)
     var offset = n0
     var at_end = n0 < CHUNK
     var messages = List[Int]()
@@ -426,7 +477,7 @@ def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mu
                 count=leftover,
             )
         messages.clear()
-        comptime if lines:
+        if lines:
             # The last of the input is in hand once nothing more was read and nothing is carried.
             used = frame_lines(Span(bufs[nb]), messages, reads == 0 and carry == 0, slices)
         else:

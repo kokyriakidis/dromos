@@ -19,8 +19,9 @@ habits:
 ## Layout
 
 - `cli/dromos_cli.mojo`: the commands, `index` and `gam-to-gaf`, each with its own options and `-h`.
-- `dromos/stream.mojo`: the pipeline every command runs on: reads (O_DIRECT), decoding (BGZF, plain, gzip), framing
-  (GAM messages or GAF lines), and a `MessageSink` taking slices of each chunk.
+- `dromos/stream.mojo`: the pipeline every command runs on: reads (O_DIRECT), decoding (BGZF, plain, gzip), GAM
+  told from GAF by the first bytes (`looks_like_gaf`), framing (GAM messages or GAF lines), and a `MessageSink`
+  taking slices of each chunk.
 - `dromos/gam.mojo`: GAM framing and protobuf decoding; `gaf_line` (vg's lines) and `slim_line` (the 12 columns).
 - `dromos/convert.mojo`: the `gam-to-gaf` sink. `dromos/index.mojo`: the `index` sink (placement, counts).
 - `dromos/refmap.mojo`: pgcat's reference map and placement rule. `dromos/gaf_text.mojo`: a GAF line as pgcat reads
