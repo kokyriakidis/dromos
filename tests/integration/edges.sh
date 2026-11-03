@@ -1,19 +1,24 @@
 #!/bin/bash
 # Adversarial inputs: dromos index against pgcat index-gaf --slim at level 0 (empty and odd files, gzip and BGZF
-# shapes, the chunk boundary), the same output whatever the threads or stdin, and damaged input failing loudly.
+# shapes, the chunk boundary), the same output whatever the threads or stdin, and damaged input failing loudly; the
+# graph's cache made, reused, made again and refused as it should be; catalogs and views of odd inputs.
 #
-#   tests/integration/edges.sh ENV_FILE        (the ENV_FILE check.sh takes; WORK is used for scratch)
+#   tests/integration/edges.sh ENV_FILE        (the ENV_FILE check.sh takes, after check.sh has run: its pgcat
+#                                               reference map and the graph's cache in WORK; WORK/edges for scratch)
 set -u
 [ $# -ge 1 ] || { sed -n 2,5p "$0"; exit 2; }
 source "$1"
 DROMOS=${DROMOS:-build/dromos}
-D=$DROMOS; P=$PGCAT; M=$REFMAP
+D=$DROMOS; P=$PGCAT; M=$WORK/pgc.hprc.CHM13.refmap
+[ -s "$M" ] || "$PGCATALOG" ref-map --graph "$GBZ" --reference-sample CHM13 --out "$M" 2> /dev/null
+mkdir -p "$WORK/graph"; ln -sf "$GBZ" "$WORK/graph/hprc.gbz"
+DG="--graph $WORK/graph/hprc.gbz --reference-sample CHM13"; DN="--graph $WORK/graph/hprc.gbz"
 W=$WORK/edges; rm -rf $W; mkdir -p $W; cd $W
 same() {  # name, input, [dromos options]
   local name=$1 in=$2; shift 2
   rm -f d.gz* p.gz*
   $P index-gaf --ref-map $M --gaf $in --slim --level 0 -t 4 --out p.gz --tmp-dir $W > p.err 2>&1; local prc=$?
-  $D index -l 0 "$@" $M $in d.gz > d.err 2>&1; local drc=$?
+  $D index -l 0 "$@" $DG $in d.gz > d.err 2>&1; local drc=$?
   if [ $prc -ne 0 ] || [ $drc -ne 0 ]; then
     echo "??    $name: pgcat rc=$prc, dromos rc=$drc"; tail -1 p.err; tail -1 d.err; return
   fi
@@ -71,56 +76,88 @@ same "a line across the chunk boundary" over.gaf
 same "exactly one chunk" exact.gaf
 head -c -1 exact.gaf > exactnl.gaf; same "exactly one chunk less its last newline" exactnl.gaf
 # 4. Threads: the same file however many.
-for t in 1 3 7; do rm -f t$t.gz*; $D index -l 0 -t $t --gaf $M $G t$t.gz 2>/dev/null; done
+for t in 1 3 7; do rm -f t$t.gz*; $D index -l 0 -t $t --gaf $DG $G t$t.gz 2>/dev/null; done
 cmp -s t1.gz t3.gz && cmp -s t1.gz t7.gz && echo "ok    the same index with 1, 3 and 7 threads" || echo "FAIL  thread counts differ"
-for t in 1 3; do $D gam-to-gaf -t $t $NODES $SMALL_GAM > g$t.gaf 2>/dev/null; done
+for t in 1 3; do $D gam-to-gaf -t $t $DN $SMALL_GAM > g$t.gaf 2>/dev/null; done
 cmp -s g1.gaf g3.gaf && echo "ok    gam-to-gaf the same with 1 and 3 threads" || echo "FAIL  gam-to-gaf thread counts differ"
 # 5. A GAM on stdin.
-rm -f s.gz* f.gz*; $D index -l 0 $M - s.gz < $SMALL_GAM 2>/dev/null; $D index -l 0 $M $SMALL_GAM f.gz 2>/dev/null
+rm -f s.gz* f.gz*; $D index -l 0 $DG - s.gz < $SMALL_GAM 2>/dev/null; $D index -l 0 $DG $SMALL_GAM f.gz 2>/dev/null
 cmp -s s.gz f.gz && echo "ok    a GAM on stdin indexes as from its file" || echo "FAIL  GAM on stdin"
-$D gam-to-gaf $NODES - < $SMALL_GAM | cmp -s - g1.gaf && echo "ok    gam-to-gaf from stdin" || echo "FAIL  gam-to-gaf from stdin"
+$D gam-to-gaf $DN - < $SMALL_GAM | cmp -s - g1.gaf && echo "ok    gam-to-gaf from stdin" || echo "FAIL  gam-to-gaf from stdin"
 # 6. Damaged input must fail, not write a partial index.
-head -c 100000 $SMALL_GAM > cut.gam; rm -f x.gz*; fails "a GAM cut short" $D index $M cut.gam x.gz; [ -e x.gz ] && echo "FAIL  an index was left for a GAM cut short"
-head -c 3000 m.gaf.gz > cut.gaf.gz; rm -f x.gz*; fails "a gzip GAF cut short" $D index $M cut.gaf.gz x.gz; [ -e x.gz ] && echo "FAIL  an index was left for a gzip GAF cut short"
-printf "garbage" | cat m.gaf.gz - > junk.gaf.gz; fails "junk after a gzip member" $D index $M junk.gaf.gz x.gz
-head -c 30000 g.gaf.bgz > cut.gaf.bgz; fails "a BGZF GAF cut short" $D index $M cut.gaf.bgz x.gz
+head -c 100000 $SMALL_GAM > cut.gam; rm -f x.gz*; fails "a GAM cut short" $D index $DG cut.gam x.gz; [ -e x.gz ] && echo "FAIL  an index was left for a GAM cut short"
+head -c 3000 m.gaf.gz > cut.gaf.gz; rm -f x.gz*; fails "a gzip GAF cut short" $D index $DG cut.gaf.gz x.gz; [ -e x.gz ] && echo "FAIL  an index was left for a gzip GAF cut short"
+printf "garbage" | cat m.gaf.gz - > junk.gaf.gz; fails "junk after a gzip member" $D index $DG junk.gaf.gz x.gz
+head -c 30000 g.gaf.bgz > cut.gaf.bgz; fails "a BGZF GAF cut short" $D index $DG cut.gaf.bgz x.gz
 python3 -c "
 d = bytearray(open('g.gaf.bgz','rb').read()); d[5000] ^= 0xFF; open('bad.gaf.bgz','wb').write(d)"
-fails "a BGZF GAF with a flipped byte" $D index $M bad.gaf.bgz x.gz
-cp a.gaf a.gam; rm -f n.gz* o.gz*; $D index -l 0 $M a.gam n.gz 2>/dev/null; $D index -l 0 --gaf $M a.gaf o.gz 2>/dev/null
+fails "a BGZF GAF with a flipped byte" $D index $DG bad.gaf.bgz x.gz
+cp a.gaf a.gam; rm -f n.gz* o.gz*; $D index -l 0 $DG a.gam n.gz 2>/dev/null; $D index -l 0 --gaf $DG a.gaf o.gz 2>/dev/null
 cmp -s n.gz o.gz && echo "ok    a GAF named as a GAM is read as a GAF" || echo "FAIL  a GAF named as a GAM"
-fails "a GAF given --gam" $D index --gam $M a.gaf x.gz
-fails "gam-to-gaf given a GAF" $D gam-to-gaf $NODES a.gaf
-fails "a missing input" $D index $M /nonexistent.gam x.gz
-fails "an unwritable output" $D index $M $SMALL_GAM /proc/nope/x.gz
-fails "a node table that is not one" $D gam-to-gaf $SMALL_GAF $SMALL_GAM
-fails "a ref map that is not one" $D index $SMALL_GAF $SMALL_GAM x.gz
-# 7. A GBZ given in place of its files (GBZ_SMALL): made once beside it, remade when older than it, beside the output
-# when the graph's folder is not writable, and a clear error otherwise.
+fails "a GAF given --gam" $D index --gam $DG a.gaf x.gz
+fails "gam-to-gaf given a GAF" $D gam-to-gaf $DN a.gaf
+fails "a missing input" $D index $DG /nonexistent.gam x.gz
+fails "an unwritable output" $D index $DG $SMALL_GAM /proc/nope/x.gz
+fails "a graph that is not a GBZ" $D gam-to-gaf --graph $SMALL_GAF $SMALL_GAM
+fails "no graph" $D index $SMALL_GAM x.gz
+# 7. The graph's cache (GBZ_SMALL): made on first use beside the graph, reused, made again when the graph changes,
+# when it is damaged or of another version, kept elsewhere with --cache, made by two first uses at once; a read-only
+# folder, a file that is not a cache and another graph's cache refused, untouched.
 ok() { "$@" && echo "ok    $label" || echo "FAIL  $label"; }
+made() { grep -q "making the graph's cache" "$1"; }
 mkdir -p gw gr; cp $GBZ_SMALL gw/g.gbz; cp $GBZ_SMALL gr/g.gbz; chmod 555 gr
-$D index --reference-sample CHM13 gw/g.gbz empty.gaf e1.gz 2> e1.err
-label="a graph's reference map made beside it"; ok test -s gw/g.gbz.CHM13.refmap
-$PGCATALOG ref-map --graph $GBZ_SMALL --reference-sample CHM13 --out p.refmap
-label="its reference map is pgcatalog's"; ok cmp -s gw/g.gbz.CHM13.refmap p.refmap
-$D index --reference-sample CHM13 gw/g.gbz empty.gaf e2.gz 2> e2.err
-label="a current reference map reused"; ok bash -c "! grep -q 'kept for the next run' e2.err"
-touch -d "2000-01-01" gw/g.gbz.CHM13.refmap
-$D index --reference-sample CHM13 gw/g.gbz empty.gaf e3.gz 2> e3.err
-label="a reference map older than the graph remade"; ok grep -q "kept for the next run" e3.err
+GW="--graph gw/g.gbz --reference-sample CHM13"
+$D index $GW empty.gaf e1.gz 2> e1.err
+label="a cache made beside the graph on first use"; ok bash -c "test -s gw/g.gbz.dromos && grep -q 'first use' e1.err"
+$D index $GW empty.gaf e2.gz 2> e2.err
+label="a current cache reused"; ok bash -c "! grep -q making e2.err"
+$D index --graph gw/g.gbz --reference-sample GRCh38 empty.gaf e2b.gz 2> e2b.err
+label="one cache for both reference samples"; ok bash -c "! grep -q making e2b.err"
+cp gw/g.gbz.dromos first.dromos
+touch -d "2001-01-01" gw/g.gbz
+$D index $GW empty.gaf e3.gz 2> e3.err
+label="a graph changed (a new time): its cache made again"; ok grep -q "the graph has changed" e3.err
 label="no temporary files left"; ok bash -c "! ls gw | grep -q part"
-$D index --reference-sample GRCh38 gw/g.gbz empty.gaf e4.gz 2> /dev/null
-label="each reference sample its own map"; ok test -s gw/g.gbz.GRCh38.refmap
-fails "a graph declaring two reference samples, none chosen" $D index gw/g.gbz empty.gaf x.gz
-fails "a reference sample the graph lacks" $D index --reference-sample NOBODY gw/g.gbz empty.gaf x.gz
-fails "a reference map of another sample" $D index --reference-sample GRCh38 gw/g.gbz.CHM13.refmap empty.gaf x.gz
-$D index --reference-sample CHM13 gr/g.gbz empty.gaf e5.gz 2> /dev/null
-label="a read-only graph folder: the reference map beside the output"; ok test -s g.gbz.CHM13.refmap
-fails "a read-only graph folder: no node table without an output" $D gam-to-gaf gr/g.gbz $SMALL_GAM
-printf "@x\n" | $D gam-to-gaf gw/g.gbz - > /dev/null 2>&1
-$PGCATALOG node-table --graph $GBZ_SMALL --out p.nodes
-label="a graph's node table made beside it, pgcatalog's"; ok cmp -s gw/g.gbz.nodes p.nodes
+head -c 5000 first.dromos > gw/g.gbz.dromos
+$D gam-to-gaf --graph gw/g.gbz $SMALL_GAM > /dev/null 2> e4.err || echo "FAIL  gam-to-gaf failed: $(tail -1 e4.err)"
+label="a cache cut short: made again"; ok grep -q "(damaged)" e4.err
+$D gam-to-gaf --graph gw/g.gbz $SMALL_GAM > /dev/null 2> e5.err || echo "FAIL  gam-to-gaf failed: $(tail -1 e5.err)"
+label="then reused"; ok bash -c "! grep -q making e5.err"
+python3 -c "
+d = bytearray(open('gw/g.gbz.dromos','rb').read()); d[200] ^= 1; open('gw/g.gbz.dromos','wb').write(d)"
+$D gam-to-gaf --graph gw/g.gbz $SMALL_GAM > /dev/null 2> e6.err || echo "FAIL  gam-to-gaf failed: $(tail -1 e6.err)"
+label="a cache with a damaged header: made again"; ok grep -q "(damaged)" e6.err
+python3 -c "
+d = bytearray(open('gw/g.gbz.dromos','rb').read()); d[8] = 0; open('gw/g.gbz.dromos','wb').write(d)"
+$D gam-to-gaf --graph gw/g.gbz $SMALL_GAM > /dev/null 2> e7.err || echo "FAIL  gam-to-gaf failed: $(tail -1 e7.err)"
+label="another version's cache: made again"; ok grep -q "another dromos version" e7.err
+echo "not a cache" > gw/g.gbz.dromos
+fails "a file that is not a cache, at the cache's place" $D gam-to-gaf --graph gw/g.gbz $SMALL_GAM
+label="that file left as it was"; ok grep -q "not a cache" gw/g.gbz.dromos
+rm gw/g.gbz.dromos
+fails "another graph's cache" $D gam-to-gaf --graph $GBZ --cache first.dromos $SMALL_GAM
+label="another graph's cache left as it was"; ok bash -c "test \$(stat -c %s first.dromos) -gt 5000"
+$D index --graph gr/g.gbz --reference-sample CHM13 empty.gaf x.gz 2> ro.err; rc=$?
+label="a read-only folder: an error naming --cache ($(tail -1 ro.err | cut -c1-60)...)"
+ok bash -c "[ $rc -ne 0 ] && grep -q -- --cache ro.err && ! test -e gr/g.gbz.dromos"
+$D index --graph gr/g.gbz --reference-sample CHM13 --cache elsewhere.dromos empty.gaf e8.gz 2> /dev/null
+label="a read-only folder: the cache elsewhere (--cache)"; ok bash -c "test -s elsewhere.dromos && ! test -e gr/g.gbz.dromos"
+chmod 755 gr; $D prepare --graph gr/g.gbz 2> /dev/null; chmod 555 gr
+$D gam-to-gaf --graph gr/g.gbz $SMALL_GAM > ro.gaf 2> e9.err || echo "FAIL  gam-to-gaf failed: $(tail -1 e9.err)"
+label="a read-only folder with its cache prepared: read"; ok bash -c "test -s ro.gaf && ! grep -q making e9.err"
 chmod 755 gr
+mkdir -p gc; cp $GBZ_SMALL gc/g.gbz
+for i in 1 2 3 4; do $D index --graph gc/g.gbz --reference-sample CHM13 $G c$i.gz 2> c$i.err & done; wait
+label="four first uses at once: the same index, one cache, no temporary files"
+ok bash -c "cmp -s c1.gz c2.gz && cmp -s c1.gz c3.gz && cmp -s c1.gz c4.gz && test -s gc/g.gbz.dromos \
+  && ! ls gc | grep -q part"
+$D prepare --graph gc/g.gbz 2> e10.err
+label="and that cache current"; ok bash -c "! grep -q making e10.err"
+fails "a graph declaring two reference samples, none chosen" $D index --graph gw/g.gbz empty.gaf x.gz
+fails "a reference sample the graph lacks" $D index --graph gw/g.gbz --reference-sample NOBODY empty.gaf x.gz
+label="no cache left by a sample the graph lacks"; ok bash -c "! ls gw | grep -q part"
+fails "prepare: no graph" $D prepare
+fails "surject: no contig" $D surject $DG $SMALL_GAF
 # 8. catalog and view on the small graph (GBZ_SMALL, its committed snarls), against pgcatalog build and view: odd
 # snarls files, regions and contigs, threads; a missing snarls cache made with vg (VG, the vg binary pgcatalog runs).
 S=$OLDPWD/tests/data/micb-kir3dl1.catalog/snarls

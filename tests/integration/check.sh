@@ -8,21 +8,22 @@
 #   PGCAT      pgcat from pgphase's rescue-experiment branch, ff2b4b2 (tools/pgcat; `cargo build --release --no-default-features`;
 #              the last with index-gaf --ref-map --slim), the indexer dromos
 #              replaced, which makes the reference indexes (pgcatalog, its successor, has no index-gaf)
-#   REFMAP     the graph's reference map (pgcatalog ref-map); NODES its node table with letters, LENGTHS one without
+#   GBZ        the graph the alignments are on; GBZ_SMALL a small GBZ (tests/data/micb-kir3dl1.gbz)
 #   SMALL_GAM  a few thousand alignments; SMALL_GAF  vg convert -G of it (any order)
 #   SLICE_GAM  a GAM ending at a group boundary, some GB; SLICE_SLIM  dromos gam-to-gaf --slim of it, as checked;
 #   SLICE_FULL dromos gam-to-gaf of it, as checked (only with --full)
 #   PGCATALOG  pgcatalog (pgphase's tools/pgcatalog, plegma-msa branch, 60a3d09, `cargo build --release`), whose
-#              surject dromos surject ports and whose ref-map and node-table dromos's must match; GBZ the graph the
-#              alignments are on (REFMAP and NODES are its); GBZ_SMALL a small GBZ (tests/data/micb-kir3dl1.gbz)
+#              surject, build and view dromos's surject, catalog and view port, and whose ref-map makes pgcat's
+#              reference map
 #   CATALOG_DIR the graph's catalogs (<contig>.pgsites); SURJECT_CONTIG a contig the alignments lie on (chr10)
 #   SNARLS     the graph's snarls cache (<contig>.snarls and graph.id, as pgcatalog build keeps it), copied, not changed
-#   WORK       a directory for outputs and the pgcat and pgcatalog references (made once, kept)
+#   WORK       a directory for outputs and the pgcat and pgcatalog references (made once, kept), and for the graph's
+#              cache: dromos reads GBZ through a link in WORK/graph, its cache made beside it
 #
 # Every index is made at -l 0 (stored blocks), where dromos and pgcat write the same bytes: the files must be equal,
 # and their .tbi equal decompressed.
 set -u
-[ $# -ge 1 ] || { sed -n 2,20p "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n 2,22p "$0"; exit 2; }
 source "$1"
 FULL=${2:-}
 DROMOS=${DROMOS:-build/dromos}
@@ -45,9 +46,10 @@ same_surject() {  # name, pgcatalog checksum file, input, [sort], dromos options
   local name=$1 want=$2 in=$3 order=$4; shift 4
   local got
   if [ "$order" == "sort" ]; then
-    got=$("$DROMOS" surject "$@" "$REFMAP" "$NODES" "$in" 2> /dev/null | records | LC_ALL=C sort | md5sum)
+    got=$("$DROMOS" surject --graph "$G" --reference-sample CHM13 "$@" "$in" 2> /dev/null | records | LC_ALL=C sort \
+      | md5sum)
   else
-    got=$("$DROMOS" surject "$@" "$REFMAP" "$NODES" "$in" 2> /dev/null | records | md5sum)
+    got=$("$DROMOS" surject --graph "$G" --reference-sample CHM13 "$@" "$in" 2> /dev/null | records | md5sum)
   fi
   [ "$got" == "$(cat "$want")" ] && pass "$name" || fail "$name"
 }
@@ -56,61 +58,35 @@ pgcat_index() {  # GAF, output: pgcat's slim index at level 0, made once
     --tmp-dir "$WORK" 2> "$2.err" || { echo "pgcat failed on $1"; exit 1; }
 }
 
-# The graph files: dromos ref-map, node-table and reference-samples write what pgcatalog writes, on both graphs, for
-# each declared reference sample.
-pgcatalog_file() {  # output, pgcatalog args...: pgcatalog's file, made once
-  local out=$1; shift
-  [ -s "$out" ] || "$PGCATALOG" "$@" --out "$out" 2> "$out.err" || { echo "pgcatalog failed: $*"; exit 1; }
-}
+# reference-samples prints what pgcatalog prints, on both graphs.
 for g in small:$GBZ_SMALL hprc:$GBZ; do
   n=${g%%:*}; f=${g#*:}
   "$PGCATALOG" reference-samples "$f" > "$WORK/$n.samples.want"
   "$DROMOS" reference-samples "$f" | cmp -s - "$WORK/$n.samples.want" && pass "reference-samples: $n" \
     || fail "reference-samples: $n"
-  for s in $(cat "$WORK/$n.samples.want"); do
-    pgcatalog_file "$WORK/pgc.$n.$s.refmap" ref-map --graph "$f" --reference-sample "$s"
-    "$DROMOS" ref-map --graph "$f" --reference-sample "$s" --out "$WORK/d.$n.$s.refmap" 2> /dev/null
-    cmp -s "$WORK/d.$n.$s.refmap" "$WORK/pgc.$n.$s.refmap" && pass "ref-map: $n, $s" || fail "ref-map: $n, $s"
-  done
-  rm -f "$WORK"/d.$n.*.refmap
-  pgcatalog_file "$WORK/pgc.$n.nodes" node-table --graph "$f"
-  "$DROMOS" node-table --graph "$f" --out "$WORK/d.$n.nodes" 2> /dev/null
-  cmp -s "$WORK/d.$n.nodes" "$WORK/pgc.$n.nodes" && pass "node-table: $n" || fail "node-table: $n"
-  pgcatalog_file "$WORK/pgc.$n.lengths" node-table --graph "$f" --no-letters
-  "$DROMOS" node-table -t 3 --graph "$f" --no-letters --out "$WORK/d.$n.lengths" 2> /dev/null
-  cmp -s "$WORK/d.$n.lengths" "$WORK/pgc.$n.lengths" && pass "node-table --no-letters: $n" \
-    || fail "node-table --no-letters: $n"
-  rm -f "$WORK/d.$n.nodes" "$WORK/d.$n.lengths"
 done
+# pgcat's reference map (pgcatalog ref-map's file), for pgcat index-gaf.
+REFMAP="$WORK/pgc.hprc.CHM13.refmap"
+[ -s "$REFMAP" ] || "$PGCATALOG" ref-map --graph "$GBZ" --reference-sample CHM13 --out "$REFMAP" 2> "$REFMAP.err" \
+  || { echo "pgcatalog ref-map failed"; exit 1; }
 
-# The graph given in place of its files: they are made once beside it (a link to it in WORK), as pgcatalog makes
-# them, and used as given files are.
+# The graph's cache: made by dromos prepare beside the graph (a link to it in WORK/graph), current after, and the same
+# file when a command makes it on first use, beside the graph or elsewhere (--cache).
 mkdir -p "$WORK/graph"
-L="$WORK/graph/hprc.gbz"
-ln -sf "$GBZ" "$L"
-rm -f "$L".*
+G="$WORK/graph/hprc.gbz"
+ln -sf "$GBZ" "$G"
+rm -f "$G".* "$WORK/elsewhere.dromos"
+"$DROMOS" prepare --graph "$G" 2> "$WORK/prepare.err" && [ -s "$G.dromos" ] && grep -q "making the graph's cache" \
+  "$WORK/prepare.err" && pass "prepare: the graph's cache made beside it" || fail "prepare: the graph's cache made beside it"
+"$DROMOS" prepare --graph "$G" 2> "$WORK/prepare.err" && ! grep -q "making" "$WORK/prepare.err" \
+  && pass "prepare: a current cache left as it is" || fail "prepare: a current cache left as it is"
 pgcat_index "$SLICE_SLIM" "$WORK/ref.slice.gz"
-"$DROMOS" index -l 0 --reference-sample CHM13 "$L" "$SLICE_SLIM" "$WORK/d.graph.gz" 2> /dev/null
-same_index "index: the graph given" "$WORK/d.graph.gz" "$WORK/ref.slice.gz"
-cmp -s "$L.CHM13.refmap" "$WORK/pgc.hprc.CHM13.refmap" && pass "index: the graph's reference map kept beside it" \
-  || fail "index: the graph's reference map kept beside it"
-"$DROMOS" index -l 0 --reference-sample CHM13 "$L" "$SLICE_SLIM" "$WORK/d.graph.gz" 2> "$WORK/d.graph.err"
-grep -q "kept for the next run" "$WORK/d.graph.err" && fail "index: the kept reference map reused" \
-  || pass "index: the kept reference map reused"
-"$DROMOS" gam-to-gaf "$NODES" "$SMALL_GAM" > "$WORK/small.nodes.gaf"
-"$DROMOS" gam-to-gaf "$L" "$SMALL_GAM" 2> /dev/null | cmp -s - "$WORK/small.nodes.gaf" \
-  && pass "gam-to-gaf: the graph given" || fail "gam-to-gaf: the graph given"
-cmp -s "$L.nodes" "$WORK/pgc.hprc.nodes" && pass "gam-to-gaf: the graph's node table kept beside it" \
-  || fail "gam-to-gaf: the graph's node table kept beside it"
-want=$("$DROMOS" surject --contig "$SURJECT_CONTIG" "$REFMAP" "$NODES" "$SMALL_GAF" 2> /dev/null | records | md5sum)
-got=$("$DROMOS" surject --contig "$SURJECT_CONTIG" --reference-sample CHM13 "$L" "$SMALL_GAF" 2> /dev/null | records \
-  | md5sum)
-[ "$got" == "$want" ] && pass "surject: the graph given" || fail "surject: the graph given"
-got=$("$DROMOS" surject --contig "$SURJECT_CONTIG" --reference-sample CHM13 "$L" "$NODES" "$SMALL_GAF" 2> /dev/null \
-  | records | md5sum)
-[ "$got" == "$want" ] && pass "surject: the graph for its reference map" \
-  || fail "surject: the graph for its reference map"
-rm -f "$L".* "$WORK/d.graph.gz" "$WORK/d.graph.gz.tbi"
+"$DROMOS" index -l 0 --graph "$G" --reference-sample CHM13 --cache "$WORK/elsewhere.dromos" "$SLICE_SLIM" \
+  "$WORK/d.graph.gz" 2> /dev/null
+same_index "index: the cache made on first use, elsewhere (--cache)" "$WORK/d.graph.gz" "$WORK/ref.slice.gz"
+cmp -s "$WORK/elsewhere.dromos" "$G.dromos" && pass "the cache made on first use is prepare's, byte for byte" \
+  || fail "the cache made on first use is prepare's, byte for byte"
+rm -f "$WORK/elsewhere.dromos" "$WORK/d.graph.gz" "$WORK/d.graph.gz.tbi"
 
 # catalog and view: pgcatalog build's catalogs from the same snarls, byte for byte (the small graph from its committed
 # snarls, on 2 threads as pgphase's gate builds it; HPRC contigs, a region, and with --full the whole genome), and
@@ -171,44 +147,45 @@ fi
 rm -rf "$WORK"/dcat.*
 
 # gam-to-gaf: vg's lines, and the slices as checked before.
-"$DROMOS" gam-to-gaf "$NODES" "$SMALL_GAM" > "$WORK/small.gaf"
+"$DROMOS" gam-to-gaf --graph "$G" "$SMALL_GAM" > "$WORK/small.gaf"
 cmp -s <(sort "$WORK/small.gaf") <(sort "$SMALL_GAF") && pass "gam-to-gaf: vg convert's lines" || fail "gam-to-gaf: vg convert's lines"
-"$DROMOS" gam-to-gaf --slim "$LENGTHS" "$SLICE_GAM" | cmp -s - "$SLICE_SLIM" && pass "gam-to-gaf --slim: the slice" || fail "gam-to-gaf --slim: the slice"
+"$DROMOS" gam-to-gaf --slim --graph "$G" "$SLICE_GAM" | cmp -s - "$SLICE_SLIM" && pass "gam-to-gaf --slim: the slice" || fail "gam-to-gaf --slim: the slice"
 if [ "$FULL" == "--full" ]; then
-  "$DROMOS" gam-to-gaf "$NODES" "$SLICE_GAM" | cmp -s - "$SLICE_FULL" && pass "gam-to-gaf: the slice, full" || fail "gam-to-gaf: the slice, full"
+  "$DROMOS" gam-to-gaf --graph "$G" "$SLICE_GAM" | cmp -s - "$SLICE_FULL" && pass "gam-to-gaf: the slice, full" || fail "gam-to-gaf: the slice, full"
 fi
 
 # index from the GAM, and from its slim GAF in every encoding.
+DG="--graph $G --reference-sample CHM13"
 pgcat_index "$SLICE_SLIM" "$WORK/ref.slice.gz"
 rm -f "$WORK"/d.*.gz "$WORK"/d.*.gz.tbi
-"$DROMOS" index -l 0 "$REFMAP" "$SLICE_GAM" "$WORK/d.gam.gz" 2> /dev/null
+"$DROMOS" index -l 0 $DG "$SLICE_GAM" "$WORK/d.gam.gz" 2> /dev/null
 same_index "index: the slice GAM" "$WORK/d.gam.gz" "$WORK/ref.slice.gz"
 [ -s "$WORK/slice.gaf.gz" ] || gzip -1 -c "$SLICE_SLIM" > "$WORK/slice.gaf.gz"
 [ -s "$WORK/slice.gaf.bgz" ] || bgzip -@ 10 -c "$SLICE_SLIM" > "$WORK/slice.gaf.bgz"
-"$DROMOS" index -l 0 --gaf "$REFMAP" "$SLICE_SLIM" "$WORK/d.plain.gz" 2> /dev/null
+"$DROMOS" index -l 0 --gaf $DG "$SLICE_SLIM" "$WORK/d.plain.gz" 2> /dev/null
 same_index "index: the slice's GAF, plain" "$WORK/d.plain.gz" "$WORK/ref.slice.gz"
-"$DROMOS" index -l 0 "$REFMAP" "$WORK/slice.gaf.gz" "$WORK/d.gzip.gz" 2> /dev/null
+"$DROMOS" index -l 0 $DG "$WORK/slice.gaf.gz" "$WORK/d.gzip.gz" 2> /dev/null
 same_index "index: the slice's GAF, gzip" "$WORK/d.gzip.gz" "$WORK/ref.slice.gz"
-"$DROMOS" index -l 0 "$REFMAP" "$WORK/slice.gaf.bgz" "$WORK/d.bgzf.gz" 2> /dev/null
+"$DROMOS" index -l 0 $DG "$WORK/slice.gaf.bgz" "$WORK/d.bgzf.gz" 2> /dev/null
 same_index "index: the slice's GAF, BGZF" "$WORK/d.bgzf.gz" "$WORK/ref.slice.gz"
-"$DROMOS" index -l 0 --gaf "$REFMAP" - "$WORK/d.stdin.gz" < "$SLICE_SLIM" 2> /dev/null
+"$DROMOS" index -l 0 --gaf $DG - "$WORK/d.stdin.gz" < "$SLICE_SLIM" 2> /dev/null
 same_index "index: the slice's GAF, stdin" "$WORK/d.stdin.gz" "$WORK/ref.slice.gz"
 # The kind told from the bytes, not the name or a flag: a GAF named .gam, gzip named .gam, and on stdin.
 ln -sf "$SLICE_SLIM" "$WORK/slice-gaf.gam"
-"$DROMOS" index -l 0 "$REFMAP" "$WORK/slice-gaf.gam" "$WORK/d.named.gz" 2> /dev/null
+"$DROMOS" index -l 0 $DG "$WORK/slice-gaf.gam" "$WORK/d.named.gz" 2> /dev/null
 same_index "index: a GAF named .gam, told by its bytes" "$WORK/d.named.gz" "$WORK/ref.slice.gz"
 ln -sf "$WORK/slice.gaf.gz" "$WORK/slice-gz.gam"
-"$DROMOS" index -l 0 "$REFMAP" "$WORK/slice-gz.gam" "$WORK/d.namedgz.gz" 2> /dev/null
+"$DROMOS" index -l 0 $DG "$WORK/slice-gz.gam" "$WORK/d.namedgz.gz" 2> /dev/null
 same_index "index: a gzip GAF named .gam, told by its bytes" "$WORK/d.namedgz.gz" "$WORK/ref.slice.gz"
-"$DROMOS" index -l 0 "$REFMAP" - "$WORK/d.stdin2.gz" < "$SLICE_SLIM" 2> /dev/null
+"$DROMOS" index -l 0 $DG - "$WORK/d.stdin2.gz" < "$SLICE_SLIM" 2> /dev/null
 same_index "index: a GAF on stdin, told by its bytes" "$WORK/d.stdin2.gz" "$WORK/ref.slice.gz"
-"$DROMOS" index -l 0 "$REFMAP" - "$WORK/d.gamstdin.gz" < "$SLICE_GAM" 2> /dev/null
+"$DROMOS" index -l 0 $DG - "$WORK/d.gamstdin.gz" < "$SLICE_GAM" 2> /dev/null
 same_index "index: a GAM on stdin, told by its bytes" "$WORK/d.gamstdin.gz" "$WORK/ref.slice.gz"
 
 # index from vg's full GAF (its tags dropped), and from edge cases: tags kept and dropped, CRLF, empty and comment
 # lines, names starting with @, a short line, no final newline.
 pgcat_index "$SMALL_GAF" "$WORK/ref.small.gz"
-"$DROMOS" index -l 0 --gaf "$REFMAP" "$SMALL_GAF" "$WORK/d.small.gz" 2> /dev/null
+"$DROMOS" index -l 0 --gaf $DG "$SMALL_GAF" "$WORK/d.small.gz" 2> /dev/null
 same_index "index: vg's full GAF" "$WORK/d.small.gz" "$WORK/ref.small.gz"
 E="$WORK/edge.gaf"
 {
@@ -219,7 +196,7 @@ E="$WORK/edge.gaf"
   head -45 "$SMALL_GAF" | tail -1 | tr -d '\n'
 } > "$E"
 pgcat_index "$E" "$WORK/ref.edge.gz"
-"$DROMOS" index -l 0 --gaf "$REFMAP" "$E" "$WORK/d.edge.gz" 2> /dev/null
+"$DROMOS" index -l 0 --gaf $DG "$E" "$WORK/d.edge.gz" 2> /dev/null
 same_index "index: edge-case GAF" "$WORK/d.edge.gz" "$WORK/ref.edge.gz"
 
 # surject: pgcatalog surject's records, from the GAF, the GAM (vg's GAF lines are in another order: both sorted) and
@@ -255,7 +232,7 @@ if [ "$FULL" == "--full" ]; then
   same_surject "surject --catalog: the slice GAM" "$WORK/surject.full.cat.md5" "$SLICE_GAM" keep --contig "$SC" \
     --sam-contig "$SC" --catalog "$CAT"
   pgcat_index "$SLICE_FULL" "$WORK/ref.full.gz"
-  "$DROMOS" index -l 0 --gaf "$REFMAP" "$SLICE_FULL" "$WORK/d.full.gz" 2> /dev/null
+  "$DROMOS" index -l 0 --gaf $DG "$SLICE_FULL" "$WORK/d.full.gz" 2> /dev/null
   same_index "index: the slice's full GAF" "$WORK/d.full.gz" "$WORK/ref.full.gz"
   cmp -s "$WORK/d.full.gz" "$WORK/d.gam.gz" && pass "index: the full GAF gives the GAM's file" || fail "index: the full GAF gives the GAM's file"
 fi
