@@ -19,7 +19,11 @@ from dromos.cache import (
     u32_at,
     u64_at,
 )
+from std.math import ceildiv
+
 from dromos.nodes import Nodes
+from dromos.parallel import ParallelTask, parallel_for
+from dromos.stream import imm_untracked, mut_untracked, untracked
 
 # Why an alignment with a walk has no place (pgcat's Unplaced, in its order); 0 is placed.
 comptime NO_ANCHOR = 1
@@ -79,6 +83,22 @@ struct ContigPath(Copyable):
     var path: Int
     var first: Int
     var nodes: List[Int]
+
+
+comptime _NODES_PER_TASK = 1 << 22
+
+
+@fieldwise_init
+struct _StepsOf(ParallelTask):
+    """`RefMap.set_steps` for each range of node ids, and once more for the further placements."""
+
+    var map: ImmPointer[RefMap, ImmUntrackedOrigin]
+    var out: MutPointer[List[List[ContigPath]], MutUntrackedOrigin]
+    var slot: ImmPointer[List[Int], ImmUntrackedOrigin]
+    var ranges: Int
+
+    def run(self, index: Int):
+        self.map[].set_steps(self.out[], self.slot[], index, self.ranges)
 
 
 @always_inline
@@ -262,6 +282,60 @@ struct RefMap(Movable, Nodes):
             for j in range(Int(self.more_at[unsafe_offset=i]), Int(self.more_at[unsafe_offset=i + 1])):
                 _set_step(out, Int(self.more[unsafe_offset=j]), node)
         return out^
+
+    def paths_by_contig(self, threads: Int) -> List[List[ContigPath]]:
+        """Every contig's paths (by contig number), each with its steps' nodes, from one scan of every node's
+        placements (`contig_paths` for all of them)."""
+        var out = List[List[ContigPath]](length=len(self.contigs), fill=List[ContigPath]())
+        # Each path's place in its contig's list.
+        var slot = List[Int](length=len(self.path_contig), fill=0)
+        for path in range(len(self.path_contig)):
+            ref list = out[self.path_contig[path]]
+            slot[path] = len(list)
+            var lo = self.path_first[path]
+            list.append(ContigPath(path, lo, List[Int](length=self.path_first[path + 1] - lo, fill=-1)))
+
+        # Each placement is one node's: tasks over ranges of node ids write distinct steps.
+        var task = _StepsOf(
+            untracked(Pointer(to=self)),
+            mut_untracked(Pointer(to=out)),
+            imm_untracked(Pointer(to=slot)),
+            ceildiv(self.size, _NODES_PER_TASK),
+        )
+        parallel_for(task, task.ranges + 1, threads)
+        # The tasks reach `slot` through an untracked pointer: kept alive until here.
+        _ = slot^
+        return out^
+
+    def set_steps(self, mut out: List[List[ContigPath]], slot: List[Int], range_index: Int, ranges: Int):
+        """Range `range_index` of the node ids' first placements, or (the one past the ranges) the further ones."""
+        if range_index < ranges:
+            for node in range(range_index * _NODES_PER_TASK, min(self.size, (range_index + 1) * _NODES_PER_TASK)):
+                var k = self._first(node)
+                if k != NONE:
+                    self._set_step_of(out, slot, k, node)
+            return
+        for i in range(self.more_count):
+            var node = Int(self.more_nodes[unsafe_offset=i])
+            for j in range(Int(self.more_at[unsafe_offset=i]), Int(self.more_at[unsafe_offset=i + 1])):
+                self._set_step_of(out, slot, Int(self.more[unsafe_offset=j]), node)
+
+    @always_inline
+    def _set_step_of(self, mut out: List[List[ContigPath]], slot: List[Int], k: Int, node: Int):
+        """Placement `k` is of `node`: its step's node, in the path holding it (the first whose end is past it)."""
+        var lo = 0
+        var hi = len(self.path_contig)
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            if self.path_first[mid + 1] <= k:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo >= len(self.path_contig):
+            return
+        ref cp = out[self.path_contig[lo]][slot[lo]]
+        if k >= cp.first and k < cp.first + len(cp.nodes):
+            cp.nodes[k - cp.first] = node
 
     def first_placement_of(self, path: Int) -> Int:
         """Path `path`'s first placement (placements are in path order)."""

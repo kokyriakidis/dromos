@@ -13,9 +13,12 @@ over from its slim decode."""
 
 from std.atomic import Atomic
 from std.ffi import external_call
+from std.memory import Allocation, Layout, alloc, dealloc
 from std.sys import stderr
 
-from dromos.contig import Contig, comp
+from dromos.bam import RecordWriter
+from dromos.bam_sort import BamStaging
+from dromos.contig import Contig, Reference, comp
 from dromos.gaf_text import parse_unsigned
 from dromos.gam import Alignment, gaf_line, put_bytes, put_int, put_text
 from dromos.linearize import (
@@ -33,8 +36,8 @@ from dromos.linearize import (
 )
 from dromos.nodes import NodeTable
 from dromos.output import write_all
-from dromos.parallel import ParallelTask, parallel_for
-from dromos.stream import MessageSink, mut_untracked
+from dromos.parallel import Background, ParallelTask, parallel_for
+from dromos.stream import MessageSink, imm_untracked, mut_untracked
 
 
 @fieldwise_init
@@ -60,6 +63,7 @@ struct _Scratch(Movable):
     var blocks: List[Block]
     var merged: List[Block]
     var cigar: List[CigarOp]
+    var hits: List[Int]
 
     def __init__(out self):
         self.fields = List[Int]()
@@ -71,6 +75,7 @@ struct _Scratch(Movable):
         self.blocks = List[Block]()
         self.merged = List[Block]()
         self.cigar = List[CigarOp]()
+        self.hits = List[Int]()
 
 
 comptime _TAB = UInt8(ord("\t"))
@@ -178,54 +183,90 @@ def _first_column(p: ImmPointer[UInt8, _], fields: List[Int]) -> Int:
     return 3
 
 
-struct Surjector(Movable):
-    """What `surject_line` needs: the contig, the node letters, and the options."""
+@always_inline
+def _place(contig: Contig, step: Int, length: Int, off: Int) -> Tuple[Int, Int]:
+    """The reference position of letter `off` of walk step `step` (of `length` letters) and its direction (+1 or -1
+    along the reference), or direction 0 if the contig does not visit its node once."""
+    var pl = contig.placed(step >> 1)
+    if pl < 0:
+        return (0, 0)
+    var rev = step & 1 == 1
+    var node_rev = pl & 1 == 1
+    var start = pl >> 1
+    var fo = length - 1 - off if rev else off
+    var r = start + (length - 1 - fo) if node_rev else start + fo
+    return (r, 1 if rev == node_rev else -1)
 
-    var contig: Contig
+
+struct Surjector(Movable):
+    """What `surject_line` needs: the contigs, the node letters, and the options; each contig's name in the SAM and
+    its catalog's windows."""
+
+    var reference: Reference
     var nodes: NodeTable
-    var sam_contig: String
+    var sam_names: List[String]
     var graph: Bool
-    var windows: List[Window]
+    var windows: List[List[Window]]
+    var records: RecordWriter
 
     def __init__(
-        out self, var contig: Contig, var nodes: NodeTable, sam_contig: String, graph: Bool, var windows: List[Window]
+        out self,
+        var reference: Reference,
+        var nodes: NodeTable,
+        var sam_names: List[String],
+        graph: Bool,
+        var windows: List[List[Window]],
     ):
-        self.contig = contig^
+        self.reference = reference^
         self.nodes = nodes^
-        self.sam_contig = sam_contig
+        self.sam_names = sam_names^
         self.graph = graph
         self.windows = windows^
-
-    @always_inline
-    def _place(self, step: Int, length: Int, off: Int) -> Tuple[Int, Int]:
-        """The reference position of letter `off` of walk step `step` (of `length` letters) and its direction (+1 or
-        -1 along the reference), or direction 0 if the contig does not visit its node once."""
-        var pl = self.contig.placed(step >> 1)
-        if pl < 0:
-            return (0, 0)
-        var rev = step & 1 == 1
-        var node_rev = pl & 1 == 1
-        var start = pl >> 1
-        var fo = length - 1 - off if rev else off
-        var r = start + (length - 1 - fo) if node_rev else start + fo
-        return (r, 1 if rev == node_rev else -1)
+        self.records = RecordWriter()
 
     def touches(self, p: ImmPointer[UInt8, _], n: Int, mut fields: List[Int], mut walk: List[Int]) -> Bool:
-        """Whether GAF line `p[:n]` (no newline) may place a base on the contig: its walk holds a node the contig
+        """Whether GAF line `p[:n]` (no newline) may place a base on a contig: its walk holds a node a contig
         visits once (`surject_line` places none otherwise)."""
         _split(p, n, fields)
         var k = _first_column(p, fields)
         if len(fields) // 2 < k + 12 or not _parse_walk(p, fields, k + 5, walk):
             return False
         for step in walk:
-            if self.contig.placed(step >> 1) >= 0:
+            if self.reference.placed_anywhere(step >> 1):
                 return True
         return False
 
-    def surject_line(self, p: ImmPointer[UInt8, _], n: Int, mut s: _Scratch, mut out: List[UInt8]) -> Bool:
-        """The SAM record (with its newline) of GAF line `p[:n]` (no newline) appended to `out`; false, nothing
-        appended, if it places no base on the contig."""
+    def surject_read[
+        bam: Bool
+    ](self, p: ImmPointer[UInt8, _], n: Int, mut s: _Scratch, mut out: List[UInt8]) raises -> Int:
+        """The records of GAF line `p[:n]` (no newline) appended to `out`, one on each contig it places a base on
+        (in contig order), each as `surject_line` makes it; how many."""
+        if len(self.reference.contigs) == 1:
+            return Int(self.surject_line[bam](p, n, 0, s, out))
         _split(p, n, s.fields)
+        var k = _first_column(p, s.fields)
+        if len(s.fields) // 2 < k + 12 or not _parse_walk(p, s.fields, k + 5, s.walk):
+            return 0
+        s.hits.clear()
+        for step in s.walk:
+            self.reference.add_contigs_of(step >> 1, s.hits)
+        var made = 0
+        for i in range(len(s.hits)):
+            var c = s.hits[i]
+            made += Int(self.surject_line[bam](p, n, c, s, out, parsed=True))
+        return made
+
+    def surject_line[
+        bam: Bool
+    ](
+        self, p: ImmPointer[UInt8, _], n: Int, c: Int, mut s: _Scratch, mut out: List[UInt8], parsed: Bool = False
+    ) raises -> Bool:
+        """The record on contig `c` of GAF line `p[:n]` (no newline) appended to `out`, as SAM text (with its
+        newline) or as BAM; false, nothing appended, if it places no base on the contig. `parsed`: the line's fields
+        and walk are in `s` already (`surject_read` found its contigs from them)."""
+        ref contig = self.reference.contigs[c]
+        if not parsed:
+            _split(p, n, s.fields)
         var k = _first_column(p, s.fields)
         if len(s.fields) // 2 < k + 12 or _is(p, s.fields, k + 5, "*"):
             return False
@@ -243,12 +284,12 @@ struct Surjector(Movable):
         if cs_field < 0:
             return False
         var bq_field = _tag(p, s.fields, "bq:Z:")
-        if not _parse_walk(p, s.fields, k + 5, s.walk):
+        if not parsed and not _parse_walk(p, s.fields, k + 5, s.walk):
             return False
         # No base can be placed unless a node of the walk is the contig's.
         var any_placed = False
         for step in s.walk:
-            any_placed = any_placed or self.contig.placed(step >> 1) >= 0
+            any_placed = any_placed or contig.placed(step >> 1) >= 0
         if not any_placed:
             return False
         var walk_len = len(s.walk)
@@ -298,7 +339,7 @@ struct Surjector(Movable):
                         for t in range(take):
                             dst[unsafe_offset=t] = upper(self.nodes.at(letters + off + t))
                     s.score.resize(at + take, CLIP_MATCH)
-                    var pl = self._place(step, length, off)
+                    var pl = _place(contig, step, length, off)
                     if pl[1] != 0:
                         s.runs.append(_Run(len(s.read) - take, take, pl[0], pl[1]))
                     off += take
@@ -312,7 +353,7 @@ struct Surjector(Movable):
                 s.read.append(upper(p[unsafe_offset=i + 1]))
                 i += 2
                 s.score.append(CLIP_MISMATCH)
-                var pl = self._place(s.walk[w], s.lens[w], off)
+                var pl = _place(contig, s.walk[w], s.lens[w], off)
                 if pl[1] != 0:
                     s.runs.append(_Run(len(s.read) - 1, 1, pl[0], pl[1]))
                 off += 1
@@ -379,7 +420,7 @@ struct Surjector(Movable):
             for t in range(rl):
                 s.read[t] = comp(s.read[t])
         var pos = 0
-        if not linearize(Span(s.read), s.merged, Span(self.contig.seq), self.graph, self.windows, pos, s.cigar):
+        if not linearize(Span(s.read), s.merged, Span(contig.seq), self.graph, self.windows[c], pos, s.cigar):
             return False
         # Clipping on the read's alignment to the walk, in the BAM's orientation.
         if not fwd:
@@ -389,12 +430,36 @@ struct Surjector(Movable):
         var lead = s.cigar[0].length if nc > 0 and s.cigar[0].op == S else 0
         var trail = s.cigar[nc - 1].length if nc > 1 and s.cigar[nc - 1].op == S else 0
         var clipped = clip_cigar(pos, s.cigar, max(clips[0], lead), max(clips[1], trail))
+        # bq covers the whole read; the aligned part (qstart..qend, on the read as sequenced) is what was rebuilt.
+        # bq runs along the read as sequenced; the walk's letters along the read reversed when it is on `-`.
+        var reverse_qual = minus == fwd
+        var bq_at = s.fields[2 * bq_field] + 5 if bq_field >= 0 else 0
+        var bq_len = s.fields[2 * bq_field + 1] - bq_at if bq_field >= 0 else -1
+        var qual_at = -1
+        if bq_len == qlen and qend <= qlen and qend >= qstart and qend - qstart == rl:
+            qual_at = bq_at + qstart
+        comptime if bam:
+            self.records.put(
+                out,
+                p.unsafe_offset(s.fields[2 * k]),
+                s.fields[2 * k + 1] - s.fields[2 * k],
+                0 if fwd else 16,
+                c,
+                clipped[0],
+                mapq,
+                clipped[1],
+                Span(s.read),
+                p,
+                qual_at,
+                reverse_qual,
+            )
+            return True
         put_bytes(out, p, s.fields[2 * k], s.fields[2 * k + 1] - s.fields[2 * k])
         if fwd:
             put_text(out, "\t0\t")
         else:
             put_text(out, "\t16\t")
-        out.extend(self.sam_contig.as_bytes())
+        out.extend(self.sam_names[c].as_bytes())
         out.append(_TAB)
         put_int(out, clipped[0] + 1)
         out.append(_TAB)
@@ -406,29 +471,25 @@ struct Surjector(Movable):
         put_text(out, "\t*\t0\t0\t")
         out.extend(Span(s.read))
         out.append(_TAB)
-        # bq covers the whole read; the aligned part (qstart..qend, on the read as sequenced) is what was rebuilt.
-        # bq runs along the read as sequenced; the walk's letters along the read reversed when it is on `-`.
-        var reverse_qual = minus == fwd
-        var bq_at = s.fields[2 * bq_field] + 5 if bq_field >= 0 else 0
-        var bq_len = s.fields[2 * bq_field + 1] - bq_at if bq_field >= 0 else -1
-        if bq_len == qlen and qend <= qlen and qend >= qstart and qend - qstart == rl:
-            if reverse_qual:
-                for t in range(bq_at + qend - 1, bq_at + qstart - 1, -1):
-                    out.append(p[unsafe_offset=t])
-            else:
-                put_bytes(out, p, bq_at + qstart, rl)
-        else:
+        if qual_at < 0:
             for _ in range(rl):
                 out.append(_QUAL)
+        elif reverse_qual:
+            for t in range(qual_at + rl - 1, qual_at - 1, -1):
+                out.append(p[unsafe_offset=t])
+        else:
+            put_bytes(out, p, qual_at, rl)
         out.append(_NEWLINE)
         return True
 
 
 comptime SLICES_PER_THREAD = 16
-"""Slices of a chunk's messages: each copies its share of the reads to align into a piece of the batch."""
-comptime BATCH_BYTES = 256 << 20
-"""The lines a batch gathers before it is aligned. A read's alignment costs from nothing to a second, and a step waits
-for its slowest task: aligned a few chunks at a time, the threads wait at the end of a batch, not of every chunk."""
+"""Slices of a chunk's messages: each copies its share of the reads to align into a piece."""
+comptime IN_FLIGHT = 512 << 20
+"""The lines of pieces published and not yet written out, at most (but for one step's more): reading waits for the
+aligners past it."""
+comptime RING_STEPS = 8
+"""Steps' pieces the ring holds."""
 
 
 struct _Slice(Movable):
@@ -446,41 +507,52 @@ struct _Slice(Movable):
         self.alignments = 0
 
 
-struct _Piece(Movable):
-    """A slice's reads of one chunk: the GAF lines of those that touch the contig (newline-ended), then their
+struct _Piece(Copyable, Movable):
+    """A slice's reads of one chunk: the GAF lines of those that touch a contig (newline-ended), then their
     records."""
 
     var lines: List[UInt8]
     var text: List[UInt8]
+    var bytes: Int
+    """Its lines' bytes, as published."""
     var written: Int
+    """Reads with a record."""
+    var records: Int
 
     def __init__(out self):
         self.lines = List[UInt8]()
         self.text = List[UInt8]()
-        self.written = 0
-
-
-struct _Batch(Movable):
-    """Pieces in input order: `used` of them filled, `bytes` of lines in all."""
-
-    var pieces: List[_Piece]
-    var used: Int
-    var bytes: Int
-
-    def __init__(out self):
-        self.pieces = List[_Piece]()
-        self.used = 0
         self.bytes = 0
+        self.written = 0
+        self.records = 0
 
 
-comptime _FREE = -1
+comptime _PUBLISHED = 0
+"""Pieces published: piece g (a sequence number) lies in ring slot g mod the ring's size."""
+comptime _NEXT = 1
+"""The next piece an aligner takes."""
+comptime _FINISHED = 2
+"""1 once no more pieces will be published; 2 to stop at once (after an error)."""
+comptime _FAILED = 3
+comptime _CONTROLS = 4
 
 
 @fieldwise_init
-struct _Align(ParallelTask):
-    """The sink's alignment workers, run once more at the end for the last batch."""
+struct _Aligners[bam: Bool](Movable, ParallelTask):
+    """The aligners, on threads of their own for the whole run: each takes the next piece published, makes its
+    records and marks it done, until no more will be."""
 
-    var sink: MutPointer[SurjectSink, MutUntrackedOrigin]
+    var sink: MutPointer[SurjectSink[Self.bam], MutUntrackedOrigin]
+
+    def run(self, index: Int):
+        self.sink[].align_loop(index)
+
+
+@fieldwise_init
+struct _Writers[bam: Bool](ParallelTask):
+    """The writer side tasks, run on their own (when reading waits, and at the end)."""
+
+    var sink: MutPointer[SurjectSink[Self.bam], MutUntrackedOrigin]
     var failed: MutPointer[Bool, MutUntrackedOrigin]
 
     def run(self, index: Int):
@@ -490,28 +562,43 @@ struct _Align(ParallelTask):
             self.failed[] = True
 
 
-struct SurjectSink(MessageSink, Movable):
-    """Each slice gathers the GAF lines of its reads that touch the contig (a GAM's alignments written as GAF) into a
-    piece of the filling batch. A full batch (or the last) is aligned in the next step by side tasks, one a thread,
-    each taking pieces in turn and writing their records; in the step after, one more side task writes the records
-    out in order (on stdout). Three batches take turns: filling, aligning, writing."""
+struct SurjectSink[bam: Bool](MessageSink, Movable):
+    """Each slice gathers the GAF lines of its reads that touch a contig (a GAM's alignments written as GAF) into a
+    piece of the ring; after the step the pieces are published, in order. Aligners on threads of their own take the
+    pieces one at a time as they are published and make their records, so no thread waits at the end of a batch for
+    the slowest read of it. In each step, the pieces done since the last (a prefix, in order) are written out: as
+    SAM on stdout by one side task, or, with `bam`, handed to the staging buckets by `shares` side tasks. Reading
+    waits when the pieces not yet written hold IN_FLIGHT bytes of lines."""
 
     var s: Surjector
     var states: List[_Slice]
     var workers: List[_Scratch]
-    var batches: List[_Batch]
-    var filling: Int
-    var aligning: Int
-    """The batch the next step aligns, or _FREE."""
-    var writing: Int
-    """The batch the next step writes out, or _FREE."""
-    var next_piece: Atomic[Int64]
+    var ring: List[_Piece]
+    var ring_ptr: MutPointer[_Piece, MutUntrackedOrigin]
+    var done: Allocation[Atomic[Int64]]
+    """Per ring slot: 1 + the sequence number of the last piece done there."""
+    var done_ptr: MutPointer[Atomic[Int64], MutUntrackedOrigin]
+    var control: Allocation[Atomic[Int64]]
+    var control_ptr: MutPointer[Atomic[Int64], MutUntrackedOrigin]
+    var aligners: List[Background[_Aligners[Self.bam]]]
+    var threads: Int
+    var produced: Int
+    """The sequence number of the first piece the next step's slices fill."""
+    var write_from: Int
+    var write_to: Int
+    """The pieces the next step writes out."""
+    var in_flight: Int
+    """Lines of the pieces published and not yet written."""
     var lines: Bool
     var written: Int
-    """Records made, over the batches aligned."""
+    """Reads with a record, over the pieces written."""
+    var records: Int
     var failed: Bool
+    var staging: BamStaging
+    var shares: Int
 
-    def __init__(out self, var s: Surjector, threads: Int):
+    def __init__(out self, var s: Surjector, threads: Int, header: String, var staging: BamStaging):
+        """`header` is written on stdout first (SAM); BAM records go to `staging`."""
         self.s = s^
         self.states = List[_Slice]()
         for _ in range(SLICES_PER_THREAD * threads):
@@ -519,33 +606,49 @@ struct SurjectSink(MessageSink, Movable):
         self.workers = List[_Scratch]()
         for _ in range(threads):
             self.workers.append(_Scratch())
-        self.batches = List[_Batch]()
-        for _ in range(3):
-            self.batches.append(_Batch())
-        self.filling = 0
-        self.aligning = _FREE
-        self.writing = _FREE
-        self.next_piece = Atomic[Int64](0)
+        var slots = RING_STEPS * len(self.states)
+        self.ring = List[_Piece](length=slots, fill=_Piece())
+        self.ring_ptr = mut_untracked(self.ring.unsafe_ptr())
+        self.done = alloc(Layout[Atomic[Int64]](length=slots))
+        self.done_ptr = mut_untracked(self.done.unsafe_ptr())
+        for i in range(slots):
+            self.done_ptr.unsafe_offset(i).unsafe_write(Atomic[Int64](0))
+        self.control = alloc(Layout[Atomic[Int64]](length=_CONTROLS))
+        self.control_ptr = mut_untracked(self.control.unsafe_ptr())
+        for i in range(_CONTROLS):
+            self.control_ptr.unsafe_offset(i).unsafe_write(Atomic[Int64](0))
+        self.aligners = List[Background[_Aligners[Self.bam]]]()
+        self.threads = threads
+        self.produced = 0
+        self.write_from = 0
+        self.write_to = 0
+        self.in_flight = 0
         self.lines = False
         self.written = 0
+        self.records = 0
         self.failed = False
-        self._room()
-        var header = List[UInt8]()
-        put_text(header, "@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:")
-        header.extend(self.s.sam_contig.as_bytes())
-        put_text(header, "\tLN:")
-        put_int(header, len(self.s.contig.seq))
-        put_text(header, "\n@PG\tID:dromos-surject\tPN:dromos\tVN:0.1.0\n")
-        write_all(1, header.unsafe_ptr(), len(header))
+        self.shares = staging.shares
+        self.staging = staging^
+        comptime if not Self.bam:
+            write_all(1, header.unsafe_ptr(), header.byte_length())
 
-    def _room(mut self):
-        """Pieces enough in the filling batch for the next step's slices."""
-        ref b = self.batches[self.filling]
-        while len(b.pieces) < b.used + len(self.states):
-            b.pieces.append(_Piece())
+    def __deinit__(deinit self):
+        # The aligners are joined by `finish`; any still running are stopped and joined before the ring goes.
+        self.control_ptr.unsafe_offset(_FINISHED)[].store(2)
+        for k in range(len(self.aligners)):
+            self.aligners[k].join()
+        dealloc(self.done^)
+        dealloc(self.control^)
+
+    @always_inline
+    def _slot(self, g: Int) -> MutPointer[_Piece, MutUntrackedOrigin]:
+        return self.ring_ptr.unsafe_offset(g % len(self.ring))
 
     def begin(mut self, lines: Bool) raises:
         self.lines = lines
+        self.aligners.append(
+            Background(_Aligners[Self.bam](mut_untracked(Pointer(to=self))), self.threads, self.threads)
+        )
 
     def slices(self) -> Int:
         return len(self.states)
@@ -559,11 +662,11 @@ struct SurjectSink(MessageSink, Movable):
         last: Int,
     ) raises:
         var st = mut_untracked(Pointer(to=self.states[slice]))
-        ref b = self.batches[self.filling]
-        var piece = mut_untracked(Pointer(to=b.pieces[b.used + slice]))
+        var piece = self._slot(self.produced + slice)
         piece[].lines.clear()
         piece[].text.clear()
         piece[].written = 0
+        piece[].records = 0
         for m in range(first, last):
             var at = messages[unsafe_offset=2 * m]
             var stop = messages[unsafe_offset=2 * m + 1]
@@ -588,91 +691,177 @@ struct SurjectSink(MessageSink, Movable):
             if a.name_length > 0 and data[unsafe_offset=a.name_at] == _HASH:
                 continue
             st[].alignments += 1
-            # No base can be placed unless a node of the alignment is the contig's.
+            # No base can be placed unless a node of the alignment is a contig's.
             var any_placed = False
             for map in a.maps:
-                any_placed = any_placed or self.s.contig.placed(map.node) >= 0
+                any_placed = any_placed or self.s.reference.placed_anywhere(map.node)
             if any_placed:
                 a.decode(data, at, stop)
                 gaf_line(data, a, self.s.nodes, piece[].lines)
 
+    def align_loop(mut self, index: Int):
+        """Aligner `index`: the next piece published, one at a time, until no more will be."""
+        var scratch = mut_untracked(Pointer(to=self.workers[index]))
+        ref published = self.control_ptr.unsafe_offset(_PUBLISHED)[]
+        ref finished = self.control_ptr.unsafe_offset(_FINISHED)[]
+        while True:
+            var g = Int(self.control_ptr.unsafe_offset(_NEXT)[].fetch_add(1))
+            while g >= Int(published.load()):
+                if finished.load() != 0 and g >= Int(published.load()):
+                    return
+                _ = external_call["usleep", Int32](UInt32(200))
+            if finished.load() == 2:
+                return
+            var piece = self._slot(g)
+            try:
+                var p = piece[].lines.unsafe_ptr().as_imm()
+                var n = len(piece[].lines)
+                var at = 0
+                while at < n:
+                    var hit = external_call["memchr", Int](p.unsafe_offset(at), Int32(ord("\n")), n - at)
+                    var end = hit - Int(p)
+                    var made = self.s.surject_read[Self.bam](p.unsafe_offset(at), end - at, scratch[], piece[].text)
+                    if made > 0:
+                        piece[].written += 1
+                        piece[].records += made
+                    at = end + 1
+            except:
+                self.control_ptr.unsafe_offset(_FAILED)[].store(1)
+            piece[].lines = List[UInt8]()
+            self.done_ptr.unsafe_offset(g % len(self.ring))[].store(Int64(g + 1))
+
+    def _done_through(self, start: Int) -> Int:
+        """The first piece from `start` on not yet done (or not yet published)."""
+        var g = start
+        var published = Int(self.control_ptr.unsafe_offset(_PUBLISHED)[].load())
+        while g < published and Int(self.done_ptr.unsafe_offset(g % len(self.ring))[].load()) == g + 1:
+            g += 1
+        return g
+
+    def _check(self) raises:
+        if self.control_ptr.unsafe_offset(_FAILED)[].load() != 0:
+            raise Error("a read could not be aligned")
+
     def side_tasks(self) -> Int:
-        return (len(self.workers) if self.aligning != _FREE else 0) + (1 if self.writing != _FREE else 0)
+        if self.write_to == self.write_from:
+            return 0
+        comptime if Self.bam:
+            return self.shares
+        return 1
 
     def side_task(mut self, index: Int) raises:
-        if index >= len(self.workers) or self.aligning == _FREE:
-            self._write(self.writing)
-            return
-        # A worker: the batch's pieces, one at a time, until none is left.
-        var scratch = mut_untracked(Pointer(to=self.workers[index]))
-        ref b = self.batches[self.aligning]
-        while True:
-            var k = Int(self.next_piece.fetch_add(1))
-            if k >= b.used:
-                return
-            var piece = mut_untracked(Pointer(to=b.pieces[k]))
-            var p = piece[].lines.unsafe_ptr().as_imm()
-            var n = len(piece[].lines)
-            var at = 0
-            while at < n:
-                var hit = external_call["memchr", Int](p.unsafe_offset(at), Int32(ord("\n")), n - at)
-                var end = hit - Int(p)
-                if self.s.surject_line(p.unsafe_offset(at), end - at, scratch[], piece[].text):
-                    piece[].written += 1
-                at = end + 1
+        comptime if Self.bam:
+            # Share `index` of the staging buckets takes its records of every piece, in order.
+            for g in range(self.write_from, self.write_to):
+                var piece = self._slot(g)
+                self.staging.take_share(index, piece[].text.unsafe_ptr(), len(piece[].text))
+        else:
+            for g in range(self.write_from, self.write_to):
+                var piece = self._slot(g)
+                write_all(1, piece[].text.unsafe_ptr(), len(piece[].text))
 
-    def _write(mut self, batch: Int):
-        ref b = self.batches[batch]
-        for k in range(b.used):
-            write_all(1, b.pieces[k].text.unsafe_ptr(), len(b.pieces[k].text))
+    def _wrote(mut self) raises:
+        """Accounts for the pieces just written out (on one thread): counted, their records freed, their slots
+        free; then the next pieces to write, those done since."""
+        comptime if Self.bam:
+            if self.write_to > self.write_from:
+                self.staging.after_shares()
+        for g in range(self.write_from, self.write_to):
+            var piece = self._slot(g)
+            self.written += piece[].written
+            self.records += piece[].records
+            self.in_flight -= piece[].bytes
+            piece[].text = List[UInt8]()
+        self.write_from = self.write_to
+        self.write_to = self._done_through(self.write_from)
+        comptime if Self.bam:
+            for g in range(self.write_from, self.write_to):
+                var piece = self._slot(g)
+                self.staging.make_room(piece[].text.unsafe_ptr(), len(piece[].text))
+
+    def _write_now(mut self) raises:
+        """Writes out the pieces due, on `threads` threads, now (not beside a step)."""
+        var task = _Writers[Self.bam](mut_untracked(Pointer(to=self)), mut_untracked(Pointer(to=self.failed)))
+        parallel_for(task, self.side_tasks(), self.threads)
+        if self.failed:
+            raise Error("records could not be written")
 
     def after_step(mut self, slices: Int) raises:
-        # The batch aligned in the step just run is the next to write; the one written is free.
-        var free = self.writing
-        self.writing = self.aligning
-        self.aligning = _FREE
-        if self.writing != _FREE:
-            ref done = self.batches[self.writing]
-            for k in range(done.used):
-                self.written += done.pieces[k].written
-        if free != _FREE:
-            self.batches[free].used = 0
-            self.batches[free].bytes = 0
-        ref b = self.batches[self.filling]
-        for k in range(b.used, b.used + slices):
-            b.bytes += len(b.pieces[k].lines)
-        b.used += slices
-        # A full batch is aligned next (the last, whatever its size, by `finish`).
-        if b.bytes >= BATCH_BYTES:
-            self.aligning = self.filling
-            self.next_piece.store(0)
-            for k in range(3):
-                if k != self.aligning and k != self.writing:
-                    self.filling = k
-                    break
-        self._room()
+        self._check()
+        # The pieces the slices filled are published, in order.
+        for k in range(slices):
+            var piece = self._slot(self.produced + k)
+            piece[].bytes = len(piece[].lines)
+            self.in_flight += piece[].bytes
+        self.produced += slices
+        self.control_ptr.unsafe_offset(_PUBLISHED)[].store(Int64(self.produced))
+        # The pieces written in the step just run, and those to write next.
+        self._wrote()
+        # Room for the next step's pieces: slots written out, and lines in flight under the bound. Done pieces are
+        # written out here while waiting, so the wait always ends.
+        while self.produced + len(self.states) > self.write_from + len(self.ring) or self.in_flight >= IN_FLIGHT:
+            self._check()
+            if self.write_to > self.write_from:
+                self._write_now()
+                self._wrote()
+            else:
+                _ = external_call["usleep", Int32](UInt32(500))
+                self.write_to = self._done_through(self.write_from)
+                comptime if Self.bam:
+                    for g in range(self.write_from, self.write_to):
+                        var piece = self._slot(g)
+                        self.staging.make_room(piece[].text.unsafe_ptr(), len(piece[].text))
 
-    def finish(mut self, contig: String, threads: Int, complete: Bool) raises:
-        """Writes what was aligned and, once the input is `complete`, aligns and writes the last batch; then the
-        counts. Also after an error (not `complete`), so the records made so far are out."""
-        if self.writing != _FREE:
-            self._write(self.writing)
-            self.writing = _FREE
-        if complete and self.aligning == _FREE and self.batches[self.filling].used > 0:
-            self.aligning = self.filling
-            self.next_piece.store(0)
-        if complete and self.aligning != _FREE:
-            var task = _Align(mut_untracked(Pointer(to=self)), mut_untracked(Pointer(to=self.failed)))
-            parallel_for(task, len(self.workers), threads)
-            if self.failed:
-                raise Error("a read could not be aligned")
-            self.after_step(0)
-            self._write(self.writing)
-            self.writing = _FREE
+    def finish(mut self, threads: Int, complete: Bool) raises:
+        """Once the input is `complete`, waits for the aligners and writes out what is left. After an error (not
+        `complete`), the aligners stop, and SAM records made so far are written out."""
+        if not complete:
+            self.control_ptr.unsafe_offset(_FINISHED)[].store(2)
+            for k in range(len(self.aligners)):
+                self.aligners[k].join()
+            self.aligners.clear()
+            comptime if not Self.bam:
+                if self.write_to > self.write_from:
+                    self._write_now()
+            return
+        self.control_ptr.unsafe_offset(_FINISHED)[].store(1)
+        # Pieces written in the step that ran last are accounted for by after_step; the rest now.
+        while self.write_from < self.produced:
+            self._check()
+            if self.write_to > self.write_from:
+                self._write_now()
+                self._wrote()
+            else:
+                _ = external_call["usleep", Int32](UInt32(500))
+                self.write_to = self._done_through(self.write_from)
+                comptime if Self.bam:
+                    for g in range(self.write_from, self.write_to):
+                        var piece = self._slot(g)
+                        self.staging.make_room(piece[].text.unsafe_ptr(), len(piece[].text))
+        for k in range(len(self.aligners)):
+            self.aligners[k].join()
+        self.aligners.clear()
+        self._check()
+
+    def report(self, what: String):
+        """The counts, on stderr: alignments read, and those with a record on `what` (the contig, or the contigs)."""
         var n = 0
         for t in range(len(self.states)):
             n += self.states[t].alignments
+        var contigs = len(self.s.reference.contigs)
+        if contigs == 1:
+            print(
+                (
+                    t"[dromos] surject: {n} alignments, {self.written} written, {n - self.written} without a base on"
+                    t" {what}"
+                ),
+                file=stderr,
+            )
+            return
         print(
-            t"[dromos] surject: {n} alignments, {self.written} written, {n - self.written} without a base on {contig}",
+            (
+                t"[dromos] surject: {n} alignments, {self.written} with a base on {what} ({self.records} records),"
+                t" {n - self.written} without"
+            ),
             file=stderr,
         )

@@ -21,7 +21,7 @@ from std.ffi import OwnedDLHandle, external_call
 from std.memory import unsafe_memcpy
 
 from dromos.bgzf import MappedFile, load_zstd, zstd_decompress
-from dromos.contig import Contig
+from dromos.contig import Contig, Reference
 from dromos.gaf_text import parse_unsigned
 from dromos.linearize import Window
 from dromos.output import OutFile, write_all
@@ -106,6 +106,45 @@ def _snarl(contig: Contig, map: RefMap, p: ImmPointer[UInt8, _], at: Int, end: I
         hi = sa
     if hi >= lo and hi - lo <= MAX_SITE:
         all.append(Window(lo, hi))
+
+
+@fieldwise_init
+struct _LoadWindows[map_origin: ImmOrigin, ref_origin: ImmOrigin](ParallelTask):
+    """Catalog `i`'s windows on contig `i` of the reference, a contig a task."""
+
+    var map: ImmPointer[RefMap, Self.map_origin]
+    var reference: ImmPointer[Reference, Self.ref_origin]
+    var paths: ImmPointer[String, ImmUntrackedOrigin]
+    var out: MutPointer[List[Window], MutUntrackedOrigin]
+    var failed: MutPointer[Int, MutUntrackedOrigin]
+
+    def run(self, index: Int):
+        try:
+            self.out[unsafe_offset=index] = load_windows(
+                self.paths[unsafe_offset=index], self.reference[].contigs[index], self.map[]
+            )
+        except:
+            self.failed[] = index + 1
+
+
+def load_all_windows(paths: List[String], reference: Reference, map: RefMap, threads: Int) raises -> List[List[Window]]:
+    """Each contig's windows from its catalog (`paths[i]` for contig i), contigs read at once."""
+    var out = List[List[Window]](length=len(paths), fill=List[Window]())
+    var failed = List[Int](length=1, fill=0)
+    var task = _LoadWindows(
+        Pointer(to=map),
+        Pointer(to=reference),
+        paths.unsafe_ptr().as_imm().unsafe_origin_cast[ImmUntrackedOrigin](),
+        out.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
+        failed.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
+    )
+    parallel_for(task, len(paths), threads)
+    if failed[0] > 0:
+        # Read again on this thread, for its error.
+        var k = failed[0] - 1
+        _ = load_windows(paths[k], reference.contigs[k], map)
+        raise Error(t"{paths[k]}: its windows could not be read")
+    return out^
 
 
 def load_windows(path: String, contig: Contig, map: RefMap) raises -> List[Window]:

@@ -1,17 +1,23 @@
 """Dromos: pangenome graph alignments, fast. `dromos COMMAND -h` for each command's usage."""
 
+from std.ffi import external_call
+from std.os import stat
+from std.os.path import dirname
 from std.sys import argv, exit, stderr
 from std.time import perf_counter_ns
 
 from dromos.build import BuildOptions, run_build
-from dromos.contig import Contig
+from dromos.bam import BamIndex, bam_header, needs_csi
+from dromos.bam_sort import BamStaging, write_bam
+from dromos.contig import Reference
 from dromos.convert import GafSink
 from dromos.graph import reference_samples, resolve_reference_sample
 from dromos.index import IndexSink
 from dromos.linearize import Window
 from dromos.nodes import NodeTable
+from dromos.output import OutFile
 from dromos.parallel import default_threads
-from dromos.pgsites import load_windows, view
+from dromos.pgsites import load_all_windows, view
 from dromos.prepare import graph_cache
 from dromos.refmap import RefMap
 from dromos.stream import AUTO, GAF, GAM, stream_input
@@ -21,7 +27,8 @@ comptime OVERVIEW = """dromos: pangenome graph alignments, fast
 
   dromos index       a GAM or GAF placed on the reference, sorted and tabix-indexed, as pgphase reads it
   dromos gam-to-gaf  a GAM as GAF, the lines vg convert -G writes
-  dromos surject     a GAM or GAF as SAM on one reference contig, the records pgcatalog surject writes
+  dromos surject     a GAM or GAF on the reference contigs, the records pgcatalog surject writes: SAM, or a
+                     sorted, indexed BAM
 
   dromos catalog            a GBZ graph's site catalogs, one per reference contig (<contig>.pgsites), as pgphase
                             reads them: the files pgcatalog build writes
@@ -66,30 +73,40 @@ GAM as GAF on stdout: the lines vg convert -G writes for it, in the GAM's order.
   --slim                    each line's 12 GAF columns alone (no cs, bq, AS or dv; the node letters are not read)
 """
 
-comptime SURJECT_USAGE = """dromos surject [options] --graph GRAPH.gbz --contig NAME IN > OUT.sam
+comptime SURJECT_USAGE = """dromos surject [options] --graph GRAPH.gbz IN -o OUT.bam
+dromos surject [options] --graph GRAPH.gbz --contig NAME IN > OUT.sam
 
-IN's alignments as alignments to one reference contig, as SAM on stdout: the records pgcatalog surject writes for the
-same graph, reads and options, in IN's order. Reads with no base on the contig are left out.
-  | samtools sort -o OUT.bam && samtools index OUT.bam
+IN's alignments as alignments to the reference contigs: the records pgcatalog surject writes for the same graph,
+reads and options, one run for each contig, in one pass over IN. A read with bases on several contigs has a record on
+each; reads with no base on any are left out.
+  -o OUT.bam                a BAM sorted as samtools sort sorts it, and its index (OUT.bam.bai, or .csi when a
+                            contig is longer than a .bai holds); without it, SAM on stdout in IN's order (a read's
+                            records in contig order)
 
   --graph FILE              the pangenome graph (GBZ)
   --cache FILE              the graph's cache: made there on first use (and again when the graph changes), read
                             after [GRAPH.gbz.dromos, beside the graph]
   IN                        a GAM, or a GAF with cs (and bq for qualities; plain, gzip or BGZF), told apart by their
                             first bytes; - reads stdin. dromos index's output keeps no cs and cannot be used
-  --contig NAME             the reference contig (chr20)
-  --reference-sample NAME   the sample whose path is the reference [the graph's declared reference sample, if it
+  --contig NAME             a reference contig (chr20); repeat it for several [every contig of the reference sample]
+  --reference-sample NAME   the sample whose paths are the reference [the graph's declared reference sample, if it
                             declares exactly one]
-  --sam-contig NAME         the contig's name in the SAM [<sample>#0#<contig>]
+  --sam-names full|short    the contigs' names in the SAM or BAM: CHM13#0#chr20, or chr20 [full]
+  --sam-contig NAME         the one contig's name in the SAM or BAM (with a single --contig)
   --graph-placement         place read bases only where the graph puts them: a stretch of more than 50 bases off the
                             reference is not aligned to it, and such read ends are clipped
-  --catalog FILE            the contig's catalog (.pgsites): a read spanning one of its snarl windows is aligned
+  --catalog DIR|FILE        the contigs' catalogs, DIR/<contig>.pgsites as dromos catalog --out DIR writes them (or
+                            one contig's .pgsites file): a read spanning one of a contig's snarl windows is aligned
                             there as its allele, at minimap2's asm5 costs
   -t THREADS                threads [the machine's cores]
+  -l LEVEL                  the BAM's deflate level, 0 to 12 [4]
+  -m SIZE                   memory for records waiting to be sorted, compressed (K, M or G); past half of it they
+                            are spilled to --tmp-dir [8G]
+  --tmp-dir DIR             where records are spilled [OUT.bam's folder]
   --gaf                     IN is a GAF (not told from its bytes)
   --gam                     IN is a GAM (not told from its bytes)
 
-Each read is rebuilt from its walk and cs; a base on a node the contig visits once takes that node's position.
+Each read is rebuilt from its walk and cs; a base on a node a contig visits once takes that node's position.
 Between placed stretches, a substitution bubble is aligned base for base and an indel bubble globally; read ends off
 the reference are aligned or soft-clipped, and ends diverging from the read's own graph alignment clipped.
 """
@@ -211,6 +228,15 @@ struct _Args(Movable):
                 return v^
         return None
 
+    def values(mut self, name: StaticString) -> List[String]:
+        """Every value given after `name` (all taken out), in order."""
+        var out = List[String]()
+        while True:
+            var v = self.value(name)
+            if not v:
+                return out^
+            out.append(v.value())
+
     def threads(mut self) -> Int:
         var t = self.value("-t")
         return _number(t.value(), "-t", 1, 1024, self.command) if t else default_threads()
@@ -299,46 +325,178 @@ def gam_to_gaf_main() raises:
             sink.finish()
 
 
+def _size(text: String, option: String, command: StaticString) -> Int:
+    """`text` as bytes: a number with an optional K, M or G (powers of 1024)."""
+    var n = text.byte_length()
+    var scale = 1
+    var digits = text
+    if n > 0:
+        var last = String(text[byte = n - 1 :]).upper()
+        if last == "K" or last == "M" or last == "G":
+            scale = 1 << 10 if last == "K" else (1 << 20 if last == "M" else 1 << 30)
+            digits = String(text[byte = : n - 1])
+    return _number(digits, option, 1, Int.MAX // scale, command) * scale
+
+
+def _writable(path: String) raises:
+    """Makes and removes `path`: an error now if it cannot be written."""
+    _ = OutFile(path)
+    var c = List[UInt8](path.as_bytes())
+    c.append(0)
+    _ = external_call["unlink", Int32](c.unsafe_ptr())
+
+
+def _is_dir(path: String) -> Bool:
+    try:
+        return (Int(stat(path).st_mode) & 0o170000) == 0o040000
+    except:
+        return False
+
+
 def surject_main() raises:
     var args = _Args("surject")
     if args.help():
         print(SURJECT_USAGE, end="")
         return
     var threads = args.threads()
-    var contig_arg = args.value("--contig")
+    var contig_args = args.values("--contig")
     var sample_arg = args.value("--reference-sample")
     var sam_arg = args.value("--sam-contig")
+    var names_arg = args.value("--sam-names")
     var catalog_arg = args.value("--catalog")
     var cache_arg = args.value("--cache")
+    var out_arg = args.value("-o")
+    var level_arg = args.value("-l")
+    var memory_arg = args.value("-m")
+    var tmp_arg = args.value("--tmp-dir")
     var placement = args.flag("--graph-placement")
     var gaf = args.flag("--gaf")
     var gam = args.flag("--gam")
     if gaf and gam:
         _fail("--gaf or --gam, not both", "surject")
-    if not contig_arg:
-        _fail("--contig is required", "surject")
+    var short_names = False
+    if names_arg:
+        if names_arg.value() == "short":
+            short_names = True
+        elif names_arg.value() != "full":
+            _fail(String(t"--sam-names is full or short, not {names_arg.value()}"), "surject")
+    var level = _number(level_arg.value(), "-l", 0, 12, "surject") if level_arg else 4
+    var memory = _size(memory_arg.value(), "-m", "surject") if memory_arg else 8 << 30
+    if not out_arg and (level_arg or memory_arg or tmp_arg):
+        _fail("-l, -m and --tmp-dir are for a BAM (-o)", "surject")
     var graph = _graph(args, SURJECT_USAGE)
     var pos = args.positional(1)
     var sample = resolve_reference_sample(graph, sample_arg)
     var cache = graph_cache(graph, cache_arg, sample, threads)
-    var contig_name = contig_arg.value()
     var t0 = perf_counter_ns()
     var map = RefMap(cache, sample)
     var nodes = NodeTable(cache)
-    var contig = Contig(map, nodes, contig_name)
-    var windows = List[Window]()
+    # The contigs, in reference order: those named, or all.
+    var names = List[String]()
+    for c in map.contigs:
+        var wanted = len(contig_args) == 0
+        for a in contig_args:
+            wanted = wanted or a == c
+        if wanted:
+            names.append(c)
+    for a in contig_args:
+        var known = False
+        for c in map.contigs:
+            known = known or a == c
+        if not known:
+            raise Error(t"no reference path {sample}#0#{a} in the graph")
+    if len(names) == 0:
+        raise Error(t"no reference paths of {sample} in the graph")
+    if sam_arg and len(names) != 1:
+        _fail("--sam-contig names one contig: give one --contig (or --sam-names for several)", "surject")
+    if sam_arg and names_arg:
+        _fail("--sam-contig or --sam-names, not both", "surject")
+    var reference = Reference(map, nodes, names, threads)
+    var sam_names = List[String]()
+    var lengths = List[Int]()
+    for k in range(len(names)):
+        if sam_arg:
+            sam_names.append(sam_arg.value())
+        elif short_names:
+            sam_names.append(names[k])
+        else:
+            sam_names.append(reference.contigs[k].chrom)
+        lengths.append(len(reference.contigs[k].seq))
+    var windows = List[List[Window]](length=len(names), fill=List[Window]())
     if catalog_arg:
-        windows = load_windows(catalog_arg.value(), contig, map)
-        print(t"[dromos] surject: {len(windows)} snarl windows", file=stderr)
-    var sam_contig = sam_arg.value() if sam_arg else contig.chrom
-    print(t"[dromos] {contig.chrom}: {len(contig.seq)} bases ({Float64(perf_counter_ns() - t0) * 1e-9} s)", file=stderr)
-    var sink = SurjectSink(Surjector(contig^, nodes^, sam_contig, placement, windows^), threads)
+        var paths = List[String]()
+        var at = catalog_arg.value()
+        if _is_dir(at):
+            for c in names:
+                var f = at + "/" + c + ".pgsites"
+                try:
+                    _ = stat(f)
+                except:
+                    raise Error(t"no catalog {f} for {c}")
+                paths.append(f)
+        elif len(names) == 1:
+            paths.append(at)
+        else:
+            _fail("--catalog FILE is one contig's catalog: give a folder of them for several contigs", "surject")
+        windows = load_all_windows(paths, reference, map, threads)
+        var count = 0
+        for w in windows:
+            count += len(w)
+        print(t"[dromos] surject: {count} snarl windows", file=stderr)
+    if len(names) == 1:
+        print(
+            (
+                t"[dromos] {reference.contigs[0].chrom}: {len(reference.contigs[0].seq)} bases"
+                t" ({Float64(perf_counter_ns() - t0) * 1e-9} s)"
+            ),
+            file=stderr,
+        )
+    else:
+        var bases = 0
+        for n in lengths:
+            bases += n
+        print(
+            t"[dromos] {len(names)} contigs of {sample}: {bases} bases ({Float64(perf_counter_ns() - t0) * 1e-9} s)",
+            file=stderr,
+        )
+    var what = names[0] if len(names) == 1 else String(t"{len(names)} contigs")
+    var surjector = Surjector(reference^, nodes^, sam_names.copy(), placement, windows^)
+    var kind = GAF if gaf else (GAM if gam else AUTO)
+    if not out_arg:
+        var header = String("@HD\tVN:1.6\tSO:unsorted\n")
+        for k in range(len(sam_names)):
+            header += String(t"@SQ\tSN:{sam_names[k]}\tLN:{lengths[k]}\n")
+        header += "@PG\tID:dromos-surject\tPN:dromos\tVN:0.1.0\n"
+        var sink = SurjectSink[False](surjector^, threads, header, BamStaging(0, 1, memory, "."))
+        try:
+            stream_input(_input(pos[0]), threads, sink, kind)
+        except e:
+            sink.finish(threads, complete=False)
+            raise e^
+        sink.finish(threads, complete=True)
+        sink.report(what)
+        return
+    var out = out_arg.value()
+    var folder = dirname(out)
+    var spill_dir = tmp_arg.value() if tmp_arg else (folder if folder else String("."))
+    # Where the BAM and the spills go is tried now, not after the input has been read.
+    _writable(out + ".tmp")
+    _writable(spill_dir + "/.dromos-spill." + String(external_call["getpid", Int32]()))
+    var text = String("@HD\tVN:1.6\tSO:coordinate\n")
+    for k in range(len(sam_names)):
+        text += String(t"@SQ\tSN:{sam_names[k]}\tLN:{lengths[k]}\n")
+    text += "@PG\tID:dromos-surject\tPN:dromos\tVN:0.1.0\n"
+    var header = bam_header(text, sam_names, lengths)
+    var staging = BamStaging(len(names), threads, memory, spill_dir)
+    var sink = SurjectSink[True](surjector^, threads, String(), staging^)
     try:
-        stream_input(_input(pos[0]), threads, sink, GAF if gaf else (GAM if gam else AUTO))
+        stream_input(_input(pos[0]), threads, sink, kind)
     except e:
-        sink.finish(contig_name, threads, complete=False)
+        sink.finish(threads, complete=False)
         raise e^
-    sink.finish(contig_name, threads, complete=True)
+    sink.finish(threads, complete=True)
+    sink.report(what)
+    write_bam(sink.staging, header, BamIndex(sam_names, lengths, needs_csi(lengths)), out, level, threads)
 
 
 def prepare_main() raises:
