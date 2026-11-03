@@ -3,9 +3,10 @@
 Pangenome graph alignments in Mojo: vg's GAM read as fast as the disk delivers it, written as pgphase's index (the
 file `pgcat index-gaf --slim` writes), as the GAF lines `vg convert -G` writes, or surjected onto the reference
 contigs (`pgcatalog surject`'s records, every contig in one pass, as SAM or a sorted, indexed BAM)
-(github.com/kokyriakidis/pgphase). It reads the GBZ graph itself, through the gbz crate: it makes the site catalogs
-pgphase's pgcatalog made (`catalog`, `view`), and keeps what the other commands read of the graph in one cache file
-beside it (`G.gbz.dromos`, `prepare`). dromos alone turns a graph and its alignments into pgphase's inputs.
+(github.com/kokyriakidis/pgphase). It reads the GBZ graph itself, through the gbz crate: it makes the graph's site
+catalog, one file of every contig's snarls in binary columns (`catalog`; `view` prints pgcatalog view's text of it,
+`catalog-info` its header), and keeps what the other commands read of the graph in one cache file beside it
+(`G.gbz.dromos`, `prepare`). dromos alone turns a graph and its alignments into pgphase's inputs.
 
 ## Mojo skills
 
@@ -22,8 +23,8 @@ habits:
 
 ## Layout
 
-- `cli/dromos_cli.mojo`: the commands, `index`, `gam-to-gaf`, `surject`, `catalog`, `view`, `prepare` and
-  `reference-samples`, each with its own options and `-h`. index, gam-to-gaf and surject take the graph as
+- `cli/dromos_cli.mojo`: the commands, `index`, `gam-to-gaf`, `surject`, `catalog`, `view`, `catalog-info`, `prepare`
+  and `reference-samples`, each with its own options and `-h`. index, gam-to-gaf and surject take the graph as
   `--graph G.gbz` (and `--cache FILE`) and read its cache.
 - `gbz-ffi/`: the gbz crate (=0.6.2, with simple-sds =0.4.2) behind a C interface, a Rust cdylib
   (`libdromos_gbz`, built by `pixi run build` beside build/dromos; dromos finds it there, then at $DROMOS_GBZ_LIB).
@@ -38,12 +39,16 @@ habits:
   damaged). `dromos/prepare.mojo`: the cache made from a GBZ (`make_cache`: one load of the graph's parts; paths
   walked in the background while the nodes are found and read; letters packed in the background while the
   placements are laid out; every section written through a mapping) and found or made again (`graph_cache`).
-- `dromos/snarls.mojo`: vg snarls files (plain, gzip, BGZF), pgcatalog's snarls.rs. `dromos/catalog.mojo`: one
-  contig's catalog (pgcatalog's catalog.rs, record.rs and reference.rs): node letters a page at a time, the reference
-  path and its traversals, the haplotype walk search, records and their lines, and the steps that build, write and
-  compress them. `dromos/build.mojo`: the `catalog` command (build.rs: regions, the snarls cache, vg chunk and vg
-  snarls when a contig's snarls are not cached). `dromos/pgsites.mojo`: the `.pgsites` format: the writer, the reader,
-  `view`, and surject's snarl windows.
+- `dromos/snarls.mojo`: vg snarls files (plain, gzip, BGZF), pgcatalog's snarls.rs. `dromos/dist.mojo`: snarls from a
+  giraffe distance index (libbdsg's SnarlDistanceIndex, versions 3 and 4), read in place, oriented as vg snarls
+  writes them. `dromos/catalog.mojo`: one contig's records (pgcatalog's catalog.rs, record.rs and reference.rs): node
+  letters a page at a time, the reference path and its traversals, the haplotype walk search, records, their blocks
+  and `encode_block` (a block's columns), and the steps that build and encode them on the pool. `dromos/build.mojo`:
+  the `catalog` command (build.rs: regions, `SnarlSource`, the one interface to the snarls' sources: the distance
+  index, checked against the graph, or the snarls cache, vg chunk and vg snarls when a contig's snarls are not
+  cached; contigs built three at a time, the biggest first). `dromos/sites.mojo`: the site catalog's format
+  (docs/catalog-format.md is its specification): the writer, the reader, `view`, `info` and surject's snarl windows.
+  `dromos/pool.mojo`: worker threads shared by several jobs at once (every contig's steps).
 - `dromos/stream.mojo`: the pipeline every command runs on: reads (O_DIRECT), decoding (BGZF, plain, gzip), GAM
   told from GAF by the first bytes (`looks_like_gaf`), framing (GAM messages or GAF lines), and a `MessageSink`
   taking slices of each chunk.
@@ -97,11 +102,18 @@ habits:
   ff2b4b2; refmap.mojo and tabix.mojo port its gaf.rs and tabix.rs): at `-l 0` the same file byte for byte, and the
   same .tbi decompressed (the check does this). At other levels only the deflate differs: compare decompressed content
   and tabix queries.
-- `dromos catalog` must write pgcatalog build's `.pgsites` byte for byte (the same records, blocks, zstd frames and
-  index; zstd 1.5.7, pgcatalog's, with its parameters per frame), and `dromos view` print pgcatalog view's text, for
-  any threads: check any change with `pixi run check` (its catalog and view cases; `--full` for the whole genome)
-  and tests/integration/edges.sh. Haplotype walks may be found in any order (they are sorted); a heavy snarl's
-  haplotypes are searched in parts whose walks and counts add up.
+- The site catalog is dromos's own format, versioned: `VERSION` in sites.mojo is 1, and docs/catalog-format.md says
+  exactly what a reader needs (pgphase's C++ reader is written from it). Any change to the layout or meaning raises
+  VERSION and the document together; a reader refuses other versions, and truncated or damaged files, saying which.
+- `dromos view` of a `dromos catalog` file must print, for each contig and region, pgcatalog view's text of
+  pgcatalog build's catalog of it from the same snarls, byte for byte; the file must be the same for any threads.
+  Check any change with `pixi run check` (its catalog and view cases; `--full` for the whole genome, against
+  pgcatalog's catalogs, and the distance index's snarls against vg snarls') and tests/integration/edges.sh.
+  Haplotype walks may be found in any order (they are sorted); a heavy snarl's haplotypes are searched in parts whose
+  walks and counts add up.
+- Snarls from the distance index must be vg snarls' (the same start and end visits, the same parents): the
+  catalog's views from either are the same, on the whole HPRC genome. Snarls computed in dromos itself would be a
+  third `SnarlSource`.
 - `dromos surject` must write the SAM records `pgcatalog surject` writes (pgphase's tools/pgcatalog), byte for byte,
   from a GAM and from its GAF: check any change with `pixi run check` (its surject cases; `--full` for the slice).
   Float ties in `chain` use libm's log2, as Rust does. Without `--contig` it surjects every contig of the reference
@@ -120,4 +132,8 @@ habits:
   and edge cases).
 - Pointers handed to parallel tasks carry their owner's origin, or the owner is an explicit allocation that outlives
   the tasks (see sporos's CLAUDE.md for the patterns, copied here from sporos: parallel.mojo, output.mojo, bgzf.mojo).
+- A raw (untracked) pointer does not keep its owner alive: Mojo destroys a value after its last named use, on raising
+  paths too. Read a mapped file through a function that borrows the mapping for the whole call (sites.mojo's `_read`,
+  dist.mojo's `_header`), and give readers of a buffer its origin (`Cursor`).
+- Unit tests write their scratch files in `$DROMOS_TEST_DIR` (else /tmp): on xaros, a folder on /mnt/sdb.
 - Finished work merges straight into `main` and is pushed; no pull requests.
