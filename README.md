@@ -10,7 +10,7 @@ Pangenome graph alignments in Mojo, read as fast as the disk delivers them.
 ```sh
 pgcat ref-map --graph graph.gbz --out graph.refmap         # once per graph: where each node lies on the reference
 pgcat node-table --graph graph.gbz --out graph.nodes       # once per graph, for gam-to-gaf: node lengths and letters
-pixi run build
+pixi run build                                             # then ./build/dromos COMMAND -h for each command
 pixi run ./build/dromos index -t 16 graph.refmap reads.gam reads.coord.gaf.gz      # and reads.coord.gaf.gz.tbi
 pixi run ./build/dromos index -t 16 graph.refmap reads.gaf.gz reads.coord.gaf.gz   # a GAF: *.gaf[.gz|.bgz] or --gaf
 vg giraffe ... -o gaf | pixi run ./build/dromos index --gaf graph.refmap - reads.coord.gaf.gz

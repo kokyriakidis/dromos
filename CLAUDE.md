@@ -16,6 +16,19 @@ habits:
 
 `pixi run sync-skills` refreshes them from upstream; `.claude/skills/UPSTREAM` records the commit.
 
+## Layout
+
+- `cli/dromos_cli.mojo`: the commands, `index` and `gam-to-gaf`, each with its own options and `-h`.
+- `dromos/stream.mojo`: the pipeline every command runs on: reads (O_DIRECT), decoding (BGZF, plain, gzip), framing
+  (GAM messages or GAF lines), and a `MessageSink` taking slices of each chunk.
+- `dromos/gam.mojo`: GAM framing and protobuf decoding; `gaf_line` (vg's lines) and `slim_line` (the 12 columns).
+- `dromos/convert.mojo`: the `gam-to-gaf` sink. `dromos/index.mojo`: the `index` sink (placement, counts).
+- `dromos/refmap.mojo`: pgcat's reference map and placement rule. `dromos/gaf_text.mojo`: a GAF line as pgcat reads
+  it. `dromos/staging.mojo`: placed lines by bucket. `dromos/sort_write.mojo`: the final sort, BGZF and tabix
+  (`dromos/tabix.mojo`).
+- `dromos/bgzf.mojo`: files, BGZF blocks, libdeflate, zstd and zlib. `dromos/nodes.mojo`: the node table.
+  `dromos/output.mojo`, `dromos/parallel.mojo`: writing, integers, threads.
+
 ## Working here
 
 - Build: `pixi run build` (build/dromos); test: `pixi run test`; format: `pixi run format` (120 columns).

@@ -154,8 +154,8 @@ def write_sorted(mut staging: Staging, max_span: List[Int], out_path: String, le
     if Bool(getenv("DROMOS_TIMING")):
         print(
             (
-                t"dromos timing (s): sort and write {Float64(t1 - t0) * 1e-9} (steps {Float64(step_ns) * 1e-9},"
-                t" between {Float64(serial_ns) * 1e-9})"
+                t"dromos timing: sorting and writing {Float64(t1 - t0) * 1e-9} s (steps {Float64(step_ns) * 1e-9},"
+                t" between steps {Float64(serial_ns) * 1e-9})"
             ),
             file=stderr,
         )

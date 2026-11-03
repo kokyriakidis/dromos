@@ -6,6 +6,7 @@ from std.testing import TestSuite, assert_equal, assert_true
 
 from dromos.gam import Alignment, Framer, frame, gaf_line, slim_line, varint
 from dromos.nodes import NodeTable
+from dromos.gaf_text import MALFORMED, PLACED, SKIP, UNMAPPED, append_slim, classify
 from dromos.output import decimal_digits
 from dromos.refmap import AMBIGUOUS, INCONSISTENT, MISSING_NODE, NO_ANCHOR, Anchor, Placed, RefMap
 from dromos.tabix import N_BINS, bin_level, bin_parent, reg2bin
@@ -295,6 +296,42 @@ def test_decimal_digits() raises:
         bound *= 10
     assert_equal(decimal_digits(0), 1)
     assert_equal(decimal_digits(9223372036854775807), 19)
+
+
+def _classify(m: RefMap, line: StaticString) -> Tuple[Int, Int, Int, Int]:
+    """Kind, contig, start, end (as pgcat's classify gives them)."""
+    var walk = List[Int]()
+    var anchors = List[Anchor]()
+    var placed = Placed(-1, -1, -1)
+    var why = 0
+    var aligned = 0
+    var b = _text(line)
+    var kind = classify(m, b.unsafe_ptr(), len(b), walk, anchors, placed, why, aligned)
+    return (kind, placed.contig, placed.start, placed.end)
+
+
+def test_lines_as_pgcat_classifies_them() raises:
+    # pgcat's `lines` test, on its test map.
+    var m = RefMap(_refmap_file(False))
+    var r = _classify(m, "r1\t20\t0\t20\t+\t>1>2>3\t25\t2\t22\t20\t20\t60")
+    assert_true(r[0] == PLACED and r[1] == 0 and r[2] == 102 and r[3] == 122)
+    assert_equal(_classify(m, "r2\t20\t*\t*\t*\t*\t*\t*\t*\t0\t0\t255")[0], UNMAPPED)
+    assert_equal(_classify(m, "r3\t20\t0\t20\t+\t>1>2")[0], MALFORMED)
+    assert_equal(_classify(m, "r4\t20\t0\t20\t+\tchr1:5-9\t25\t2\t22\t20\t20\t60")[0], MALFORMED)
+    assert_equal(_classify(m, "@HD\tVN:1")[0], SKIP)
+    assert_equal(_classify(m, "")[0], SKIP)
+
+
+def test_slim_keeps_columns_and_pgphase_tags() raises:
+    var out = List[UInt8]()
+    var line = _text("r\t1\t2\t3\t+\t>1\t5\t6\t7\t8\t9\t60\tcs:Z::5\trq:i:7\tbq:Z:II\tpu:Z:no_anchor\trs:Z:x\trqx\t")
+    append_slim(out, line.unsafe_ptr(), len(line))
+    assert_true(out == _text("r\t1\t2\t3\t+\t>1\t5\t6\t7\t8\t9\t60\trq:i:7\tpu:Z:no_anchor\trs:Z:x"))
+    # Fewer than 12 columns: those there are; an empty last column is kept as one.
+    out.clear()
+    var short = _text("a\tb\t")
+    append_slim(out, short.unsafe_ptr(), len(short))
+    assert_true(out == _text("a\tb\t"))
 
 
 def main() raises:

@@ -449,8 +449,8 @@ def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mu
     if timing:
         print(
             (
-                t"dromos timing (s): steps {Float64(step_ns) * 1e-9}, sink {Float64(sink_ns) * 1e-9}, framing"
-                t" {Float64(serial_ns) * 1e-9}"
+                t"dromos timing: reading {Float64(step_ns + sink_ns + serial_ns) * 1e-9} s (steps"
+                t" {Float64(step_ns) * 1e-9}, between steps {Float64(sink_ns + serial_ns) * 1e-9})"
             ),
             file=stderr,
         )
