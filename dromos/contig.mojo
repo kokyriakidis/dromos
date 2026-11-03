@@ -1,5 +1,5 @@
 """A reference contig as `dromos surject` projects reads onto it (pgcatalog's surject.rs `load_contig`, over its
-reference.rs `ReferencePath`), built from the reference map and the node table instead of the graph: the contig's
+reference.rs `ReferencePath`), built from the graph's cache (its reference map and node table) instead of the graph: the contig's
 letters, and each node the contig's path visits once, with where and whether reversed.
 
 The contig's paths (fragments) are laid end to end in the order of their offsets (then of their paths), each step at
@@ -46,8 +46,6 @@ struct Contig(Movable):
         self.chrom = String(t"{map.sample}#0#{contig}")
         if len(paths) == 0:
             raise Error(t"no reference path {self.chrom} in the graph")
-        if not nodes.has_letters():
-            raise Error("the node table has no letters (dromos node-table without --no-letters)")
         # Fragments in offset order (step 0's start), then path order.
         var order = List[Int]()
         for i in range(len(paths)):
@@ -84,13 +82,13 @@ struct Contig(Movable):
                 var node = cp.nodes[s]
                 var p = map.placement(cp.first + s)
                 var n = map.length(node)
-                var letters = nodes.bases(node)
+                var letters = nodes.start(node)
                 if p.reverse:
                     for k in range(n):
-                        self.seq[p.start + k] = comp(letters[unsafe_offset=n - 1 - k])
+                        self.seq[p.start + k] = comp(nodes.at(letters + n - 1 - k))
                 else:
                     for k in range(n):
-                        self.seq[p.start + k] = letters[unsafe_offset=k]
+                        self.seq[p.start + k] = nodes.at(letters + k)
                 visits[node - lo] += 1
                 self.place[node - lo] = p.start << 1 | Int(p.reverse)
         for k in range(len(visits)):

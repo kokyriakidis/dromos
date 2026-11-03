@@ -8,7 +8,7 @@ The library is found beside the dromos binary, then at $DROMOS_GBZ_LIB.
 
 from std.ffi import OwnedDLHandle, _DLCallable, external_call
 from std.memory import unsafe_memcpy
-from std.os import getenv
+from std.os import getenv, stat
 from std.os.path import exists
 from std.sys.info import CompilationTarget
 
@@ -357,7 +357,25 @@ struct GbzGraph(Movable):
         return self._follow("follow_backward", state, out)
 
 
-struct GbzParts(Movable):
+trait NodeSource:
+    """Where the graph's cache takes node lengths and letters from: the GBZ's parts, or nodes held in memory."""
+
+    def lengths_into(
+        self, first: Int, count: Int, dst: MutPointer[UInt32, MutUntrackedOrigin]
+    ) raises -> Tuple[Int, Int]:
+        """The lengths of nodes `first ..< first + count` into `dst`, 0xFFFF_FFFF for an id the graph lacks: their
+        total, and the first id whose length a u32 cannot hold (-1 for none)."""
+        ...
+
+    def letters_into(
+        self, first: Int, count: Int, dst: MutPointer[UInt8, MutUntrackedOrigin], capacity: Int
+    ) raises -> Int:
+        """The letters of nodes `first ..< first + count` the graph has, one after another, into `dst` (room for
+        `capacity`): how many."""
+        ...
+
+
+struct GbzParts(Movable, NodeSource):
     """A GBZ's parts for reading every node and the reference paths fast (gbz-ffi's Parts): the GBWT, loaded by the
     crate, and the node sequences' pieces, read at the same time and unpacked as they are asked for. Node ids, real
     nodes, lengths and letters mean what they mean in `GbzGraph`. Read-only: any thread may call it."""
@@ -435,6 +453,16 @@ struct GbzParts(Movable):
         if n < 0:
             raise Error("node letters overflow their buffer")
         return n
+
+    def lengths_into(
+        self, first: Int, count: Int, dst: MutPointer[UInt32, MutUntrackedOrigin]
+    ) raises -> Tuple[Int, Int]:
+        return self.lengths_u32(first, count, UInt32(0xFFFF_FFFF), dst)
+
+    def letters_into(
+        self, first: Int, count: Int, dst: MutPointer[UInt8, MutUntrackedOrigin], capacity: Int
+    ) raises -> Int:
+        return self.letters(first, count, dst, capacity)
 
     def search_state(self, node: Int, reverse: Bool) raises -> Optional[SearchState]:
         """The state of the haplotypes visiting (node, reverse) (`GbzGraph.search_state`); none if no haplotype
@@ -602,9 +630,18 @@ def resolve_reference_sample(path: String, given: Optional[String]) raises -> St
 comptime _FINGERPRINT_SPAN = 4 << 20
 
 
-def fingerprint(path: String) raises -> String:
-    """An identity for the graph's content, cheap to compute: the file size and an FNV-1a hash of its first and last
-    4 MB (header, tags and index structure)."""
+@fieldwise_init
+struct GraphId(Equatable, TrivialRegisterPassable):
+    """What tells a graph file from another, cheaply: its size, its modification time (seconds) and an FNV-1a hash of
+    its first and last 4 MB (header, tags and index structure)."""
+
+    var size: Int
+    var mtime: Int
+    var hash: UInt64
+
+
+def graph_id(path: String) raises -> GraphId:
+    """The graph file's `GraphId` (of the file a link names)."""
     var f = RawFile(path)
     var size = f.size
     var span = min(_FINGERPRINT_SPAN, size)
@@ -615,8 +652,14 @@ def fingerprint(path: String) raises -> String:
             raise Error(t"{path}: cannot read")
         for b in buf:
             h = (h ^ UInt64(b)) * 0x100000001B3
+    return GraphId(size, Int(stat(path).st_mtimespec.tv_sec), h)
+
+
+def fingerprint(path: String) raises -> String:
+    """An identity for the graph's content, cheap to compute: the file size and the hash of `graph_id`."""
+    var id = graph_id(path)
     comptime digits = "0123456789abcdef"
     var hex = String()
     for i in range(16):
-        hex += String(digits[byte=Int((h >> UInt64(60 - 4 * i)) & 15)])
-    return String(t"size={size} fnv1a={hex}")
+        hex += String(digits[byte=Int((id.hash >> UInt64(60 - 4 * i)) & 15)])
+    return String(t"size={id.size} fnv1a={hex}")

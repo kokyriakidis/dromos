@@ -7,18 +7,33 @@ from std.memory import bitcast
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 from dromos.gam import Alignment, Framer, frame, gaf_line, slim_line, varint
-from dromos.nodes import NodeTable
+from dromos.nodes import NodeTable, complement
+from dromos.cache import (
+    CURRENT,
+    DAMAGED,
+    MISSING,
+    NONE,
+    NOT_A_CACHE,
+    OTHER_VERSION,
+    CacheFile,
+    CacheWriter,
+    Header,
+    examine,
+)
 from dromos.graph import (
     GbzGraph,
     GbzParts,
+    GraphId,
+    NodeSource,
     SearchState,
     fingerprint,
+    graph_id,
     is_gbz,
     reference_paths,
     reference_samples,
     resolve_reference_sample,
 )
-from dromos.graph_files import folder_of, name_of, write_node_table, write_ref_map
+from dromos.prepare import ReferenceSample, folder_of, make_cache, name_of, pack_letters, write_nodes, write_placements
 from dromos.build import natural_less, parse_region
 from dromos.catalog import Graph, ReferencePath, Traversal, build_catalog, traversals, vcf_header
 from dromos.pgsites import Catalog, Writer, compress_sealed, records, same_contig
@@ -93,28 +108,64 @@ def _mapping(node: Int, offset: Int, var edits: List[List[UInt8]]) -> List[UInt8
     return m^
 
 
-def _nodes_file() raises -> String:
-    """A node table of nodes 1 ACGTACGT, 2 GGG and 3 TTTTT (node 0 absent)."""
-    var path = String("/tmp/dromos_test_nodes.bin")
-    var t = _text("DROMOSN1")
-    var lengths: List[Int] = [0, 8, 3, 5]
-    for k in range(8):
-        t.append(UInt8((4 >> (8 * k)) & 0xFF))
-    for n in lengths:
-        for k in range(4):
-            t.append(UInt8((n >> (8 * k)) & 0xFF))
-    t.append(1)
-    for _ in range(7):
-        t.append(0)
-    var at = 0
-    for n in [0, 8, 3, 5, 0]:
-        for k in range(8):
-            t.append(UInt8((at >> (8 * k)) & 0xFF))
-        at += n
-    t.extend(Span(_text("ACGTACGTGGGTTTTT")))
-    with open(path, "w") as f:
-        f.write_bytes(Span(t))
+struct _MemoryNodes(NodeSource):
+    """Nodes held in memory: lengths (NONE for an id the graph lacks) and their letters one after another."""
+
+    var lengths: List[UInt32]
+    var letters: List[UInt8]
+
+    def __init__(out self, var lengths: List[UInt32], letters: StaticString):
+        self.lengths = lengths^
+        self.letters = _text(letters)
+
+    def _length(self, node: Int) -> Int:
+        if node >= len(self.lengths) or self.lengths[node] == UInt32(NONE):
+            return 0
+        return Int(self.lengths[node])
+
+    def lengths_into(
+        self, first: Int, count: Int, dst: MutPointer[UInt32, MutUntrackedOrigin]
+    ) raises -> Tuple[Int, Int]:
+        var total = 0
+        for i in range(count):
+            dst[unsafe_offset=i] = self.lengths[first + i]
+            total += self._length(first + i)
+        return (total, -1)
+
+    def letters_into(
+        self, first: Int, count: Int, dst: MutPointer[UInt8, MutUntrackedOrigin], capacity: Int
+    ) raises -> Int:
+        var at = 0
+        for i in range(first):
+            at += self._length(i)
+        var n = 0
+        for i in range(first, first + count):
+            n += self._length(i)
+        for i in range(n):
+            dst[unsafe_offset=i] = self.letters[at + i]
+        return n
+
+
+def _cache(
+    path: String, var lengths: List[UInt32], letters: StaticString, var samples: List[ReferenceSample], width: Int = 4
+) raises -> String:
+    """A graph cache of the nodes and reference samples given, as `prepare` writes one."""
+    var count = len(lengths)
+    var graph = _MemoryNodes(lengths^, letters)
+    var w = CacheWriter(path)
+    var nodes = write_nodes(w, graph, count, width, 2)
+    write_placements(w, samples, nodes.lengths(), count, 2)
+    w.finish(GraphId(1, 2, 3), "test.gbz")
+    _ = nodes.count
     return path
+
+
+def _nodes_file(width: Int = 4) raises -> String:
+    """A graph cache of nodes 1 ACGTACGT, 2 GGG and 3 TTTTT (node 0 absent), no reference sample."""
+    var lengths: List[UInt32] = [UInt32(NONE), 8, 3, 5]
+    return _cache(
+        String(t"/tmp/dromos_test_nodes_{width}.bin"), lengths^, "ACGTACGTGGGTTTTT", List[ReferenceSample](), width
+    )
 
 
 def test_varint() raises:
@@ -228,48 +279,37 @@ def test_unaligned_line() raises:
     assert_true(out == _text("u\t3\t0\t3\t*\t*\t*\t*\t*\t*\t*\t0\tcs:Z:+ACG\n"))
 
 
-def _le(mut out: List[UInt8], v: Int, bytes: Int):
-    for k in range(bytes):
-        out.append(UInt8((v >> (8 * k)) & 0xFF))
+def _sample(
+    name: String,
+    var walks: List[List[UInt64]],
+    var fragments: List[Int],
+    var path_contig: List[Int],
+    var contigs: List[String],
+) -> ReferenceSample:
+    var s = ReferenceSample(name)
+    s.walks = walks^
+    s.fragments = fragments^
+    s.path_contig = path_contig^
+    s.contigs = contigs^
+    return s^
 
 
 def _refmap_file(twice: Bool) raises -> String:
     """pgcat's test map: reference path >1 >2 >3 (lengths 10, 5, 10) at 100 on chrA; node 4 (5 bp) off the reference;
     node 0 absent. With `twice`, node 2 is also on a second path, at 500 of chrB."""
-    var path = String(t"/tmp/dromos_test_refmap_{Int(twice)}.bin")
-    var t = _text("PGCATRM1")
-    _le(t, 5, 8)
-    t.extend(Span(_text("CHM13")))
-    _le(t, 5, 8)
-    for n in [0xFFFFFFFF, 10, 5, 10, 5]:
-        _le(t, n, 4)
-    for f in [0xFFFFFFFF, 0, 1, 2, 0xFFFFFFFF]:
-        _le(t, f, 4)
-    var placements: List[List[Int]] = [[0, 0, 100, 0], [0, 1, 110, 0], [0, 2, 115, 0]]
+    var walks: List[List[UInt64]] = [[2, 4, 6]]
+    var fragments: List[Int] = [100]
+    var path_contig: List[Int] = [0]
     if twice:
-        placements.append([1, 0, 500, 0])
-    _le(t, len(placements), 8)
-    for pl in placements:
-        _le(t, pl[0], 4)
-        _le(t, pl[1], 4)
-        _le(t, pl[2], 8)
-        _le(t, pl[3], 1)
-    _le(t, 1 if twice else 0, 8)
-    if twice:
-        _le(t, 2, 8)
-        _le(t, 1, 8)
-        _le(t, 3, 4)
-    _le(t, 2, 8)
-    _le(t, 0, 4)
-    _le(t, 1, 4)
-    _le(t, 2, 8)
-    _le(t, 4, 8)
-    t.extend(Span(_text("chrA")))
-    _le(t, 4, 8)
-    t.extend(Span(_text("chrB")))
-    with open(path, "w") as f:
-        f.write_bytes(Span(t))
-    return path
+        walks.append([4])
+        fragments.append(500)
+        path_contig.append(1)
+    var samples = List[ReferenceSample]()
+    samples.append(_sample("CHM13", walks^, fragments^, path_contig^, ["chrA", "chrB"]))
+    var lengths: List[UInt32] = [UInt32(NONE), 10, 5, 10, 5]
+    return _cache(
+        String(t"/tmp/dromos_test_refmap_{Int(twice)}.bin"), lengths^, "AAAAAAAAAACCCCCGGGGGGGGGGTTTTT", samples^
+    )
 
 
 def _project(m: RefMap, walk: List[Int], ts: Int, te: Int) -> Tuple[Int, Int, Int, Int]:
@@ -285,7 +325,7 @@ def _step(node: Int, reverse: Bool) -> Int:
 
 
 def test_projection_as_pgcat() raises:
-    var m = RefMap(_refmap_file(False))
+    var m = RefMap(_refmap_file(False), "CHM13")
     assert_equal(m.sample, "CHM13")
     assert_equal(m.length(2), 5)
     assert_equal(m.length(0), 0)
@@ -307,7 +347,9 @@ def test_projection_as_pgcat() raises:
 
 
 def test_ambiguous_placements() raises:
-    var m = RefMap(_refmap_file(True))
+    var m = RefMap(_refmap_file(True), "CHM13")
+    assert_equal(m.placement(3).path, 1)
+    assert_equal(m.placement(3).start, 500)
     # Node 2 alone has two places; with node 1 before it, only path 0 fits.
     assert_equal(_project(m, [_step(2, False)], 0, 5)[0], AMBIGUOUS)
     var r = _project(m, [_step(1, False), _step(2, False)], 0, 15)
@@ -349,7 +391,7 @@ def _classify(m: RefMap, line: StaticString) -> Tuple[Int, Int, Int, Int]:
 
 def test_lines_as_pgcat_classifies_them() raises:
     # pgcat's `lines` test, on its test map.
-    var m = RefMap(_refmap_file(False))
+    var m = RefMap(_refmap_file(False), "CHM13")
     var r = _classify(m, "r1\t20\t0\t20\t+\t>1>2>3\t25\t2\t22\t20\t20\t60")
     assert_true(r[0] == PLACED and r[1] == 0 and r[2] == 102 and r[3] == 122)
     assert_equal(_classify(m, "r2\t20\t*\t*\t*\t*\t*\t*\t*\t0\t0\t255")[0], UNMAPPED)
@@ -654,37 +696,102 @@ def test_parts_read_as_the_graph() raises:
         assert_true(p.path(id) == g.path(id))
 
 
-def test_graph_files_from_the_graph() raises:
-    """A reference map and node table made from the graph read back as its nodes and reference paths."""
+def test_cache_from_the_graph() raises:
+    """A graph cache made from the graph reads back as its nodes and each reference sample's paths, its letters the
+    same at 4 bits and 8."""
     var g = GbzGraph(GBZ)
-    write_ref_map(GBZ, "CHM13", "/tmp/dromos_test.refmap", 3)
-    write_node_table(GBZ, "/tmp/dromos_test.nodes", True, 3)
-    var m = RefMap("/tmp/dromos_test.refmap")
-    var t = NodeTable("/tmp/dromos_test.nodes")
-    assert_equal(m.sample, "CHM13")
+    make_cache(GBZ, "/tmp/dromos_test.dromos", ["CHM13", "GRCh38"], None, 4, 3)
+    make_cache(GBZ, "/tmp/dromos_test8.dromos", ["GRCh38"], None, 8, 3)
+    var t = NodeTable("/tmp/dromos_test.dromos")
+    var t8 = NodeTable("/tmp/dromos_test8.dromos")
     assert_equal(t.count, g.max_node() + 1)
+    assert_false(t.wide)
+    assert_true(t8.wide)
     for node in range(t.count):
         var s = g.sequence(node)
         assert_equal(t.length(node), len(s))
-        assert_equal(m.length(node), len(s))
         for i in range(len(s)):
             assert_equal(t.letter(node, False, i), s[i])
+            assert_equal(t8.letter(node, False, i), s[i])
+            assert_equal(t.letter(node, True, i), complement(s[len(s) - 1 - i]))
     var md = g.metadata()
-    var sample = md.sample_id("CHM13").value()
     var names = md.path_names()
-    var path = 0
-    for id in range(len(names)):
-        if names[id].sample != sample:
-            continue
-        var walk = g.path(id)
-        var start = names[id].fragment
-        var k = m._first_placement_of(path)
-        for i in range(len(walk)):
-            var pl = m.placement(k + i)
-            assert_true(pl.path == path and pl.step == i and pl.start == start and pl.reverse == (walk[i] & 1 == 1))
-            start += len(g.sequence(Int(walk[i] >> 1)))
-        path += 1
-    assert_equal(len(m.path_contig), path)
+    for sample in ["CHM13", "GRCh38"]:
+        var m = RefMap("/tmp/dromos_test.dromos", sample)
+        for node in range(t.count):
+            assert_equal(m.length(node), len(g.sequence(node)))
+        var id_of = md.sample_id(sample).value()
+        var path = 0
+        for id in range(len(names)):
+            if names[id].sample != id_of:
+                continue
+            var walk = g.path(id)
+            var start = names[id].fragment
+            var k = m.first_placement_of(path)
+            for i in range(len(walk)):
+                var pl = m.placement(k + i)
+                assert_true(pl.path == path and pl.step == i and pl.start == start and pl.reverse == (walk[i] & 1 == 1))
+                start += len(g.sequence(Int(walk[i] >> 1)))
+            path += 1
+        assert_equal(len(m.path_contig), path)
+    var only = CacheFile("/tmp/dromos_test8.dromos")
+    assert_equal(len(only.samples), 1)
+    var raised = False
+    try:
+        _ = RefMap("/tmp/dromos_test8.dromos", "CHM13")
+    except:
+        raised = True
+    assert_true(raised)
+
+
+def test_letters_packed() raises:
+    var letters = _text("ACGTNRYKMSWBDHVUACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACG")
+    var packed = List[UInt8](length=(len(letters) + 1) // 2, fill=0)
+    assert_true(pack_letters(letters.unsafe_ptr(), len(letters), packed.unsafe_ptr()))
+    assert_equal(packed[0], 0x10)
+    assert_equal(packed[len(packed) - 1], 0x02)
+    var t = NodeTable(_nodes_file(4))
+    var t8 = NodeTable(_nodes_file(8))
+    for node in range(4):
+        for i in range(t.length(node)):
+            assert_equal(t.letter(node, False, i), t8.letter(node, False, i))
+            assert_equal(t.letter(node, True, i), t8.letter(node, True, i))
+    letters[70] = UInt8(ord("x"))
+    assert_false(pack_letters(letters.unsafe_ptr(), len(letters), packed.unsafe_ptr()))
+    letters[70] = UInt8(ord("A"))
+    letters[len(letters) - 1] = UInt8(ord("a"))
+    assert_false(pack_letters(letters.unsafe_ptr(), len(letters), packed.unsafe_ptr()))
+
+
+def test_cache_examined() raises:
+    """A cache is told from a missing file, another file, another version's cache and a damaged one."""
+    var h = Header()
+    assert_equal(examine("/tmp/dromos_no_such_cache", h), MISSING)
+    assert_equal(examine(GBZ, h), NOT_A_CACHE)
+    var path = _nodes_file()
+    assert_equal(examine(path, h), CURRENT)
+    assert_true(h.graph == GraphId(1, 2, 3))
+    assert_equal(h.name, "test.gbz")
+    var bytes: List[UInt8]
+    with open(path, "r") as f:
+        bytes = f.read_bytes()
+    var damaged = bytes.copy()
+    damaged[100] ^= 1
+    var cut = bytes.copy()
+    cut.resize(len(bytes) - 10, 0)
+    var other = bytes.copy()
+    other[8] = 99
+    var cases: List[Tuple[Int, List[UInt8]]] = [(DAMAGED, damaged^), (DAMAGED, cut^), (OTHER_VERSION, other^)]
+    for c in cases:
+        with open("/tmp/dromos_test_bad.dromos", "w") as f:
+            f.write_bytes(Span(c[1]))
+        assert_equal(examine("/tmp/dromos_test_bad.dromos", h), c[0])
+        var raised = False
+        try:
+            _ = NodeTable("/tmp/dromos_test_bad.dromos")
+        except:
+            raised = True
+        assert_true(raised)
 
 
 def test_folders_and_names() raises:

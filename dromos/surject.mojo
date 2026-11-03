@@ -285,18 +285,18 @@ struct Surjector(Movable):
                     if length == 0:
                         # No letters: a node the graph lacks.
                         return False
-                    var letters = self.nodes.bases(step >> 1)
+                    var letters = self.nodes.start(step >> 1)
                     var take = min(left, length - off)
                     var at = len(s.read)
                     s.read.resize(unsafe_uninit_length=at + take)
                     var dst = s.read.unsafe_ptr().unsafe_offset(at)
                     if step & 1 == 1:
-                        var last = length - off - 1
+                        var last = letters + length - off - 1
                         for t in range(take):
-                            dst[unsafe_offset=t] = comp(letters[unsafe_offset=last - t])
+                            dst[unsafe_offset=t] = comp(self.nodes.at(last - t))
                     else:
                         for t in range(take):
-                            dst[unsafe_offset=t] = upper(letters[unsafe_offset=off + t])
+                            dst[unsafe_offset=t] = upper(self.nodes.at(letters + off + t))
                     s.score.resize(at + take, CLIP_MATCH)
                     var pl = self._place(step, length, off)
                     if pl[1] != 0:

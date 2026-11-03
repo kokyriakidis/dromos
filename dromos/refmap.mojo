@@ -1,28 +1,25 @@
-"""Alignments placed on the reference: pgcat's reference map, read whole, and its placement rule (pgcat's gaf.rs,
-`RefMap::project`, itself pggaf's walk_ref_interval), ported line for line so dromos places every alignment where
-`pgcat index-gaf` does.
-
-The map (`dromos ref-map` writes it once per graph, as `pgcatalog ref-map` does) is little-endian:
-
-    "PGCATRM1"                         magic
-    u64 n, n bytes                     the reference sample
-    u64 size                           node ids 0 .. size - 1
-    u32 node_len[size]                 each node's length; NONE for an id the graph lacks
-    u32 first[size]                    the node's first placement; NONE for a node off the reference
-    u64 count, count x 17 bytes        placements: path u32, step u32, start u64, reverse u8
-    u64 k, then k times:               nodes the reference visits more than once, by node id:
-        u64 node, u64 m, u32 more[m]       the placements after its first
-    u64 p, u32 path_contig[p]          each reference path's contig
-    u64 c, then c times u64 n, n bytes the contigs' names
+"""Alignments placed on the reference: pgcat's reference map, read from the graph's cache (cache.mojo: a reference
+sample's PATHS, FIRST, PLACEMENTS and MORE sections, with the nodes' LENGTHS), and its placement rule (pgcat's
+gaf.rs, `RefMap::project`, itself pggaf's walk_ref_interval), ported line for line so dromos places every alignment
+where `pgcat index-gaf` does.
 """
 
-from dromos.bgzf import MappedFile
+from dromos.cache import (
+    FIRST,
+    LENGTHS,
+    MORE,
+    MORE_AT,
+    MORE_NODES,
+    NONE,
+    PATH_BITS,
+    PATHS,
+    PLACEMENTS,
+    START_SHIFT,
+    CacheFile,
+    u32_at,
+    u64_at,
+)
 from dromos.nodes import Nodes
-
-comptime MAGIC = "PGCATRM1"
-comptime NONE = 0xFFFF_FFFF
-"""A node_len or first entry with no value."""
-comptime PLACEMENT_BYTES = 17
 
 # Why an alignment with a walk has no place (pgcat's Unplaced, in its order); 0 is placed.
 comptime NO_ANCHOR = 1
@@ -93,135 +90,110 @@ def _set_step(mut paths: List[ContigPath], k: Int, node: Int):
             return
 
 
-@always_inline
-def _u32(p: ImmPointer[UInt8, _], at: Int) -> Int:
-    return (
-        Int(p[unsafe_offset=at])
-        | Int(p[unsafe_offset=at + 1]) << 8
-        | Int(p[unsafe_offset=at + 2]) << 16
-        | Int(p[unsafe_offset=at + 3]) << 24
-    )
-
-
-@always_inline
-def _u64(p: ImmPointer[UInt8, _], at: Int) -> Int:
-    return _u32(p, at) | _u32(p, at + 4) << 32
-
-
 struct RefMap(Movable, Nodes):
-    """A reference map (dromos ref-map), mapped into memory: node lengths and placements are read in place."""
+    """A reference sample's placements, mapped from the graph's cache: node lengths and placements are read in
+    place."""
 
-    var file: MappedFile
+    var cache: CacheFile
     var sample: String
     var size: Int
-    var node_len_at: Int
-    var first_at: Int
-    var placements_at: Int
+    var node_len: ImmPointer[UInt32, ImmUntrackedOrigin]
+    var first: ImmPointer[UInt32, ImmUntrackedOrigin]
+    var placements: ImmPointer[UInt64, ImmUntrackedOrigin]
     var placement_count: Int
-    var more_nodes: List[Int]
+    var path_first: List[Int]
+    """Each path's first placement, and the end of the last."""
+    var more_nodes: ImmPointer[UInt64, ImmUntrackedOrigin]
     """The nodes with further placements, in id order."""
-    var more_at: List[Int]
-    """Where each one's list of further placements starts in the file."""
-    var more_count: List[Int]
-    """How many further placements each one has."""
+    var more_at: ImmPointer[UInt64, ImmUntrackedOrigin]
+    """Where each one's further placements start in `more`."""
+    var more: ImmPointer[UInt32, ImmUntrackedOrigin]
+    var more_count: Int
     var has_more: List[UInt64]
     """A bit per node id: set when the node has further placements."""
     var path_contig: List[Int]
     var contigs: List[String]
 
-    def __init__(out self, path: String) raises:
-        self.file = MappedFile(path)
-        var n = self.file.size
-        var p = self.file.ptr
-        var bad = String(t"{path}: not a reference map (dromos ref-map writes one)")
-        var ok = n >= 16
-        var magic = MAGIC.as_bytes()
-        for i in range(8):
-            ok = ok and p[unsafe_offset=i] == magic[i]
-        if not ok:
-            raise Error(bad)
-        var at = 8
-        var length = _u64(p, at)
-        at += 8
-        if length > n - at:
-            raise Error(bad)
-        self.sample = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=p.unsafe_offset(at), length=length)))
-        at += length
-        if at + 8 > n:
-            raise Error(bad)
-        self.size = _u64(p, at)
-        at += 8
-        self.node_len_at = at
-        self.first_at = at + 4 * self.size
-        at = self.first_at + 4 * self.size
-        if at + 8 > n:
-            raise Error(bad)
-        var count = _u64(p, at)
-        at += 8
-        self.placements_at = at
-        self.placement_count = count
-        at += PLACEMENT_BYTES * count
-        if at + 8 > n:
-            raise Error(bad)
-        var k = _u64(p, at)
-        at += 8
-        self.more_nodes = List[Int](capacity=k)
-        self.more_at = List[Int](capacity=k)
-        self.more_count = List[Int](capacity=k)
-        self.has_more = List[UInt64](length=(self.size + 63) // 64, fill=0)
-        for _ in range(k):
-            if at + 16 > n:
-                raise Error(bad)
-            var node = _u64(p, at)
-            var m = _u64(p, at + 8)
-            at += 16
-            if node >= self.size or (len(self.more_nodes) > 0 and node <= self.more_nodes[len(self.more_nodes) - 1]):
-                raise Error(bad)
-            self.more_nodes.append(node)
-            self.more_at.append(at)
-            self.more_count.append(m)
-            self.has_more[node >> 6] |= UInt64(1) << UInt64(node & 63)
-            at += 4 * m
-            if at > n:
-                raise Error(bad)
-        if at + 8 > n:
-            raise Error(bad)
-        var paths = _u64(p, at)
-        at += 8
-        if at + 4 * paths + 8 > n:
-            raise Error(bad)
-        self.path_contig = List[Int](capacity=paths)
-        for i in range(paths):
-            self.path_contig.append(_u32(p, at + 4 * i))
-        at += 4 * paths
-        var c = _u64(p, at)
-        at += 8
+    def __init__(out self, path: String, sample: String) raises:
+        var cache = CacheFile(path)
+        var index = cache.sample_index(sample)
+        if not index:
+            raise Error(t"{path}: no reference sample {sample} in the graph's cache")
+        var s = index.value()
+        var damaged = String(t"{path}: a damaged graph cache; make it again with dromos prepare")
+        var lengths = cache.section(LENGTHS)
+        var first = cache.section(FIRST, s)
+        var placements = cache.section(PLACEMENTS, s)
+        var paths = cache.section(PATHS, s)
+        var more_nodes = cache.section(MORE_NODES, s)
+        var more_at = cache.section(MORE_AT, s)
+        var more = cache.section(MORE, s)
+        for sec in [lengths, first, placements, paths, more_nodes, more_at]:
+            cache.advise(sec)
+        self.size = cache.count
+        if first.length != 4 * self.size:
+            raise Error(damaged)
+        self.node_len = cache.ptr(lengths).unsafe_bitcast[UInt32]()
+        self.first = cache.ptr(first).unsafe_bitcast[UInt32]()
+        self.placements = cache.ptr(placements).unsafe_bitcast[UInt64]()
+        self.placement_count = placements.length // 8
+        # The paths, their contigs and the contigs' names.
+        var p = cache.ptr(paths)
+        var n = u64_at(p, 0) if paths.length >= 8 else -1
+        var names_at = 8 + 8 * (n + 1) + (4 * n + 7) // 8 * 8
+        if n < 0 or names_at + 8 > paths.length:
+            raise Error(damaged)
+        self.path_first = List[Int](capacity=n + 1)
+        self.path_contig = List[Int](capacity=n)
+        for i in range(n + 1):
+            self.path_first.append(u64_at(p, 8 + 8 * i))
+        for i in range(n):
+            self.path_contig.append(u32_at(p, 8 + 8 * (n + 1) + 4 * i))
+        var c = u64_at(p, names_at)
+        var at = names_at + 8
         self.contigs = List[String](capacity=c)
         for _ in range(c):
-            if at + 8 > n:
-                raise Error(bad)
-            var name_length = _u64(p, at)
-            at += 8
-            if name_length > n - at:
-                raise Error(bad)
+            var length = u64_at(p, at) if at + 8 <= paths.length else paths.length
+            if at + 8 + length > paths.length:
+                raise Error(damaged)
             self.contigs.append(
-                String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=p.unsafe_offset(at), length=name_length)))
+                String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=p.unsafe_offset(at + 8), length=length)))
             )
-            at += name_length
-        for i in range(paths):
-            if self.path_contig[i] >= c:
-                raise Error(bad)
+            at += 8 + length
+        for i in range(n):
+            if self.path_contig[i] >= c or self.path_first[i] > self.path_first[i + 1]:
+                raise Error(damaged)
+        if self.path_first[n] != self.placement_count:
+            raise Error(damaged)
+        # Nodes with further placements.
+        self.more_count = more_nodes.length // 8
+        if more_at.length != 8 * (self.more_count + 1):
+            raise Error(damaged)
+        self.more_nodes = cache.ptr(more_nodes).unsafe_bitcast[UInt64]()
+        self.more_at = cache.ptr(more_at).unsafe_bitcast[UInt64]()
+        self.more = cache.ptr(more).unsafe_bitcast[UInt32]()
+        if Int(self.more_at[unsafe_offset=self.more_count]) * 4 > more.length:
+            raise Error(damaged)
+        self.has_more = List[UInt64](length=(self.size + 63) // 64, fill=0)
+        for i in range(self.more_count):
+            var node = Int(self.more_nodes[unsafe_offset=i])
+            if node >= self.size:
+                raise Error(damaged)
+            self.has_more[node >> 6] |= UInt64(1) << UInt64(node & 63)
+        self.sample = sample
+        self.cache = cache^
 
     @always_inline
-    def _ptr(self) -> ImmPointer[UInt8, ImmUntrackedOrigin]:
-        return self.file.ptr
+    def _len(self, node: Int) -> Int:
+        """Node `node`'s entry in LENGTHS (NONE for an id the graph lacks); `node` is below `size`."""
+        return Int(self.node_len[unsafe_offset=node])
 
     @always_inline
     def length(self, node: Int) -> Int:
         """Node `node`'s length; 0 for an id the graph lacks."""
         if node < 0 or node >= self.size:
             return 0
-        var length = _u32(self._ptr(), self.node_len_at + 4 * node)
+        var length = self._len(node)
         return 0 if length == NONE else length
 
     def has_letters(self) -> Bool:
@@ -233,35 +205,37 @@ struct RefMap(Movable, Nodes):
 
     @always_inline
     def _first(self, node: Int) -> Int:
-        return _u32(self._ptr(), self.first_at + 4 * node)
+        """Node `node`'s first placement; NONE for none (FIRST holds it plus one, 0 for none)."""
+        return Int(self.first[unsafe_offset=node] - 1)
 
     @always_inline
     def _placement(self, k: Int) -> Placement:
-        var p = self._ptr()
-        var at = self.placements_at + PLACEMENT_BYTES * k
-        return Placement(_u32(p, at), _u32(p, at + 4), _u64(p, at + 8), p[unsafe_offset=at + 16] != 0)
+        var v = Int(self.placements[unsafe_offset=k])
+        var path = (v >> 1) & ((1 << PATH_BITS) - 1)
+        return Placement(path, k - self.path_first[path], v >> START_SHIFT, v & 1 == 1)
 
     @always_inline
     def _more(self, node: Int) -> Tuple[Int, Int]:
-        """Where node `node`'s further placements are listed in the file, and how many there are (0 for none)."""
+        """Where node `node`'s further placements start in `more`, and how many there are (0 for none)."""
         if (self.has_more[node >> 6] >> UInt64(node & 63)) & 1 == 0:
             return (0, 0)
         var lo = 0
-        var hi = len(self.more_nodes)
+        var hi = self.more_count
         while lo < hi:
             var mid = (lo + hi) // 2
-            if self.more_nodes[mid] < node:
+            if Int(self.more_nodes[unsafe_offset=mid]) < node:
                 lo = mid + 1
             else:
                 hi = mid
-        return (self.more_at[lo], self.more_count[lo])
+        var at = Int(self.more_at[unsafe_offset=lo])
+        return (at, Int(self.more_at[unsafe_offset=lo + 1]) - at)
 
     @always_inline
     def _placement_of(self, node: Int, first: Int, more: Tuple[Int, Int], j: Int) -> Placement:
         """Placement `j` of node `node` (its first, then its further ones)."""
         if j == 0:
             return self._placement(first)
-        return self._placement(_u32(self._ptr(), more[0] + 4 * (j - 1)))
+        return self._placement(Int(self.more[unsafe_offset=more[0] + j - 1]))
 
     def contig_paths(self, name: String) -> List[ContigPath]:
         """The paths of contig `name` (none if the map has no such contig), each with its steps' nodes: placements
@@ -274,32 +248,24 @@ struct RefMap(Movable, Nodes):
                 contig = c
         for path in range(len(self.path_contig)):
             if self.path_contig[path] == contig:
-                var lo = self._first_placement_of(path)
-                var hi = self._first_placement_of(path + 1)
+                var lo = self.path_first[path]
+                var hi = self.path_first[path + 1]
                 out.append(ContigPath(path, lo, List[Int](length=hi - lo, fill=-1)))
         if len(out) == 0:
             return out^
-        var p = self._ptr()
         for node in range(self.size):
-            var k = _u32(p, self.first_at + 4 * node)
+            var k = self._first(node)
             if k != NONE:
                 _set_step(out, k, node)
-        for i in range(len(self.more_nodes)):
-            for j in range(self.more_count[i]):
-                _set_step(out, _u32(p, self.more_at[i] + 4 * j), self.more_nodes[i])
+        for i in range(self.more_count):
+            var node = Int(self.more_nodes[unsafe_offset=i])
+            for j in range(Int(self.more_at[unsafe_offset=i]), Int(self.more_at[unsafe_offset=i + 1])):
+                _set_step(out, Int(self.more[unsafe_offset=j]), node)
         return out^
 
-    def _first_placement_of(self, path: Int) -> Int:
-        """The first placement of path `path` or a later one (placements are in path order)."""
-        var lo = 0
-        var hi = self.placement_count
-        while lo < hi:
-            var mid = (lo + hi) // 2
-            if _u32(self._ptr(), self.placements_at + PLACEMENT_BYTES * mid) < path:
-                lo = mid + 1
-            else:
-                hi = mid
-        return lo
+    def first_placement_of(self, path: Int) -> Int:
+        """Path `path`'s first placement (placements are in path order)."""
+        return self.path_first[path]
 
     @always_inline
     def placement(self, k: Int) -> Placement:
@@ -311,13 +277,12 @@ struct RefMap(Movable, Nodes):
         out.clear()
         if len(walk) == 0 or te <= ts:
             return NO_ANCHOR
-        var p = self._ptr()
         var off = 0
         for step in walk:
             var node = step >> 1
             if node < 0 or node >= self.size:
                 return MISSING_NODE
-            var length = _u32(p, self.node_len_at + 4 * node)
+            var length = self._len(node)
             if length == NONE:
                 return MISSING_NODE
             var next = off + length
@@ -336,7 +301,7 @@ struct RefMap(Movable, Nodes):
         """The reference bases an anchor's aligned part covers at placement `p`."""
         if a.reverse == p.reverse:
             return (p.start + a.local_start, p.start + a.local_end)
-        var length = _u32(self._ptr(), self.node_len_at + 4 * a.node)
+        var length = self._len(a.node)
         return (p.start + (length - a.local_end), p.start + (length - a.local_start))
 
     def _try_from(self, anchors: List[Anchor], p0: Placement, mut out: Placed) -> Int:

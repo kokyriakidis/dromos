@@ -286,22 +286,28 @@ comptime MADV_WILLNEED: Int32 = 3
 
 
 struct MappedFile(Movable):
-    """A file mapped read-only into memory: its pages are read when first touched, by whichever thread touches them,
-    and the kernel is asked to read the whole file ahead."""
+    """A file mapped read-only into memory: its pages are read when first touched, by whichever thread touches them.
+    With `ahead`, the kernel is asked to read the whole file ahead; else only the parts `advise` names."""
 
     var ptr: ImmPointer[UInt8, ImmUntrackedOrigin]
     var size: Int
 
-    def __init__(out self, path: String) raises:
+    def __init__(out self, path: String, ahead: Bool = True) raises:
         var file = RawFile(path)
-        self.size = Int(stat(path).st_size)
+        self.size = file.size
         if self.size == 0:
             raise Error(t"{path}: empty")
         var addr = external_call["mmap", Int](Int(0), self.size, PROT_READ, MAP_PRIVATE, file.fd, Int(0))
         if addr == -1:
             raise Error(t"cannot map {path}")
         self.ptr = ImmPointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=addr)
-        _ = external_call["madvise", Int32](addr, self.size, MADV_WILLNEED)
+        if ahead:
+            self.advise(0, self.size)
+
+    def advise(self, offset: Int, length: Int):
+        """Asks the kernel to read bytes `offset ..< offset + length` ahead."""
+        var start = offset - offset % 4096
+        _ = external_call["madvise", Int32](self.ptr.unsafe_offset(start), offset + length - start, MADV_WILLNEED)
 
     def __deinit__(deinit self):
         _ = external_call["munmap", Int32](self.ptr, self.size)
