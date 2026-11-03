@@ -83,6 +83,11 @@ struct NodeTable(Movable, Nodes):
         return self.offsets_at >= 0
 
     @always_inline
+    def bases(self, node: Int) -> ImmPointer[UInt8, ImmUntrackedOrigin]:
+        """Node `node`'s letters on its forward strand (`length(node)` of them; the table must have letters)."""
+        return self.file.ptr.unsafe_offset(self.bases_at + Int(self._u64(self.offsets_at + 8 * node)))
+
+    @always_inline
     def letter(self, node: Int, reverse: Bool, i: Int) -> UInt8:
         """Letter `i` of node `node` read in orientation `reverse` (its reverse complement when true)."""
         var start = Int(self._u64(self.offsets_at + 8 * node))

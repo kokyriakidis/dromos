@@ -1,7 +1,8 @@
 # dromos
 
 Pangenome graph alignments in Mojo: vg's GAM read as fast as the disk delivers it, written as pgphase's index (the
-file `pgcat index-gaf --slim` writes) or as the GAF lines `vg convert -G` writes (github.com/kokyriakidis/pgphase).
+file `pgcat index-gaf --slim` writes), as the GAF lines `vg convert -G` writes, or as SAM on one reference contig
+(`pgcatalog surject`'s records) (github.com/kokyriakidis/pgphase).
 
 ## Mojo skills
 
@@ -18,7 +19,7 @@ habits:
 
 ## Layout
 
-- `cli/dromos_cli.mojo`: the commands, `index` and `gam-to-gaf`, each with its own options and `-h`.
+- `cli/dromos_cli.mojo`: the commands, `index`, `gam-to-gaf` and `surject`, each with its own options and `-h`.
 - `dromos/stream.mojo`: the pipeline every command runs on: reads (O_DIRECT), decoding (BGZF, plain, gzip), GAM
   told from GAF by the first bytes (`looks_like_gaf`), framing (GAM messages or GAF lines), and a `MessageSink`
   taking slices of each chunk.
@@ -27,6 +28,10 @@ habits:
 - `dromos/refmap.mojo`: pgcat's reference map and placement rule. `dromos/gaf_text.mojo`: a GAF line as pgcat reads
   it. `dromos/staging.mojo`: placed lines by bucket. `dromos/sort_write.mojo`: the final sort, BGZF and tabix
   (`dromos/tabix.mojo`).
+- `dromos/surject.mojo`: the `surject` sink (reads rebuilt from GAF lines, batches aligned by side tasks);
+  `dromos/linearize.mojo`: its alignment to the reference (banded affine gaps, chaining, clipping);
+  `dromos/contig.mojo`: the contig's letters and once-visited nodes from the ref map and node table;
+  `dromos/pgsites.mojo`: a catalog's snarl windows. They port pgcatalog's surject.rs, reference.rs and pileup.rs.
 - `dromos/bgzf.mojo`: files, BGZF blocks, libdeflate, zstd and zlib. `dromos/nodes.mojo`: the node table.
   `dromos/output.mojo`, `dromos/parallel.mojo`: writing, integers, threads.
 
@@ -47,6 +52,9 @@ habits:
   ff2b4b2; refmap.mojo and tabix.mojo port its gaf.rs and tabix.rs): at `-l 0` the same file byte for byte, and the
   same .tbi decompressed (the check does this). At other levels only the deflate differs: compare decompressed content
   and tabix queries.
+- `dromos surject` must write the SAM records `pgcatalog surject` writes (pgphase's tools/pgcatalog), byte for byte,
+  from a GAM and from its GAF: check any change with `pixi run check` (its surject cases; `--full` for the slice).
+  Float ties in `chain` use libm's log2, as Rust does.
 - The pipeline (stream.mojo) is shared: a sink says what messages (a GAF's lines) become (convert.mojo, index.mojo).
   GAF input must index as pgcat indexes the same file, in every encoding (the check covers plain, gzip, BGZF, stdin
   and edge cases).

@@ -75,6 +75,24 @@ struct Placed(Equatable, TrivialRegisterPassable):
     var end: Int
 
 
+@fieldwise_init
+struct ContigPath(Copyable):
+    """A reference path of one contig: its index, its first placement (step 0's), and each step's node."""
+
+    var path: Int
+    var first: Int
+    var nodes: List[Int]
+
+
+@always_inline
+def _set_step(mut paths: List[ContigPath], k: Int, node: Int):
+    """Placement `k` is of `node`: its step's node, if `k` is a step of one of `paths`."""
+    for ref cp in paths:
+        if k >= cp.first and k < cp.first + len(cp.nodes):
+            cp.nodes[k - cp.first] = node
+            return
+
+
 @always_inline
 def _u32(p: ImmPointer[UInt8, _], at: Int) -> Int:
     return (
@@ -99,6 +117,7 @@ struct RefMap(Movable, Nodes):
     var node_len_at: Int
     var first_at: Int
     var placements_at: Int
+    var placement_count: Int
     var more_nodes: List[Int]
     """The nodes with further placements, in id order."""
     var more_at: List[Int]
@@ -140,6 +159,7 @@ struct RefMap(Movable, Nodes):
         var count = _u64(p, at)
         at += 8
         self.placements_at = at
+        self.placement_count = count
         at += PLACEMENT_BYTES * count
         if at + 8 > n:
             raise Error(bad)
@@ -242,6 +262,48 @@ struct RefMap(Movable, Nodes):
         if j == 0:
             return self._placement(first)
         return self._placement(_u32(self._ptr(), more[0] + 4 * (j - 1)))
+
+    def contig_paths(self, name: String) -> List[ContigPath]:
+        """The paths of contig `name` (none if the map has no such contig), each with its steps' nodes: placements
+        are kept in path order and a path's placements in step order, so each path is a range of them, and the nodes
+        come from a scan of every node's placements."""
+        var out = List[ContigPath]()
+        var contig = -1
+        for c in range(len(self.contigs)):
+            if self.contigs[c] == name:
+                contig = c
+        for path in range(len(self.path_contig)):
+            if self.path_contig[path] == contig:
+                var lo = self._first_placement_of(path)
+                var hi = self._first_placement_of(path + 1)
+                out.append(ContigPath(path, lo, List[Int](length=hi - lo, fill=-1)))
+        if len(out) == 0:
+            return out^
+        var p = self._ptr()
+        for node in range(self.size):
+            var k = _u32(p, self.first_at + 4 * node)
+            if k != NONE:
+                _set_step(out, k, node)
+        for i in range(len(self.more_nodes)):
+            for j in range(self.more_count[i]):
+                _set_step(out, _u32(p, self.more_at[i] + 4 * j), self.more_nodes[i])
+        return out^
+
+    def _first_placement_of(self, path: Int) -> Int:
+        """The first placement of path `path` or a later one (placements are in path order)."""
+        var lo = 0
+        var hi = self.placement_count
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            if _u32(self._ptr(), self.placements_at + PLACEMENT_BYTES * mid) < path:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    @always_inline
+    def placement(self, k: Int) -> Placement:
+        return self._placement(k)
 
     def anchors(self, walk: List[Int], ts: Int, te: Int, mut out: List[Anchor]) -> Int:
         """The walk's nodes (each `node << 1 | reverse`) that overlap its aligned part [ts, te) and lie on the

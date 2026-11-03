@@ -1,5 +1,5 @@
 """Tests: protobuf varints, GAM group framing, GAF lines against hand-worked ones, placement on the reference as
-pgcat places alignments, and tabix bins as htslib numbers them."""
+pgcat places alignments, tabix bins as htslib numbers them, and surject's alignments as pgcatalog makes them."""
 
 from std.memory import bitcast
 from std.testing import TestSuite, assert_equal, assert_true
@@ -12,6 +12,24 @@ from dromos.bgzf import load_libdeflate
 from dromos.stream import BGZF, GZIP, PLAIN, looks_like_gaf
 from dromos.refmap import AMBIGUOUS, INCONSISTENT, MISSING_NODE, NO_ANCHOR, Anchor, Placed, RefMap
 from dromos.tabix import N_BINS, bin_level, bin_parent, reg2bin
+from dromos.linearize import (
+    CLIP_MATCH,
+    CLIP_MISMATCH,
+    D,
+    I,
+    M,
+    S,
+    Block,
+    CigarOp,
+    Window,
+    align_end,
+    align_global,
+    chain,
+    clip_cigar,
+    clip_gap,
+    clip_lengths,
+    linearize,
+)
 
 
 def _varint(mut out: List[UInt8], value: Int):
@@ -353,6 +371,155 @@ def test_gam_told_from_gaf() raises:
     assert_true(not looks_like_gaf(lib, Span(gam), PLAIN, "t"))
     # Text without a tab on its first line is no GAF either.
     assert_true(not looks_like_gaf(lib, Span(_text("just words\n")), PLAIN, "t"))
+
+
+# pgcatalog's surject.rs tests, ported: the alignments, chaining, linearizing and clipping dromos surject makes.
+
+
+def _cigar(c: List[CigarOp]) -> String:
+    var out = String()
+    for o in c:
+        out += String(o.length)
+        out += chr(Int(o.op))
+    return out^
+
+
+def _linear(
+    query: List[UInt8], blocks: List[Block], reference: List[UInt8], graph: Bool, windows: List[Window] = []
+) -> String:
+    """linearize's result as "start CIGAR", or "none"."""
+    var start = 0
+    var cigar = List[CigarOp]()
+    if not linearize(Span(query), blocks, Span(reference), graph, windows, start, cigar):
+        return "none"
+    return String(t"{start} {_cigar(cigar)}")
+
+
+def test_global_alignment() raises:
+    assert_equal(_cigar(align_global(Span(_text("ACGT")), Span(_text("ACGT")))), "4M")
+    assert_equal(_cigar(align_global(Span(_text("ACTT")), Span(_text("ACGT")))), "4M")
+    # A deletion in a run goes to its left end.
+    assert_equal(_cigar(align_global(Span(_text("GAAC")), Span(_text("GAAAC")))), "1M1D3M")
+    assert_equal(_cigar(align_global(Span(_text("GAAAAC")), Span(_text("GAAC")))), "1M2I3M")
+    assert_equal(_cigar(align_global(Span(_text("")), Span(_text("ACG")))), "3D")
+    assert_equal(_cigar(align_global(Span(_text("ACG")), Span(_text("")))), "3I")
+
+
+def test_long_gap_is_aligned_in_a_band() raises:
+    # A 3 kb stretch with two mismatches and a 2-letter deletion.
+    var x: UInt64 = 7
+    var r = List[UInt8]()
+    var letters = _text("ACGT")
+    for _ in range(3000):
+        x = x * 6364136223846793005 + 1442695040888963407
+        r.append(letters[Int(x >> 33) % 4])
+    var q = r.copy()
+    q[500] = UInt8(ord("C")) if q[500] == UInt8(ord("A")) else UInt8(ord("A"))
+    q[2500] = UInt8(ord("C")) if q[2500] == UInt8(ord("A")) else UInt8(ord("A"))
+    _ = q.pop(1500)
+    _ = q.pop(1500)
+    var got = align_global(Span(q), Span(r))
+    var m = 0
+    var i = 0
+    var d = 0
+    for o in got:
+        if o.op == M:
+            m += o.length
+        elif o.op == I:
+            i += o.length
+        else:
+            d += o.length
+    assert_true(m == 2998 and i == 0 and d == 2)
+    # A read end of 3 kb against the reference beyond it: aligned, not clipped.
+    var rr = r.copy()
+    rr.extend(Span(_text("TTTTTTTTTT")))
+    var ops = List[CigarOp]()
+    assert_equal(align_end(Span(q), Span(rr), ops), 3000)
+    m = 0
+    for o in ops:
+        if o.op == M:
+            m += o.length
+    assert_equal(m, 2998)
+
+
+def test_chaining() raises:
+    # A block far off the others' diagonal (a walk touching a reference node 50 kb away) is left out.
+    var got = chain([Block(0, 1000, 500), Block(500, 51_500, 20), Block(520, 1520, 500)])
+    assert_true(got == [Block(0, 1000, 500), Block(520, 1520, 500)])
+    # A real 3 kb deletion between long blocks is kept.
+    assert_equal(len(chain([Block(0, 1000, 5000), Block(5000, 9000, 5000)])), 2)
+
+
+def test_linearized_blocks() raises:
+    var reference = _text("AAAACCCCGGGGTTTTAAAACCCC")
+    # Two blocks with a substitution bubble between (equal gaps): one match run.
+    assert_equal(_linear(_text("AAAACCCCGGGG"), [Block(0, 0, 4), Block(6, 6, 6)], reference, False), "0 12M")
+    # An insertion, then a deletion, between blocks; read ends that match nothing beyond the blocks clipped.
+    var got = _linear(_text("TTAAAAXXCCCCGGNN"), [Block(2, 0, 4), Block(8, 4, 4), Block(12, 10, 2)], reference, False)
+    assert_equal(got, "0 2S4M2I4M2D2M2S")
+    # A block running backwards on the reference is dropped into the gap.
+    got = _linear(_text("AAAACCCCGGGG"), [Block(0, 0, 4), Block(4, 2, 2), Block(6, 6, 6)], reference, False)
+    assert_equal(got, "0 12M")
+    # An indel bubble: aligned against the reference between the blocks.
+    assert_equal(_linear(_text("AAAACCCGGGGTTTT"), [Block(0, 0, 4), Block(11, 12, 4)], reference, False), "0 4M1D11M")
+    # Read ends that match the reference beyond the blocks are aligned, not clipped.
+    assert_equal(_linear(_text("CCCGGGGTTTTAAA"), [Block(3, 8, 8)], reference, False), "5 14M")
+    assert_equal(_linear(_text("ACGT"), [], reference, False), "none")
+
+
+def test_window_aligned_as_an_allele() raises:
+    # Reference AAAA GAGAGAGA CCCC; the read's graph alignment put a 2-letter deletion in one place and the same 2
+    # letters back as an insertion further on (blocks either side of a window 4..12): aligned as the window's allele,
+    # it is matches and one mismatch, not an insertion and a deletion.
+    var r = _text("AAAAGAGAGAGACCCC")
+    var blocks: List[Block] = [Block(0, 0, 6), Block(6, 8, 2), Block(10, 10, 6)]
+    assert_equal(_linear(_text("AAAAGAGAGTGACCCC"), blocks, r, False, [Window(4, 12)]), "0 16M")
+
+
+def test_divergent_ends_clipped() raises:
+    # 40 bases mismatched every third, 100 matching, 40 mismatched every third: both ends clipped.
+    var score = List[Int](length=180, fill=CLIP_MATCH)
+    for i in range(180):
+        if (i < 40 or i >= 140) and i % 3 == 0:
+            score[i] = CLIP_MISMATCH
+    var clips = clip_lengths(score)
+    assert_true(clips[0] == 40 and clips[1] == 39)  # base 140 matches
+    # One mismatch near an end is HiFi's; a long insertion (a structural variant) is free.
+    var one = List[Int](length=180, fill=CLIP_MATCH)
+    one[3] = CLIP_MISMATCH
+    clips = clip_lengths(one)
+    assert_true(clips[0] == 0 and clips[1] == 0)
+    var sv = List[Int](length=180, fill=CLIP_MATCH)
+    sv[19] += clip_gap(80)
+    clips = clip_lengths(sv)
+    assert_true(clips[0] == 0 and clips[1] == 0)
+    # The CIGAR: clipped bases soft-clipped, the start past the clipped reference, a gap at the cut joins the clip.
+    var c = clip_cigar(100, [CigarOp(M, 10), CigarOp(I, 2), CigarOp(M, 10), CigarOp(D, 3), CigarOp(M, 20)], 10, 5)
+    assert_equal(c[0], 110)
+    assert_equal(_cigar(c[1]), "12S10M3D15M5S")
+    c = clip_cigar(100, [CigarOp(S, 4), CigarOp(M, 30)], 6, 0)
+    assert_equal(c[0], 102)
+    assert_equal(_cigar(c[1]), "6S28M")
+
+
+def test_graph_placement() raises:
+    var r = List[UInt8]()
+    var letters = _text("ACGT")
+    for i in range(400):
+        r.append(letters[(i * 7 + i // 3) % 4])
+    # Read = reference 0..100, 80 letters of another copy in place of reference 100..180, then 180..300.
+    var read = List[UInt8](Span(r)[:100])
+    for _ in range(80):
+        read.append(UInt8(ord("T")))
+    read.extend(Span(r)[180:300])
+    var blocks: List[Block] = [Block(0, 0, 100), Block(180, 180, 120)]
+    assert_equal(_linear(read, blocks, r, True), "0 100M80I80D120M")
+    # Without it the equal-length stretch is aligned base for base.
+    assert_equal(_linear(read, blocks, r, False), "0 300M")
+    # A read end of 60 letters beyond the last block is clipped, even where it matches the reference.
+    var head = List[UInt8](Span(r)[:260])
+    assert_equal(_linear(head, [Block(0, 0, 200)], r, True), "0 200M60S")
+    assert_equal(_linear(head, [Block(0, 0, 200)], r, False), "0 260M")
 
 
 def main() raises:

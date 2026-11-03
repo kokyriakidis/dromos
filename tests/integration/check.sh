@@ -12,12 +12,14 @@
 #   SMALL_GAM  a few thousand alignments; SMALL_GAF  vg convert -G of it (any order)
 #   SLICE_GAM  a GAM ending at a group boundary, some GB; SLICE_SLIM  dromos gam-to-gaf --slim of it, as checked;
 #   SLICE_FULL dromos gam-to-gaf of it, as checked (only with --full)
+#   PGCATALOG  pgcatalog (pgphase's tools/pgcatalog), whose surject dromos surject ports; GBZ the graph it reads
+#   CATALOG_DIR the graph's catalogs (<contig>.pgsites); SURJECT_CONTIG a contig the alignments lie on (chr10)
 #   WORK       a directory for outputs and the pgcat references (made once, kept)
 #
 # Every index is made at -l 0 (stored blocks), where dromos and pgcat write the same bytes: the files must be equal,
 # and their .tbi equal decompressed.
 set -u
-[ $# -ge 1 ] || { sed -n 2,17p "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n 2,20p "$0"; exit 2; }
 source "$1"
 FULL=${2:-}
 DROMOS=${DROMOS:-build/dromos}
@@ -27,6 +29,24 @@ pass() { echo "ok    $1"; }
 fail() { echo "FAIL  $1"; fails=$((fails + 1)); }
 same_index() {  # name, dromos index, pgcat index
   if cmp -s "$2" "$3" && cmp -s <(bgzip -dc "$2.tbi") <(bgzip -dc "$3.tbi"); then pass "$1"; else fail "$1"; fi
+}
+# surject's SAM is large (a read's letters and qualities each): records are compared by checksum, the @PG lines
+# (each tool's own) left out.
+records() { grep -v '^@PG'; }
+pgcatalog_surject() {  # checksum file, GAF, options...: pgcatalog surject's records, made once
+  local out=$1 gaf=$2; shift 2
+  [ -s "$out" ] || (set -o pipefail; "$PGCATALOG" surject -t 10 --graph "$GBZ" --gaf "$gaf" "$@" 2> "$out.err" \
+    | records | md5sum > "$out") || { rm -f "$out"; echo "pgcatalog failed on $gaf"; exit 1; }
+}
+same_surject() {  # name, pgcatalog checksum file, input, [sort], dromos options...: the same records
+  local name=$1 want=$2 in=$3 order=$4; shift 4
+  local got
+  if [ "$order" == "sort" ]; then
+    got=$("$DROMOS" surject "$@" "$REFMAP" "$NODES" "$in" 2> /dev/null | records | LC_ALL=C sort | md5sum)
+  else
+    got=$("$DROMOS" surject "$@" "$REFMAP" "$NODES" "$in" 2> /dev/null | records | md5sum)
+  fi
+  [ "$got" == "$(cat "$want")" ] && pass "$name" || fail "$name"
 }
 pgcat_index() {  # GAF, output: pgcat's slim index at level 0, made once
   [ -s "$2" ] || "$PGCAT" index-gaf --ref-map "$REFMAP" --gaf "$1" --slim --level 0 -t 10 --out "$2" \
@@ -85,7 +105,38 @@ pgcat_index "$E" "$WORK/ref.edge.gz"
 "$DROMOS" index -l 0 --gaf "$REFMAP" "$E" "$WORK/d.edge.gz" 2> /dev/null
 same_index "index: edge-case GAF" "$WORK/d.edge.gz" "$WORK/ref.edge.gz"
 
+# surject: pgcatalog surject's records, from the GAF, the GAM (vg's GAF lines are in another order: both sorted) and
+# the GAF compressed; with graph placement and with the contig's catalog.
+SC=$SURJECT_CONTIG
+CAT="$CATALOG_DIR/$SC.pgsites"
+pgcatalog_surject "$WORK/surject.small.md5" "$SMALL_GAF" --contig "$SC"
+same_surject "surject: vg's GAF" "$WORK/surject.small.md5" "$SMALL_GAF" keep --contig "$SC"
+[ -s "$WORK/small.gaf.bgz" ] || bgzip -c "$SMALL_GAF" > "$WORK/small.gaf.bgz"
+same_surject "surject: vg's GAF, BGZF, 3 threads" "$WORK/surject.small.md5" "$WORK/small.gaf.bgz" keep \
+  --contig "$SC" -t 3
+[ -s "$WORK/surject.small.sorted.md5" ] || (set -o pipefail; "$PGCATALOG" surject --graph "$GBZ" --gaf "$SMALL_GAF" \
+  --contig "$SC" 2> /dev/null | records | LC_ALL=C sort | md5sum > "$WORK/surject.small.sorted.md5") || exit 1
+same_surject "surject: the GAM" "$WORK/surject.small.sorted.md5" "$SMALL_GAM" sort --contig "$SC"
+pgcatalog_surject "$WORK/surject.small.gp.md5" "$SMALL_GAF" --contig "$SC" --graph-placement --sam-contig "$SC"
+same_surject "surject --graph-placement: vg's GAF" "$WORK/surject.small.gp.md5" "$SMALL_GAF" keep --contig "$SC" \
+  --graph-placement --sam-contig "$SC"
+pgcatalog_surject "$WORK/surject.small.cat.md5" "$SMALL_GAF" --contig "$SC" --catalog "$CAT"
+same_surject "surject --catalog: vg's GAF" "$WORK/surject.small.cat.md5" "$SMALL_GAF" keep --contig "$SC" \
+  --catalog "$CAT"
+pgcatalog_surject "$WORK/surject.small.other.md5" "$SMALL_GAF" --contig chr20
+same_surject "surject: a contig the reads are not on" "$WORK/surject.small.other.md5" "$SMALL_GAF" keep --contig chr20
+
 if [ "$FULL" == "--full" ]; then
+  pgcatalog_surject "$WORK/surject.full.md5" "$SLICE_FULL" --contig "$SC" --sam-contig "$SC"
+  same_surject "surject: the slice GAM" "$WORK/surject.full.md5" "$SLICE_GAM" keep --contig "$SC" --sam-contig "$SC"
+  same_surject "surject: the slice's full GAF" "$WORK/surject.full.md5" "$SLICE_FULL" keep --contig "$SC" \
+    --sam-contig "$SC"
+  pgcatalog_surject "$WORK/surject.full.gp.md5" "$SLICE_FULL" --contig "$SC" --sam-contig "$SC" --graph-placement
+  same_surject "surject --graph-placement: the slice GAM" "$WORK/surject.full.gp.md5" "$SLICE_GAM" keep \
+    --contig "$SC" --sam-contig "$SC" --graph-placement
+  pgcatalog_surject "$WORK/surject.full.cat.md5" "$SLICE_FULL" --contig "$SC" --sam-contig "$SC" --catalog "$CAT"
+  same_surject "surject --catalog: the slice GAM" "$WORK/surject.full.cat.md5" "$SLICE_GAM" keep --contig "$SC" \
+    --sam-contig "$SC" --catalog "$CAT"
   pgcat_index "$SLICE_FULL" "$WORK/ref.full.gz"
   "$DROMOS" index -l 0 --gaf "$REFMAP" "$SLICE_FULL" "$WORK/d.full.gz" 2> /dev/null
   same_index "index: the slice's full GAF" "$WORK/d.full.gz" "$WORK/ref.full.gz"

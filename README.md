@@ -10,6 +10,7 @@ the indexing engine behind [pgphase](https://github.com/kokyriakidis/pgphase) (`
 |---|---|
 | `dromos index` | the alignments placed on the reference, sorted, bgzipped and tabix-indexed: the index pgphase reads |
 | `dromos gam-to-gaf` | a GAM as the GAF lines `vg convert -G` writes, in the GAM's order |
+| `dromos surject` | the alignments on one reference contig as SAM: the records `pgcatalog surject` writes |
 
 ## Speed
 
@@ -45,7 +46,7 @@ Each command reads a file that pgcatalog (pgphase's graph tool, `tools/pgcatalog
 
 ```sh
 pgcatalog ref-map --graph graph.gbz --reference-sample CHM13 --out graph.refmap   # for index
-pgcatalog node-table --graph graph.gbz --out graph.nodes                         # for gam-to-gaf
+pgcatalog node-table --graph graph.gbz --out graph.nodes                         # for gam-to-gaf and surject
 ```
 
 ### `dromos index`
@@ -74,6 +75,29 @@ dromos gam-to-gaf graph.nodes reads.gam > reads.gaf     # the lines vg convert -
 dromos gam-to-gaf --slim graph.nodes reads.gam          # their 12 columns alone
 ```
 
+### `dromos surject`
+
+```sh
+dromos surject --contig chr20 graph.refmap graph.nodes reads.gam > chr20.sam
+dromos surject --contig chr20 --sam-contig chr20 graph.refmap graph.nodes reads.gaf.gz \
+  | samtools sort -o chr20.bam && samtools index chr20.bam
+```
+
+- **What it writes.** The alignments of IN on one reference contig as SAM, the records `pgcatalog surject` writes
+  for the same reads and options, in IN's order (a port of its surject.rs). Each read is rebuilt from its walk and
+  `cs`; a base on a node the contig visits once takes that node's position, and the placed stretches are joined by
+  aligning what lies between them to the reference (affine gaps, in a band). Read ends off the reference are aligned
+  or soft-clipped, and ends diverging from the read's own graph alignment clipped. Reads with no base on the contig
+  are left out.
+- **Any input.** A GAM, or a GAF with `cs` (and `bq` for qualities) in any encoding, told apart by its first bytes.
+  A GAM's alignments are first written as vg's GAF lines, so a GAM and its GAF give the same records. dromos index's
+  output keeps no `cs` and cannot be used.
+- **Options.** `--contig NAME` (required); `--sam-contig NAME`, the contig's name in the SAM (`<sample>#0#<contig>`);
+  `--graph-placement`, read bases placed only where the graph puts them; `--catalog FILE`, the contig's catalog
+  (`.pgsites`): reads spanning one of its snarl windows aligned there as alleles; `--reference-sample NAME`, checked
+  against the reference map's; `-t THREADS`. The node table must have letters.
+- **The header.** `@HD` and `@SQ` as pgcatalog writes them; the `@PG` line is dromos's own.
+
 `dromos COMMAND -h` lists each command's options. `DROMOS_TIMING=1` reports where the time goes.
 
 ## How it works
@@ -86,6 +110,9 @@ dromos gam-to-gaf --slim graph.nodes reads.gam          # their 12 columns alone
   chunks. For the index it sums each mapping's edits as it reads them. GAF lines follow libvgio's
   `alignment_to_gaf` line for line.
 - **No graph in memory.** The reference map and node table are memory-mapped, so their pages load as they are used.
+- **Surjection in batches.** A read's alignment to the reference costs from nothing to a second. Each step's
+  slices gather the reads that touch the contig, as GAF lines; a few hundred MB of them are then aligned by one
+  worker a thread taking pieces in turn, so threads wait at the end of a batch, not of every chunk.
 - **Sorted without spilling.** Placed alignments gather by megabase of the reference, compressed with zstd as they
   arrive. At the end, windows of buckets are sorted, laid out, deflated and written in a three-deep pipeline, with
   the tabix index built as each block's address becomes known.
@@ -98,6 +125,8 @@ dromos is checked byte for byte against the tools it replaces, on HG002 HiFi ali
 - `index` writes, at `-l 0`, the same file and `.tbi` as pgphase's previous indexer (`pgcat index-gaf --slim`),
   from the GAM and from its GAF in every encoding. At other levels it writes the same decompressed content, with the
   same answer to every tabix query. The whole-genome index matches the previous one record for record.
+- `surject` writes the same SAM records as `pgcatalog surject` (pgcatalog 0.2.0), from the GAM and from its GAF,
+  with and without `--graph-placement` and `--catalog`, on every contig tried.
 - `tests/integration/edges.sh` covers odd and damaged inputs: empty files, multi-member gzip, lines across chunk
   boundaries, any thread count, stdin, and truncated or corrupt files, which fail instead of leaving a partial
   index.

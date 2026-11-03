@@ -3,17 +3,22 @@
 from std.sys import argv, exit, stderr
 from std.time import perf_counter_ns
 
+from dromos.contig import Contig
 from dromos.convert import GafSink
 from dromos.index import IndexSink
+from dromos.linearize import Window
 from dromos.nodes import NodeTable
 from dromos.parallel import default_threads
+from dromos.pgsites import load_windows
 from dromos.refmap import RefMap
 from dromos.stream import AUTO, GAF, GAM, stream_input
+from dromos.surject import SurjectSink, Surjector
 
 comptime OVERVIEW = """dromos: pangenome graph alignments, fast
 
   dromos index       a GAM or GAF placed on the reference, sorted and tabix-indexed, as pgphase reads it
   dromos gam-to-gaf  a GAM as GAF, the lines vg convert -G writes
+  dromos surject     a GAM or GAF as SAM on one reference contig, the records pgcatalog surject writes
 
 dromos COMMAND -h shows a command's usage. DROMOS_TIMING=1 reports where the time goes, on stderr.
 """
@@ -40,6 +45,33 @@ GAM as GAF on stdout: the lines vg convert -G writes for it, in the GAM's order.
   GAM         the alignments; - reads stdin
   -t THREADS  threads [the machine's cores]
   --slim      each line's 12 GAF columns alone (no cs, bq, AS or dv)
+"""
+
+comptime SURJECT_USAGE = """dromos surject [options] --contig NAME REFMAP NODES IN > OUT.sam
+
+IN's alignments as alignments to one reference contig, as SAM on stdout: the records pgcatalog surject writes for the
+same reads and options (the graph's reference map and node table in place of the graph), in IN's order. Reads with no
+base on the contig are left out.
+  | samtools sort -o OUT.bam && samtools index OUT.bam
+
+  REFMAP                    the graph's reference map (pgcatalog ref-map)
+  NODES                     the graph's node table, with letters (pgcatalog node-table)
+  IN                        a GAM, or a GAF with cs (and bq for qualities; plain, gzip or BGZF), told apart by their
+                            first bytes; - reads stdin. dromos index's output keeps no cs and cannot be used
+  --contig NAME             the reference contig (chr20)
+  --reference-sample NAME   the sample whose path is the reference; REFMAP's, which it must be [REFMAP's]
+  --sam-contig NAME         the contig's name in the SAM [<sample>#0#<contig>]
+  --graph-placement         place read bases only where the graph puts them: a stretch of more than 50 bases off the
+                            reference is not aligned to it, and such read ends are clipped
+  --catalog FILE            the contig's catalog (.pgsites): a read spanning one of its snarl windows is aligned
+                            there as its allele, at minimap2's asm5 costs
+  -t THREADS                threads [the machine's cores]
+  --gaf                     IN is a GAF (not told from its bytes)
+  --gam                     IN is a GAM (not told from its bytes)
+
+Each read is rebuilt from its walk and cs; a base on a node the contig visits once takes that node's position.
+Between placed stretches, a substitution bubble is aligned base for base and an indel bubble globally; read ends off
+the reference are aligned or soft-clipped, and ends diverging from the read's own graph alignment clipped.
 """
 
 
@@ -165,6 +197,45 @@ def gam_to_gaf_main() raises:
             sink.finish()
 
 
+def surject_main() raises:
+    var args = _Args("surject")
+    if args.help():
+        print(SURJECT_USAGE, end="")
+        return
+    var threads = args.threads()
+    var contig_arg = args.value("--contig")
+    var sample_arg = args.value("--reference-sample")
+    var sam_arg = args.value("--sam-contig")
+    var catalog_arg = args.value("--catalog")
+    var graph = args.flag("--graph-placement")
+    var gaf = args.flag("--gaf")
+    var gam = args.flag("--gam")
+    if gaf and gam:
+        _fail("--gaf or --gam, not both", "surject")
+    if not contig_arg:
+        _fail("--contig is required", "surject")
+    var pos = args.positional(3)
+    var contig_name = contig_arg.value()
+    var t0 = perf_counter_ns()
+    var map = RefMap(pos[0])
+    if sample_arg and sample_arg.value() != map.sample:
+        raise Error(t"{pos[0]} is the reference map of {map.sample}, not {sample_arg.value()}")
+    var contig = Contig(map, NodeTable(pos[1]), contig_name)
+    var windows = List[Window]()
+    if catalog_arg:
+        windows = load_windows(catalog_arg.value(), contig, map)
+        print(t"[dromos] surject: {len(windows)} snarl windows", file=stderr)
+    var sam_contig = sam_arg.value() if sam_arg else contig.chrom
+    print(t"[dromos] {contig.chrom}: {len(contig.seq)} bases ({Float64(perf_counter_ns() - t0) * 1e-9} s)", file=stderr)
+    var sink = SurjectSink(Surjector(contig^, NodeTable(pos[1]), sam_contig, graph, windows^), threads)
+    try:
+        stream_input(_input(pos[2]), threads, sink, GAF if gaf else (GAM if gam else AUTO))
+    except e:
+        sink.finish(contig_name, threads, complete=False)
+        raise e^
+    sink.finish(contig_name, threads, complete=True)
+
+
 def main():
     var args = argv()
     if len(args) < 2 or String(args[1]) == "-h" or String(args[1]) == "--help":
@@ -178,6 +249,8 @@ def main():
             index_main()
         elif command == "gam-to-gaf":
             gam_to_gaf_main()
+        elif command == "surject":
+            surject_main()
         else:
             print(t"dromos: no command {command}", file=stderr)
             print(OVERVIEW, end="", file=stderr)

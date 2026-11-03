@@ -131,3 +131,20 @@ def classify(
         return UNPLACED
     aligned = te - ts
     return PLACED
+
+
+def parse_unsigned(p: ImmPointer[UInt8, _], at: Int, end: Int, limit: Int = Int.MAX) -> Int:
+    """The number `p[at:end]` as Rust's `str::parse` reads an unsigned integer (an optional +, then one or more
+    digits, at most `limit`), or -1."""
+    var i = at
+    if i < end and p[unsafe_offset=i] == UInt8(ord("+")):
+        i += 1
+    if i >= end:
+        return -1
+    var v = 0
+    for k in range(i, end):
+        var c = Int(p[unsafe_offset=k]) - ord("0")
+        if c < 0 or c > 9 or v > (limit - c) // 10:
+            return -1
+        v = v * 10 + c
+    return v
