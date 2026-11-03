@@ -702,37 +702,22 @@ struct ContigEntry(Copyable, Movable):
 
 def _index_bytes(blocks: Span[EncodedBlock, _], offsets: List[Int], crcs: List[Int]) -> List[UInt8]:
     """A contig's index, as its frame holds it decompressed."""
-    var out = List[UInt8]()
     var n = len(blocks)
+    var arrays = List[List[Int]](length=INDEX_ARRAYS, fill=List[Int](capacity=n))
+    var reach = 0
+    for i in range(n):
+        ref b = blocks[i]
+        reach = max(reach, b.max_end)
+        var fields: List[Int] = [
+            b.first_pos, b.last_pos, b.max_end, reach, offsets[i], b.records, b.min_allele, b.max_walk, crcs[i]
+        ]
+        for a in range(INDEX_ARRAYS):
+            arrays[a].append(fields[a])
+    var out = List[UInt8]()
     put_u64(out, n)
     put_u64(out, COLUMNS)
-    var reach = 0
-    var reaches = List[Int]()
-    for i in range(n):
-        reach = max(reach, blocks[i].max_end)
-        reaches.append(reach)
-    for a in range(INDEX_ARRAYS):
-        for i in range(n):
-            ref b = blocks[i]
-            var v: Int
-            if a == 0:
-                v = b.first_pos
-            elif a == 1:
-                v = b.last_pos
-            elif a == 2:
-                v = b.max_end
-            elif a == 3:
-                v = reaches[i]
-            elif a == 4:
-                v = offsets[i]
-            elif a == 5:
-                v = b.records
-            elif a == 6:
-                v = b.min_allele
-            elif a == 7:
-                v = b.max_walk
-            else:
-                v = crcs[i]
+    for a in arrays:
+        for v in a:
             put_u64(out, v)
     for which in range(2):
         for i in range(n):
