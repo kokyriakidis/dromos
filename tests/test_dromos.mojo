@@ -1,11 +1,23 @@
 """Tests: protobuf varints, GAM group framing, GAF lines against hand-worked ones, placement on the reference as
-pgcat places alignments, tabix bins as htslib numbers them, and surject's alignments as pgcatalog makes them."""
+pgcat places alignments, tabix bins as htslib numbers them, surject's alignments as pgcatalog makes them, and a GBZ
+read through the gbz crate (tests/data/micb-kir3dl1.gbz, two reference samples)."""
 
 from std.memory import bitcast
-from std.testing import TestSuite, assert_equal, assert_true
+from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 from dromos.gam import Alignment, Framer, frame, gaf_line, slim_line, varint
 from dromos.nodes import NodeTable
+from dromos.graph import (
+    GbzGraph,
+    GbzParts,
+    SearchState,
+    fingerprint,
+    is_gbz,
+    reference_paths,
+    reference_samples,
+    resolve_reference_sample,
+)
+from dromos.graph_files import write_node_table, write_ref_map
 from dromos.gaf_text import MALFORMED, PLACED, SKIP, UNMAPPED, append_slim, classify
 from dromos.output import decimal_digits
 from dromos.bgzf import load_libdeflate
@@ -520,6 +532,154 @@ def test_graph_placement() raises:
     var head = List[UInt8](Span(r)[:260])
     assert_equal(_linear(head, [Block(0, 0, 200)], r, True), "0 200M60S")
     assert_equal(_linear(head, [Block(0, 0, 200)], r, False), "0 260M")
+
+
+comptime GBZ = "tests/data/micb-kir3dl1.gbz"
+
+
+def test_gbz_told_by_its_bytes() raises:
+    assert_true(is_gbz(GBZ))
+    assert_false(is_gbz("tests/test_dromos.mojo"))
+    assert_false(is_gbz("tests/no_such_file"))
+
+
+def test_reference_samples() raises:
+    var found = reference_samples(GBZ)
+    assert_equal(len(found), 2)
+    assert_equal(found[0], "CHM13")
+    assert_equal(found[1], "GRCh38")
+    assert_equal(resolve_reference_sample(GBZ, String("GRCh38")), "GRCh38")
+    var message = String()
+    try:
+        _ = resolve_reference_sample(GBZ, None)
+    except e:
+        message = String(e)
+    assert_equal(
+        message,
+        String(t"{GBZ} declares several reference samples (CHM13, GRCh38); choose one with --reference-sample"),
+    )
+
+
+def test_reference_paths() raises:
+    var by_contig = reference_paths(GBZ, "CHM13")
+    assert_true(len(by_contig) > 0)
+    for i in range(len(by_contig)):
+        if i > 0:
+            assert_true(by_contig[i - 1][0] < by_contig[i][0])
+        for name in by_contig[i][1]:
+            assert_true(name.startswith(String(t"CHM13#0#{by_contig[i][0]}")))
+    assert_equal(len(reference_paths(GBZ, "nobody")), 0)
+
+
+def test_fingerprint() raises:
+    # FNV-1a of the file's first and last 4 MB (here the whole file, twice).
+    assert_equal(fingerprint(GBZ), "size=73920 fnv1a=9736178bc136e029")
+
+
+def test_paths_and_edges() raises:
+    var g = GbzGraph(GBZ)
+    var md = g.metadata()
+    assert_equal(md.paths(), g.paths())
+    var next = List[UInt64]()
+    var prev = List[UInt64]()
+    for id in range(g.paths()):
+        var walk = g.path(id)
+        var back = g.path(id, True)
+        assert_equal(len(walk), len(back))
+        for i in range(len(walk)):
+            # The reverse walk visits the same nodes backwards, each flipped.
+            assert_equal(back[len(walk) - 1 - i], walk[i] ^ 1)
+            assert_true(g.has_node(Int(walk[i] >> 1)))
+            if i + 1 < len(walk):
+                assert_true(g.successors(Int(walk[i] >> 1), walk[i] & 1 == 1, next))
+                assert_true(walk[i + 1] in next)
+                assert_true(g.predecessors(Int(walk[i + 1] >> 1), walk[i + 1] & 1 == 1, prev))
+                assert_true(walk[i] in prev)
+    assert_false(g.successors(g.max_node() + 1, False, next))
+
+
+def test_search_counts_haplotypes() raises:
+    """A search state holds every visit of its node in that orientation, over both strands of every path; following
+    it forward, every visit followed by each next node."""
+    var g = GbzGraph(GBZ)
+    var walks = List[List[UInt64]]()
+    for id in range(g.paths()):
+        walks.append(g.path(id))
+        walks.append(g.path(id, True))
+    var v = walks[0][3]
+    var count = 0
+    var after = Dict[Int, Int]()
+    for w in walks:
+        for i in range(len(w)):
+            if w[i] == v:
+                count += 1
+                if i + 1 < len(w):
+                    after[Int(w[i + 1])] = after.get(Int(w[i + 1]), 0) + 1
+    var state = g.search_state(Int(v >> 1), v & 1 == 1)
+    assert_true(Bool(state))
+    assert_equal(state.value().count(), count)
+    var nexts = List[SearchState]()
+    assert_true(g.follow_forward(state.value(), nexts))
+    assert_equal(len(nexts), len(after))
+    for s in nexts:
+        assert_equal(s.count(), after[Int(s.forward_node)])
+    assert_false(Bool(g.search_state(g.max_node() + 1, False)))
+
+
+def test_parts_read_as_the_graph() raises:
+    """The parts loader gives the crate's GBZ's nodes, lengths, letters and paths."""
+    var g = GbzGraph(GBZ)
+    var p = GbzParts(GBZ)
+    var count = g.max_node() + 1
+    assert_equal(p.max_node(), g.max_node())
+    var a = List[UInt64](length=count + 3, fill=0)
+    var b = List[UInt64](length=count + 3, fill=0)
+    g.lengths(0, count + 3, a.unsafe_ptr())
+    p.lengths(0, count + 3, b.unsafe_ptr())
+    var letters = List[UInt8]()
+    for node in range(count + 3):
+        assert_equal(a[node], b[node])
+        if g.has_node(node):
+            letters.extend(g.sequence(node))
+    var got = List[UInt8](length=len(letters), fill=0)
+    assert_equal(p.letters(0, count + 3, got.unsafe_ptr(), len(got)), len(letters))
+    assert_true(got == letters)
+    assert_equal(p.paths(), g.paths())
+    for id in range(g.paths()):
+        assert_true(p.path(id) == g.path(id))
+
+
+def test_graph_files_from_the_graph() raises:
+    """A reference map and node table made from the graph read back as its nodes and reference paths."""
+    var g = GbzGraph(GBZ)
+    write_ref_map(GBZ, "CHM13", "/tmp/dromos_test.refmap", 3)
+    write_node_table(GBZ, "/tmp/dromos_test.nodes", True, 3)
+    var m = RefMap("/tmp/dromos_test.refmap")
+    var t = NodeTable("/tmp/dromos_test.nodes")
+    assert_equal(m.sample, "CHM13")
+    assert_equal(t.count, g.max_node() + 1)
+    for node in range(t.count):
+        var s = g.sequence(node)
+        assert_equal(t.length(node), len(s))
+        assert_equal(m.length(node), len(s))
+        for i in range(len(s)):
+            assert_equal(t.letter(node, False, i), s[i])
+    var md = g.metadata()
+    var sample = md.sample_id("CHM13").value()
+    var names = md.path_names()
+    var path = 0
+    for id in range(len(names)):
+        if names[id].sample != sample:
+            continue
+        var walk = g.path(id)
+        var start = names[id].fragment
+        var k = m._first_placement_of(path)
+        for i in range(len(walk)):
+            var pl = m.placement(k + i)
+            assert_true(pl.path == path and pl.step == i and pl.start == start and pl.reverse == (walk[i] & 1 == 1))
+            start += len(g.sequence(Int(walk[i] >> 1)))
+        path += 1
+    assert_equal(len(m.path_contig), path)
 
 
 def main() raises:

@@ -47,7 +47,7 @@ struct Contig(Movable):
         if len(paths) == 0:
             raise Error(t"no reference path {self.chrom} in the graph")
         if not nodes.has_letters():
-            raise Error("the node table has no letters (pgcatalog node-table without --no-letters)")
+            raise Error("the node table has no letters (dromos node-table without --no-letters)")
         # Fragments in offset order (step 0's start), then path order.
         var order = List[Int]()
         for i in range(len(paths)):

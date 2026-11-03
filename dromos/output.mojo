@@ -23,6 +23,58 @@ def write_all(fd: Int32, data: ImmPointer[UInt8, _], length: Int):
 
 
 comptime _EINTR: Int32 = 4
+comptime _O_WRONLY: Int32 = 1
+comptime _O_CREAT: Int32 = 0x200 if CompilationTarget.is_macos() else 0o100
+comptime _O_TRUNC: Int32 = 0x400 if CompilationTarget.is_macos() else 0o1000
+
+
+def pwrite_all(fd: Int32, data: ImmPointer[UInt8, _], length: Int, offset: Int) -> Bool:
+    """Writes every byte at `offset` of the file, retrying interrupted and short writes; false on any other
+    failure."""
+    var done = 0
+    while done < length:
+        var n = external_call["pwrite", Int](fd, data.unsafe_offset(done), length - done, offset + done)
+        if n > 0:
+            done += n
+            continue
+        if n < 0 and _errno() == _EINTR:
+            continue
+        return False
+    return True
+
+
+struct OutFile(Movable):
+    """A file made (or emptied) for writing at known offsets, from any thread at once."""
+
+    var fd: Int32
+    var path: String
+
+    def __init__(out self, path: String) raises:
+        var c_path = List[UInt8](path.as_bytes())
+        c_path.append(0)
+        comptime open_name = "open64" if CompilationTarget.is_linux() else "open"
+        self.fd = external_call[open_name, Int32](c_path.unsafe_ptr(), _O_WRONLY | _O_CREAT | _O_TRUNC, Int32(0o644))
+        if self.fd < 0:
+            raise Error(t"cannot write {path} (errno {_errno()})")
+        self.path = path
+
+    def write_at(self, data: ImmPointer[UInt8, _], length: Int, offset: Int) -> Bool:
+        return pwrite_all(self.fd, data, length, offset)
+
+    def put(self, data: Span[UInt8, _], offset: Int) raises:
+        if not self.write_at(data.unsafe_ptr(), len(data), offset):
+            raise Error(t"cannot write {self.path} (errno {_errno()})")
+
+    def close(mut self) raises:
+        """Closes the file; a failure (a full disk seen late) is an error."""
+        var fd = self.fd
+        self.fd = -1
+        if external_call["close", Int32](fd) != 0:
+            raise Error(t"cannot write {self.path} (errno {_errno()})")
+
+    def __deinit__(deinit self):
+        if self.fd >= 0:
+            _ = external_call["close", Int32](self.fd)
 
 
 def _errno() -> Int32:

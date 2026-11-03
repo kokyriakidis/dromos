@@ -5,6 +5,8 @@ from std.time import perf_counter_ns
 
 from dromos.contig import Contig
 from dromos.convert import GafSink
+from dromos.graph import reference_samples, resolve_reference_sample
+from dromos.graph_files import write_node_table, write_ref_map
 from dromos.index import IndexSink
 from dromos.linearize import Window
 from dromos.nodes import NodeTable
@@ -20,6 +22,10 @@ comptime OVERVIEW = """dromos: pangenome graph alignments, fast
   dromos gam-to-gaf  a GAM as GAF, the lines vg convert -G writes
   dromos surject     a GAM or GAF as SAM on one reference contig, the records pgcatalog surject writes
 
+  dromos ref-map            a GBZ graph's reference map, which index and surject place alignments by
+  dromos node-table         a GBZ graph's node lengths and letters, which gam-to-gaf and surject read
+  dromos reference-samples  the reference samples a GBZ graph declares
+
 dromos COMMAND -h shows a command's usage. DROMOS_TIMING=1 reports where the time goes, on stderr.
 """
 
@@ -28,7 +34,7 @@ comptime INDEX_USAGE = """dromos index [-t THREADS] [-l LEVEL] [--gaf | --gam] R
 IN's alignments placed on the reference, sorted, bgzipped and tabix-indexed as pgphase reads them: OUT and OUT.tbi,
 the files pgphase's previous indexer (pgcat index-gaf --slim) wrote from the same alignments as GAF.
 
-  REFMAP      the graph's reference map (pgcatalog ref-map)
+  REFMAP      the graph's reference map (dromos ref-map)
   IN          a GAM, or a GAF (plain, gzip or BGZF), told apart by their first bytes; - reads stdin
   -t THREADS  threads [the machine's cores]
   -l LEVEL    BGZF compression level, 0-12 [1]: 1 deflates about 3 times as fast as 6 into a file 40% larger;
@@ -41,7 +47,7 @@ comptime GAM_TO_GAF_USAGE = """dromos gam-to-gaf [-t THREADS] [--slim] NODES GAM
 
 GAM as GAF on stdout: the lines vg convert -G writes for it, in the GAM's order.
 
-  NODES       the graph's node table (pgcatalog node-table; with --slim it needs no letters)
+  NODES       the graph's node table (dromos node-table; with --slim it needs no letters)
   GAM         the alignments; - reads stdin
   -t THREADS  threads [the machine's cores]
   --slim      each line's 12 GAF columns alone (no cs, bq, AS or dv)
@@ -54,8 +60,8 @@ same reads and options (the graph's reference map and node table in place of the
 base on the contig are left out.
   | samtools sort -o OUT.bam && samtools index OUT.bam
 
-  REFMAP                    the graph's reference map (pgcatalog ref-map)
-  NODES                     the graph's node table, with letters (pgcatalog node-table)
+  REFMAP                    the graph's reference map (dromos ref-map)
+  NODES                     the graph's node table, with letters (dromos node-table)
   IN                        a GAM, or a GAF with cs (and bq for qualities; plain, gzip or BGZF), told apart by their
                             first bytes; - reads stdin. dromos index's output keeps no cs and cannot be used
   --contig NAME             the reference contig (chr20)
@@ -72,6 +78,36 @@ base on the contig are left out.
 Each read is rebuilt from its walk and cs; a base on a node the contig visits once takes that node's position.
 Between placed stretches, a substitution bubble is aligned base for base and an indel bubble globally; read ends off
 the reference are aligned or soft-clipped, and ends diverging from the read's own graph alignment clipped.
+"""
+
+
+comptime REF_MAP_USAGE = """dromos ref-map [-t THREADS] [--reference-sample NAME] --graph GRAPH.gbz --out FILE
+
+Where each node of a GBZ graph lies on its reference sample's paths, saved once per graph for dromos index and
+surject, which place alignments on the reference by it: the file pgcatalog ref-map writes.
+
+  --graph FILE              the pangenome graph (GBZ)
+  --out FILE                the reference map
+  --reference-sample NAME   the sample whose paths are the reference: CHM13 for CHM13#0#chr20 [the graph's declared
+                            reference sample, if it declares exactly one; HPRC graphs declare CHM13 and GRCh38 and
+                            need this]
+  -t THREADS                threads [the machine's cores]
+"""
+
+comptime NODE_TABLE_USAGE = """dromos node-table [-t THREADS] [--no-letters] --graph GRAPH.gbz --out FILE
+
+A GBZ graph's node lengths and letters as one flat file, the node table dromos gam-to-gaf and surject read: the file
+pgcatalog node-table writes.
+
+  --graph FILE   the pangenome graph (GBZ)
+  --out FILE     the node table
+  --no-letters   lengths alone (enough for GAF's columns, not for its cs)
+  -t THREADS     threads [the machine's cores]
+"""
+
+comptime REFERENCE_SAMPLES_USAGE = """dromos reference-samples GRAPH.gbz
+
+The reference samples a GBZ graph declares, one per line, read from the start of the file.
 """
 
 
@@ -236,6 +272,58 @@ def surject_main() raises:
     sink.finish(contig_name, threads, complete=True)
 
 
+def _required(value: Optional[String], usage: StaticString) -> String:
+    """A required option's value; without it, the usage on stderr (as pgcatalog does)."""
+    if not value:
+        print(usage, end="", file=stderr)
+        exit(1)
+    return value.value()
+
+
+def ref_map_main() raises:
+    var args = _Args("ref-map")
+    if args.help():
+        print(REF_MAP_USAGE, end="")
+        return
+    var threads = args.threads()
+    var graph_arg = args.value("--graph")
+    var out_arg = args.value("--out")
+    var sample = args.value("--reference-sample")
+    _ = args.positional(0)
+    var graph = _required(graph_arg, REF_MAP_USAGE)
+    var out = _required(out_arg, REF_MAP_USAGE)
+    # The sample first: a graph declaring several fails at once, not after its load.
+    var s = resolve_reference_sample(graph, sample)
+    write_ref_map(graph, s, out, threads)
+
+
+def node_table_main() raises:
+    var args = _Args("node-table")
+    if args.help():
+        print(NODE_TABLE_USAGE, end="")
+        return
+    var threads = args.threads()
+    var graph_arg = args.value("--graph")
+    var out_arg = args.value("--out")
+    var letters = not args.flag("--no-letters")
+    _ = args.positional(0)
+    var graph = _required(graph_arg, NODE_TABLE_USAGE)
+    var out = _required(out_arg, NODE_TABLE_USAGE)
+    write_node_table(graph, out, letters, threads)
+
+
+def reference_samples_main() raises:
+    var args = _Args("reference-samples")
+    if args.help():
+        print(REFERENCE_SAMPLES_USAGE, end="")
+        return
+    if len(args.items) == 0:
+        raise Error("usage: dromos reference-samples GRAPH.gbz")
+    var graph = args.positional(1)[0]
+    for s in reference_samples(graph):
+        print(s)
+
+
 def main():
     var args = argv()
     if len(args) < 2 or String(args[1]) == "-h" or String(args[1]) == "--help":
@@ -251,6 +339,12 @@ def main():
             gam_to_gaf_main()
         elif command == "surject":
             surject_main()
+        elif command == "ref-map":
+            ref_map_main()
+        elif command == "node-table":
+            node_table_main()
+        elif command == "reference-samples":
+            reference_samples_main()
         else:
             print(t"dromos: no command {command}", file=stderr)
             print(OVERVIEW, end="", file=stderr)

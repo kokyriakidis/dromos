@@ -12,7 +12,9 @@
 #   SMALL_GAM  a few thousand alignments; SMALL_GAF  vg convert -G of it (any order)
 #   SLICE_GAM  a GAM ending at a group boundary, some GB; SLICE_SLIM  dromos gam-to-gaf --slim of it, as checked;
 #   SLICE_FULL dromos gam-to-gaf of it, as checked (only with --full)
-#   PGCATALOG  pgcatalog (pgphase's tools/pgcatalog), whose surject dromos surject ports; GBZ the graph it reads
+#   PGCATALOG  pgcatalog (pgphase's tools/pgcatalog, plegma-msa branch, 60a3d09, `cargo build --release`), whose
+#              surject dromos surject ports and whose ref-map and node-table dromos's must match; GBZ the graph the
+#              alignments are on (REFMAP and NODES are its); GBZ_SMALL a small GBZ (tests/data/micb-kir3dl1.gbz)
 #   CATALOG_DIR the graph's catalogs (<contig>.pgsites); SURJECT_CONTIG a contig the alignments lie on (chr10)
 #   WORK       a directory for outputs and the pgcat references (made once, kept)
 #
@@ -52,6 +54,33 @@ pgcat_index() {  # GAF, output: pgcat's slim index at level 0, made once
   [ -s "$2" ] || "$PGCAT" index-gaf --ref-map "$REFMAP" --gaf "$1" --slim --level 0 -t 10 --out "$2" \
     --tmp-dir "$WORK" 2> "$2.err" || { echo "pgcat failed on $1"; exit 1; }
 }
+
+# The graph files: dromos ref-map, node-table and reference-samples write what pgcatalog writes, on both graphs, for
+# each declared reference sample.
+pgcatalog_file() {  # output, pgcatalog args...: pgcatalog's file, made once
+  local out=$1; shift
+  [ -s "$out" ] || "$PGCATALOG" "$@" --out "$out" 2> "$out.err" || { echo "pgcatalog failed: $*"; exit 1; }
+}
+for g in small:$GBZ_SMALL hprc:$GBZ; do
+  n=${g%%:*}; f=${g#*:}
+  "$PGCATALOG" reference-samples "$f" > "$WORK/$n.samples.want"
+  "$DROMOS" reference-samples "$f" | cmp -s - "$WORK/$n.samples.want" && pass "reference-samples: $n" \
+    || fail "reference-samples: $n"
+  for s in $(cat "$WORK/$n.samples.want"); do
+    pgcatalog_file "$WORK/pgc.$n.$s.refmap" ref-map --graph "$f" --reference-sample "$s"
+    "$DROMOS" ref-map --graph "$f" --reference-sample "$s" --out "$WORK/d.$n.$s.refmap" 2> /dev/null
+    cmp -s "$WORK/d.$n.$s.refmap" "$WORK/pgc.$n.$s.refmap" && pass "ref-map: $n, $s" || fail "ref-map: $n, $s"
+  done
+  rm -f "$WORK"/d.$n.*.refmap
+  pgcatalog_file "$WORK/pgc.$n.nodes" node-table --graph "$f"
+  "$DROMOS" node-table --graph "$f" --out "$WORK/d.$n.nodes" 2> /dev/null
+  cmp -s "$WORK/d.$n.nodes" "$WORK/pgc.$n.nodes" && pass "node-table: $n" || fail "node-table: $n"
+  pgcatalog_file "$WORK/pgc.$n.lengths" node-table --graph "$f" --no-letters
+  "$DROMOS" node-table -t 3 --graph "$f" --no-letters --out "$WORK/d.$n.lengths" 2> /dev/null
+  cmp -s "$WORK/d.$n.lengths" "$WORK/pgc.$n.lengths" && pass "node-table --no-letters: $n" \
+    || fail "node-table --no-letters: $n"
+  rm -f "$WORK/d.$n.nodes" "$WORK/d.$n.lengths"
+done
 
 # gam-to-gaf: vg's lines, and the slices as checked before.
 "$DROMOS" gam-to-gaf "$NODES" "$SMALL_GAM" > "$WORK/small.gaf"
