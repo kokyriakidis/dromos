@@ -21,13 +21,13 @@ dromos COMMAND -h shows a command's usage. DROMOS_TIMING=1 reports where the tim
 comptime INDEX_USAGE = """dromos index [-t THREADS] [-l LEVEL] [--gaf | --gam] REFMAP IN OUT
 
 IN's alignments placed on the reference, sorted, bgzipped and tabix-indexed as pgphase reads them: OUT and OUT.tbi,
-the files pgcat index-gaf --slim writes from the same alignments as GAF.
+the files pgphase's previous indexer (pgcat index-gaf --slim) wrote from the same alignments as GAF.
 
-  REFMAP      the graph's reference map (pgcat ref-map)
+  REFMAP      the graph's reference map (pgcatalog ref-map)
   IN          a GAM, or a GAF (plain, gzip or BGZF), told apart by their first bytes; - reads stdin
   -t THREADS  threads [the machine's cores]
-  -l LEVEL    BGZF compression level, 0-12 [1]: 1 deflates about 3 times as fast as 6 into a file 40% larger
-              (as large as pgcat's, zlib at 6); 6 for a file to keep
+  -l LEVEL    BGZF compression level, 0-12 [1]: 1 deflates about 3 times as fast as 6 into a file 40% larger;
+              6 for a file to keep
   --gaf       IN is a GAF (not told from its bytes)
   --gam       IN is a GAM (not told from its bytes)
 """
@@ -36,7 +36,7 @@ comptime GAM_TO_GAF_USAGE = """dromos gam-to-gaf [-t THREADS] [--slim] NODES GAM
 
 GAM as GAF on stdout: the lines vg convert -G writes for it, in the GAM's order.
 
-  NODES       the graph's node table (pgcat node-table; with --slim it needs no letters)
+  NODES       the graph's node table (pgcatalog node-table; with --slim it needs no letters)
   GAM         the alignments; - reads stdin
   -t THREADS  threads [the machine's cores]
   --slim      each line's 12 GAF columns alone (no cs, bq, AS or dv)

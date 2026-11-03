@@ -2,7 +2,7 @@
 `RefMap::project`, itself pggaf's walk_ref_interval), ported line for line so dromos places every alignment where
 `pgcat index-gaf` does.
 
-The map (`pgcat ref-map` writes it once per graph) is little-endian:
+The map (`pgcatalog ref-map` writes it once per graph) is little-endian:
 
     "PGCATRM1"                         magic
     u64 n, n bytes                     the reference sample
@@ -91,7 +91,7 @@ def _u64(p: ImmPointer[UInt8, _], at: Int) -> Int:
 
 
 struct RefMap(Movable, Nodes):
-    """A pgcat reference map, mapped into memory: node lengths and placements are read in place."""
+    """A reference map (pgcatalog ref-map), mapped into memory: node lengths and placements are read in place."""
 
     var file: MappedFile
     var sample: String
@@ -114,7 +114,7 @@ struct RefMap(Movable, Nodes):
         self.file = MappedFile(path)
         var n = self.file.size
         var p = self.file.ptr
-        var bad = String(t"{path}: not a pgcat ref map (pgcat ref-map writes one)")
+        var bad = String(t"{path}: not a reference map (pgcatalog ref-map writes one)")
         var ok = n >= 16
         var magic = MAGIC.as_bytes()
         for i in range(8):

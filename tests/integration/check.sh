@@ -5,8 +5,10 @@
 #
 # ENV_FILE sets (paths on the machine with the data):
 #   DROMOS     the dromos binary to check (default: build/dromos)
-#   PGCAT      pgcat (pgphase's tools/pgcat), which makes the reference indexes
-#   REFMAP     the graph's reference map (pgcat ref-map); NODES its node table with letters, LENGTHS one without
+#   PGCAT      pgcat from pgphase's rescue-experiment branch, ff2b4b2 (tools/pgcat; `cargo build --release --no-default-features`;
+#              the last with index-gaf --ref-map --slim), the indexer dromos
+#              replaced, which makes the reference indexes (pgcatalog, its successor, has no index-gaf)
+#   REFMAP     the graph's reference map (pgcatalog ref-map); NODES its node table with letters, LENGTHS one without
 #   SMALL_GAM  a few thousand alignments; SMALL_GAF  vg convert -G of it (any order)
 #   SLICE_GAM  a GAM ending at a group boundary, some GB; SLICE_SLIM  dromos gam-to-gaf --slim of it, as checked;
 #   SLICE_FULL dromos gam-to-gaf of it, as checked (only with --full)

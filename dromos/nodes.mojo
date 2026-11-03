@@ -9,7 +9,7 @@ The table is one file, little-endian, every section starting at a multiple of 8 
     u64 offsets[count + 1]      node i's letters are bases[offsets[i] .. offsets[i + 1]], forward strand
     u8  bases[offsets[count]]
 
-`pgcat node-table` writes it from a GBZ graph.
+`pgcatalog node-table` writes it from a GBZ graph.
 """
 
 from dromos.bgzf import MappedFile

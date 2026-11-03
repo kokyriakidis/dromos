@@ -42,10 +42,11 @@ habits:
 - Build and test where the data are (a GAM, the graph's ref map and node table): `pixi run ...`.
 - `gaf_line` follows libvgio's `alignment_to_gaf` (src/alignment_io.cpp) line for line; keep it so, and check any
   change against `vg convert -G` (the same lines; vg's order varies, dromos keeps the input's).
-- `dromos index` must write what `pgcat index-gaf --slim --ref-map` writes (pgphase's tools/pgcat: gaf.rs, bgzf.rs,
-  tabix.rs; refmap.mojo and tabix.mojo port them): at `-l 0` the same file byte for byte, and the same .tbi
-  decompressed (the check does this). At other levels only the deflate differs: compare decompressed content and
-  tabix queries.
+- `dromos index` must write what pgphase's previous indexer, `pgcat index-gaf --slim --ref-map`, writes (pgcat, now
+  pgcatalog, dropped index-gaf for dromos; the checks run a pgcat built from pgphase's rescue-experiment branch,
+  ff2b4b2; refmap.mojo and tabix.mojo port its gaf.rs and tabix.rs): at `-l 0` the same file byte for byte, and the
+  same .tbi decompressed (the check does this). At other levels only the deflate differs: compare decompressed content
+  and tabix queries.
 - The pipeline (stream.mojo) is shared: a sink says what messages (a GAF's lines) become (convert.mojo, index.mojo).
   GAF input must index as pgcat indexes the same file, in every encoding (the check covers plain, gzip, BGZF, stdin
   and edge cases).
