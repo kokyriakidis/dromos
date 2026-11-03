@@ -157,7 +157,45 @@ fails "a graph declaring two reference samples, none chosen" $D index --graph gw
 fails "a reference sample the graph lacks" $D index --graph gw/g.gbz --reference-sample NOBODY empty.gaf x.gz
 label="no cache left by a sample the graph lacks"; ok bash -c "! ls gw | grep -q part"
 fails "prepare: no graph" $D prepare
-fails "surject: no contig" $D surject $DG $SMALL_GAF
+# 7b. surject: every contig without --contig; -o's BAM from odd inputs, whatever the threads; options that do not fit.
+SAMTOOLS=${SAMTOOLS:-samtools}
+HERE=$OLDPWD/tests/integration
+[ -e "$HERE/same_index.py" ] || HERE=$HOME/dromos/tests/integration
+$D surject $DG $SMALL_GAF 2> /dev/null | grep -c '^@SQ' > sq.n
+label="surject: no contig, every contig in the SAM's header"; ok bash -c "[ \$(cat sq.n) -eq 25 ]"
+bam_ok() {  # BAM: samtools reads it, and indexes it as dromos did
+  rm -f again.bam*; cp $1 again.bam; $SAMTOOLS quickcheck $1 && $SAMTOOLS index again.bam \
+    && python3 -I $HERE/same_index.py $1.bai again.bam.bai > /dev/null \
+    && cmp -s <($SAMTOOLS idxstats $1) <($SAMTOOLS idxstats again.bam)
+}
+$D surject $DG empty.gaf -o s.empty.bam 2> /dev/null
+label="surject -o: an empty GAF, a BAM of no records"
+ok bash -c "$(declare -f bam_ok); SAMTOOLS=$SAMTOOLS HERE=$HERE bam_ok s.empty.bam && [ \$($SAMTOOLS view -c s.empty.bam) -eq 0 ] \
+  && [ \$($SAMTOOLS view -H s.empty.bam | grep -c '^@SQ') -eq 25 ]"
+$D surject $DG --contig chr20 $G -o s.none.bam 2> /dev/null
+label="surject -o: a contig no read is on"
+ok bash -c "$(declare -f bam_ok); SAMTOOLS=$SAMTOOLS HERE=$HERE bam_ok s.none.bam && [ \$($SAMTOOLS view -c s.none.bam) -eq 0 ]"
+$D surject $DG --contig chr10 $G -o s.one.bam 2> /dev/null
+label="surject -o: a single contig"
+ok bash -c "$(declare -f bam_ok); SAMTOOLS=$SAMTOOLS HERE=$HERE bam_ok s.one.bam && [ \$($SAMTOOLS view -H s.one.bam | grep -c '^@SQ') -eq 1 ]"
+$D surject $DG $G -o s.t1.bam -t 1 2> /dev/null
+$D surject $DG $G -o s.t7.bam -t 7 2> /dev/null
+$D surject $DG - -o s.stdin.bam < $G 2> /dev/null
+label="surject -o: 1 thread and 7, and stdin, the same BAM and index"
+ok bash -c "cmp -s s.t1.bam s.t7.bam && cmp -s s.t1.bam.bai s.t7.bam.bai && cmp -s s.t1.bam s.stdin.bam"
+$D surject $DG $G -o s.tiny.bam -m 1K 2> /dev/null
+label="surject -o: spilled at every step, the same BAM"; ok cmp -s s.t1.bam s.tiny.bam
+$D surject $DG $G -o s.l0.bam -l 0 2> /dev/null
+label="surject -o: level 0, the same records"
+ok bash -c "cmp -s <(bgzip -dc s.l0.bam) <(bgzip -dc s.t1.bam)"
+$D surject $DG $G -o s.cut.bam --gam 2> /dev/null
+label="surject -o: a failed run leaves no BAM"; ok bash -c "! test -e s.cut.bam && ! ls | grep -q 's.cut.bam'"
+fails "surject: --sam-contig with two contigs" $D surject $DG --contig chr10 --contig chr20 --sam-contig x $G
+fails "surject: --catalog FILE with two contigs" $D surject $DG --contig chr10 --contig chr20 --catalog $G $G
+fails "surject: a contig the graph lacks" $D surject $DG --contig chrNone $G
+fails "surject: --sam-names neither full nor short" $D surject $DG --sam-names long $G
+fails "surject: -l without -o" $D surject $DG -l 3 $G
+fails "surject -o: a folder that does not exist" $D surject $DG $G -o /nonexistent/x.bam
 # 8. catalog and view on the small graph (GBZ_SMALL, its committed snarls), against pgcatalog build and view: odd
 # snarls files, regions and contigs, threads; a missing snarls cache made with vg (VG, the vg binary pgcatalog runs).
 S=$OLDPWD/tests/data/micb-kir3dl1.catalog/snarls

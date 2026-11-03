@@ -19,14 +19,18 @@
 #   SNARLS     the graph's snarls cache (<contig>.snarls and graph.id, as pgcatalog build keeps it), copied, not changed
 #   WORK       a directory for outputs and the pgcat and pgcatalog references (made once, kept), and for the graph's
 #              cache: dromos reads GBZ through a link in WORK/graph, its cache made beside it
+#   SAMTOOLS   samtools (1.24; default: samtools), whose sort and index surject -o's BAM is checked against
+#   CARVED     a folder of carved slices of the whole GAM, chr20s.gam and chr6s.gam with their .gaf (only with --full)
 #
 # Every index is made at -l 0 (stored blocks), where dromos and pgcat write the same bytes: the files must be equal,
 # and their .tbi equal decompressed.
 set -u
-[ $# -ge 1 ] || { sed -n 2,22p "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n 2,24p "$0"; exit 2; }
 source "$1"
 FULL=${2:-}
 DROMOS=${DROMOS:-build/dromos}
+SAMTOOLS=${SAMTOOLS:-samtools}
+HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$WORK"
 fails=0
 pass() { echo "ok    $1"; }
@@ -220,7 +224,95 @@ same_surject "surject --catalog: vg's GAF" "$WORK/surject.small.cat.md5" "$SMALL
 pgcatalog_surject "$WORK/surject.small.other.md5" "$SMALL_GAF" --contig chr20
 same_surject "surject: a contig the reads are not on" "$WORK/surject.small.other.md5" "$SMALL_GAF" keep --contig chr20
 
+# surject -o: one pass over every contig into a BAM sorted as samtools sort sorts and indexed as samtools index
+# indexes. Each contig's records (samtools view OUT CONTIG) are its single-contig run's, sorted by samtools; the
+# index says what samtools index says of the same file; a single contig's BAM holds the very records samtools makes
+# of its SAM.
+single_sorted() {  # input, contig, options...: the checksum of the single-contig run's records, sorted by samtools
+  local in=$1 c=$2; shift 2
+  "$DROMOS" surject --graph "$G" --reference-sample CHM13 --contig "$c" "$@" "$in" 2> /dev/null \
+    | "$SAMTOOLS" sort -@ 4 -m 1G -T "$WORK/sorting" -O SAM 2> /dev/null | "$SAMTOOLS" view - | md5sum
+}
+same_bam() {  # name, BAM, input, all|placed (every contig, or those with records and one without), options...
+  local name=$1 bam=$2 in=$3 which=$4; shift 4
+  local bad=0 n=0 c empty=""
+  "$SAMTOOLS" quickcheck "$bam" || bad=$((bad + 1))
+  local idx=$bam.bai flag=""
+  [ -e "$bam.csi" ] && idx=$bam.csi flag=-c
+  rm -f "$WORK/again.bam"*; cp "$bam" "$WORK/again.bam"
+  "$SAMTOOLS" index $flag "$WORK/again.bam" && python3 -I "$HERE/same_index.py" "$idx" "$WORK/again.bam.${idx##*.}" \
+    > /dev/null || bad=$((bad + 1))
+  cmp -s <("$SAMTOOLS" idxstats "$bam") <("$SAMTOOLS" idxstats "$WORK/again.bam") || bad=$((bad + 1))
+  while read -r c len mapped unmapped; do
+    [ "$c" == "*" ] && continue
+    if [ "$which" == "placed" ] && [ "$mapped" == 0 ]; then
+      [ -n "$empty" ] && continue
+      empty=$c
+    fi
+    n=$((n + 1))
+    [ "$("$SAMTOOLS" view "$bam" "$c" | md5sum)" == "$(single_sorted "$in" "${c##*#}" "$@")" ] || bad=$((bad + 1))
+  done < <("$SAMTOOLS" idxstats "$bam")
+  [ $bad -eq 0 ] && pass "$name ($n contigs)" || fail "$name ($bad of $n checks differ)"
+}
+bam_records() { bgzip -dc "$1" | python3 -I "$HERE/bam_records.py"; }
+SO="--graph $G --reference-sample CHM13"
+"$DROMOS" surject $SO --contig "$SC" "$SMALL_GAF" -o "$WORK/one.bam" 2> /dev/null
+"$DROMOS" surject $SO --contig "$SC" "$SMALL_GAF" 2> /dev/null | "$SAMTOOLS" sort -O BAM -T "$WORK/sorting" \
+  -o "$WORK/one.samtools.bam" 2> /dev/null
+[ "$(bam_records "$WORK/one.bam")" == "$(bam_records "$WORK/one.samtools.bam")" ] \
+  && pass "surject -o, one contig: samtools sort's records, byte for byte" \
+  || fail "surject -o, one contig: samtools sort's records, byte for byte"
+same_bam "surject -o, one contig: index and records" "$WORK/one.bam" "$SMALL_GAF" all
+"$DROMOS" surject $SO "$SMALL_GAF" -o "$WORK/all.bam" 2> /dev/null
+same_bam "surject -o: every contig, vg's GAF" "$WORK/all.bam" "$SMALL_GAF" all
+"$DROMOS" surject $SO "$SMALL_GAM" -o "$WORK/all.gam.bam" 2> /dev/null
+same_bam "surject -o: every contig, the GAM" "$WORK/all.gam.bam" "$SMALL_GAM" all
+"$DROMOS" surject $SO "$SMALL_GAF" -o "$WORK/all.spill.bam" -m 1M 2> /dev/null
+cmp -s "$WORK/all.bam" "$WORK/all.spill.bam" && cmp -s "$WORK/all.bam.bai" "$WORK/all.spill.bam.bai" \
+  && pass "surject -o: spilled to disk, the same BAM and index" || fail "surject -o: spilled to disk, the same BAM and index"
+"$DROMOS" surject $SO "$SMALL_GAF" -o "$WORK/all.gp.bam" --graph-placement 2> /dev/null
+same_bam "surject -o --graph-placement: every contig" "$WORK/all.gp.bam" "$SMALL_GAF" all --graph-placement
+"$DROMOS" surject $SO "$SMALL_GAF" -o "$WORK/all.cat.bam" --catalog "$CATALOG_DIR" 2> /dev/null
+same_bam "surject -o --catalog DIR: every contig" "$WORK/all.cat.bam" "$SMALL_GAF" placed --catalog "$CATALOG_DIR"
+"$DROMOS" surject $SO "$SMALL_GAF" -o "$WORK/short.bam" --sam-names short 2> /dev/null
+[ "$("$SAMTOOLS" view "$WORK/short.bam" "$SC" | cut -f 1,2,4- | md5sum)" \
+  == "$("$SAMTOOLS" view "$WORK/all.bam" "CHM13#0#$SC" | cut -f 1,2,4- | md5sum)" ] \
+  && "$SAMTOOLS" view -H "$WORK/short.bam" | grep -q "^@SQ.SN:$SC.LN" \
+  && pass "surject -o --sam-names short" || fail "surject -o --sam-names short"
+# Several contigs as SAM on stdout: each contig's records, in IN's order, are its single-contig run's.
+"$DROMOS" surject $SO --contig chr20 --contig "$SC" "$SMALL_GAF" > "$WORK/two.sam" 2> /dev/null
+bad=0
+for c in "$SC" chr20; do
+  cmp -s <(awk -v c="CHM13#0#$c" '$3 == c' "$WORK/two.sam") <("$DROMOS" surject $SO --contig "$c" "$SMALL_GAF" \
+    2> /dev/null | grep -v '^@') || bad=1
+done
+[ "$(grep '^@SQ' "$WORK/two.sam" | cut -f 2 | tr '\n' ' ')" == "SN:CHM13#0#$SC SN:CHM13#0#chr20 " ] || bad=1
+[ $bad -eq 0 ] && pass "surject: two contigs as SAM, each its single run's" || fail "surject: two contigs as SAM, each its single run's"
+
 if [ "$FULL" == "--full" ]; then
+  "$DROMOS" surject $SO "$SLICE_GAM" -o "$WORK/slice.bam" 2> /dev/null
+  same_bam "surject -o: the slice GAM, every contig" "$WORK/slice.bam" "$SLICE_GAM" all
+  "$DROMOS" surject $SO "$SLICE_FULL" -o "$WORK/slice.gaf.bam" 2> /dev/null
+  cmp -s "$WORK/slice.bam" "$WORK/slice.gaf.bam" && pass "surject -o: the slice's full GAF gives the GAM's BAM" \
+    || fail "surject -o: the slice's full GAF gives the GAM's BAM"
+  "$DROMOS" surject $SO "$SLICE_GAM" -o "$WORK/slice.gp.bam" --graph-placement 2> /dev/null
+  same_bam "surject -o --graph-placement: the slice GAM" "$WORK/slice.gp.bam" "$SLICE_GAM" placed --graph-placement
+  "$DROMOS" surject $SO "$SLICE_GAM" -o "$WORK/slice.cat.bam" --catalog "$CATALOG_DIR" 2> /dev/null
+  same_bam "surject -o --catalog DIR: the slice GAM" "$WORK/slice.cat.bam" "$SLICE_GAM" placed --catalog "$CATALOG_DIR"
+  "$DROMOS" surject $SO "$SLICE_GAM" -o "$WORK/slice.spill.bam" -m 256M 2> /dev/null
+  cmp -s "$WORK/slice.bam" "$WORK/slice.spill.bam" && cmp -s "$WORK/slice.bam.bai" "$WORK/slice.spill.bam.bai" \
+    && pass "surject -o: the slice spilled to disk, the same BAM" || fail "surject -o: the slice spilled to disk, the same BAM"
+  rm -f "$WORK"/slice.*bam*
+  for s in chr20s chr6s; do
+    for k in gam gaf; do
+      "$DROMOS" surject $SO "$CARVED/$s.$k" -o "$WORK/$s.$k.bam" 2> /dev/null
+      same_bam "surject -o: the carved $s, its ${k^^}" "$WORK/$s.$k.bam" "$CARVED/$s.$k" placed
+    done
+    cmp -s <(bam_records "$WORK/$s.gam.bam") <(bam_records "$WORK/$s.gaf.bam") \
+      && pass "surject -o: the carved $s, the GAM gives its GAF's BAM" \
+      || fail "surject -o: the carved $s, the GAM gives its GAF's BAM"
+    rm -f "$WORK/$s".*.bam*
+  done
   pgcatalog_surject "$WORK/surject.full.md5" "$SLICE_FULL" --contig "$SC" --sam-contig "$SC"
   same_surject "surject: the slice GAM" "$WORK/surject.full.md5" "$SLICE_GAM" keep --contig "$SC" --sam-contig "$SC"
   same_surject "surject: the slice's full GAF" "$WORK/surject.full.md5" "$SLICE_FULL" keep --contig "$SC" \

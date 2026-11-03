@@ -4,10 +4,11 @@ through the gbz crate (tests/data/micb-kir3dl1.gbz, two reference samples), snar
 pgcatalog writes and reads them (tests/data/micb-kir3dl1.catalog: its snarls and pgcatalog's catalogs)."""
 
 from std.memory import bitcast
+from std.random import random_ui64, seed
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
 from dromos.gam import Alignment, Framer, frame, gaf_line, slim_line, varint
-from dromos.nodes import NodeTable, complement
+from dromos.nodes import NodeTable, comp, complement
 from dromos.cache import (
     CURRENT,
     DAMAGED,
@@ -40,19 +41,23 @@ from dromos.pgsites import Catalog, Writer, compress_sealed, records, same_conti
 from dromos.snarls import NO_PARENT, Snarl, canonical, parse_snarls, read_snarls, snarl_name
 from dromos.gaf_text import MALFORMED, PLACED, SKIP, UNMAPPED, append_slim, classify
 from dromos.output import decimal_digits
-from dromos.bgzf import load_libdeflate
+from dromos.bgzf import inflate_blocks, load_libdeflate, scan_blocks
 from dromos.stream import BGZF, GZIP, PLAIN, looks_like_gaf
 from dromos.refmap import AMBIGUOUS, INCONSISTENT, MISSING_NODE, NO_ANCHOR, Anchor, Placed, RefMap
 from dromos.tabix import N_BINS, bin_level, bin_parent, reg2bin
 from dromos.linearize import (
+    ASM_COSTS,
     CLIP_MATCH,
     CLIP_MISMATCH,
     D,
     I,
     M,
+    READ_COSTS,
     S,
+    Banded,
     Block,
     CigarOp,
+    Costs,
     Window,
     align_end,
     align_global,
@@ -60,8 +65,12 @@ from dromos.linearize import (
     clip_cigar,
     clip_gap,
     clip_lengths,
+    half_band,
     linearize,
+    upper,
 )
+from dromos.bam import BamIndex, RecordWriter, bam_header, csi_levels, needs_csi, nt16, record_end
+from dromos.bam_sort import BamStaging, write_bam
 
 
 def _varint(mut out: List[UInt8], value: Int):
@@ -714,6 +723,26 @@ def test_cache_from_the_graph() raises:
             assert_equal(t.letter(node, False, i), s[i])
             assert_equal(t8.letter(node, False, i), s[i])
             assert_equal(t.letter(node, True, i), complement(s[len(s) - 1 - i]))
+        # Stretches decoded two letters a lookup: every start and length parity, both strands.
+        var start = t.start(node)
+        var start8 = t8.start(node)
+        for off in range(min(3, len(s))):
+            for take in [len(s) - off, (len(s) - off) // 2, 1]:
+                if take <= 0:
+                    continue
+                var got = List[UInt8](length=take, fill=0)
+                var got8 = List[UInt8](length=take, fill=0)
+                t.copy_forward(got.unsafe_ptr(), start + off, take)
+                t8.copy_forward(got8.unsafe_ptr(), start8 + off, take)
+                for k in range(take):
+                    assert_equal(got[k], upper(t.at(start + off + k)))
+                    assert_equal(got8[k], got[k])
+                var last = start + len(s) - 1 - off
+                t.copy_reverse(got.unsafe_ptr(), last, take)
+                t8.copy_reverse(got8.unsafe_ptr(), start8 + len(s) - 1 - off, take)
+                for k in range(take):
+                    assert_equal(got[k], comp(t.at(last - k)))
+                    assert_equal(got8[k], got[k])
     var md = g.metadata()
     var names = md.path_names()
     for sample in ["CHM13", "GRCh38"]:
@@ -1066,6 +1095,301 @@ def test_reference_traversals() raises:
     assert_true(
         vcf_header("X", 5).endswith("##contig=<ID=X,length=5>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
     )
+
+
+def _hex(data: Span[UInt8, _]) -> String:
+    var digits = "0123456789abcdef".as_bytes()
+    var out = List[UInt8]()
+    for b in data:
+        out.append(digits[Int(b >> 4)])
+        out.append(digits[Int(b & 15)])
+    return String(unsafe_from_utf8=out^)
+
+
+def _ops(text: StaticString) -> List[CigarOp]:
+    """A CIGAR string's operations."""
+    var out = List[CigarOp]()
+    var n = 0
+    for b in text.as_bytes():
+        if b >= UInt8(ord("0")) and b <= UInt8(ord("9")):
+            n = n * 10 + Int(b - UInt8(ord("0")))
+        else:
+            out.append(CigarOp(b, n))
+            n = 0
+    return out^
+
+
+def _mutated(src: List[UInt8], rate: Int) -> List[UInt8]:
+    """`src` with deletions, substitutions (N and lower case among them) and insertions, each at `rate` per mil."""
+    var out = List[UInt8]()
+    var letters = "ACGTacgtN".as_bytes()
+    for b in src:
+        var x = Int(random_ui64(0, 999))
+        if x < rate:
+            continue
+        if x < 2 * rate:
+            out.append(letters[Int(random_ui64(0, 8))])
+            continue
+        if x < 3 * rate:
+            for _ in range(Int(random_ui64(1, 30))):
+                out.append(letters[Int(random_ui64(0, 3))])
+        out.append(b)
+    return out^
+
+
+def test_band_filled_in_vectors_as_cell_by_cell() raises:
+    """`Banded.fill` (a row in vectors) gives `fill_reference`'s traceback bytes and last row, for any costs, bands
+    and shapes: reads against a whole, a longer and a shorter reference, unrelated ones, empty ones."""
+    seed(42)
+    var letters = "ACGT".as_bytes()
+    for trial in range(600):
+        var n = Int(random_ui64(0, 400)) if trial % 10 != 0 else Int(random_ui64(0, 3000))
+        var r = List[UInt8]()
+        for _ in range(n):
+            r.append(letters[Int(random_ui64(0, 3))])
+        var q = _mutated(r, Int(random_ui64(0, 120)))
+        if trial % 7 == 0:
+            q = List[UInt8]()
+            for _ in range(Int(random_ui64(0, 300))):
+                q.append(letters[Int(random_ui64(0, 3))])
+        var c = READ_COSTS if trial % 2 == 0 else ASM_COSTS
+        if trial % 11 == 0:
+            c = Costs(Int(random_ui64(0, 9)), Int(random_ui64(0, 9)), Int(random_ui64(0, 9)))
+        if trial % 3 == 1:
+            for _ in range(Int(random_ui64(0, 200))):
+                r.append(letters[Int(random_ui64(0, 3))])
+        if trial % 3 == 2 and len(r) > 10:
+            r.resize(len(r) // 2, 0)
+        var halves: List[Int] = [half_band(len(q), len(r)), Int(random_ui64(0, 40)), 0, 1, 17]
+        for h in halves:
+            var a = Banded()
+            var b = Banded()
+            var filled = a.fill(Span(q), Span(r), h, c)
+            assert_equal(filled, b.fill_reference(Span(q), Span(r), h, c))
+            if not filled:
+                continue
+            assert_equal(len(a.tb), len(b.tb))
+            for k in range(len(a.tb)):
+                if a.tb[k] != b.tb[k]:
+                    assert_equal(Int(a.tb[k]), Int(b.tb[k]), String(t"trial {trial}, band {h}, cell {k}"))
+            assert_equal(len(a.last), len(b.last))
+            for k in range(len(a.last)):
+                assert_equal(a.last[k], b.last[k])
+
+
+def _clip_lengths_by_base(score: List[Int]) -> Tuple[Int, Int]:
+    """clip_lengths base by base, as pgcatalog computes it."""
+    var n = len(score)
+    var total = 0
+    var best = 0
+    var left = 0
+    for i in range(n):
+        if score[i] == CLIP_MATCH and total < best:
+            best = total
+            left = i
+        total += score[i]
+    if -best <= 5:
+        left = 0
+    total = 0
+    best = 0
+    var right = n
+    for i in range(n - 1, left - 1, -1):
+        if score[i] == CLIP_MATCH and total < best:
+            best = total
+            right = i + 1
+        total += score[i]
+    if -best <= 5:
+        right = n
+    return (left, n - right)
+
+
+def test_clip_lengths_in_vectors_as_base_by_base() raises:
+    """Vectors of scores give the clips a base at a time gives, ties and all, whatever the length."""
+    seed(7)
+    for trial in range(4000):
+        var n = Int(random_ui64(0, 70)) if trial % 4 != 0 else Int(random_ui64(0, 3000))
+        var score = List[Int]()
+        var bad = Int(random_ui64(0, 60))
+        for _ in range(n):
+            var x = Int(random_ui64(0, 99))
+            if x < bad:
+                score.append(CLIP_MISMATCH if x % 3 != 0 else -Int(random_ui64(5, 30)))
+            elif x < bad + 5:
+                score.append(0)
+            else:
+                score.append(CLIP_MATCH)
+        var got = clip_lengths(score)
+        var want = _clip_lengths_by_base(score)
+        assert_equal(got[0], want[0], String(t"trial {trial}"))
+        assert_equal(got[1], want[1], String(t"trial {trial}"))
+
+
+def test_nt16_as_htslib() raises:
+    assert_equal(nt16(UInt8(ord("A"))), 1)
+    assert_equal(nt16(UInt8(ord("c"))), 2)
+    assert_equal(nt16(UInt8(ord("G"))), 4)
+    assert_equal(nt16(UInt8(ord("T"))), 8)
+    assert_equal(nt16(UInt8(ord("U"))), 8)
+    assert_equal(nt16(UInt8(ord("N"))), 15)
+    assert_equal(nt16(UInt8(ord("R"))), 5)
+    assert_equal(nt16(UInt8(ord("="))), 0)
+    assert_equal(nt16(UInt8(ord("X"))), 15)
+    assert_equal(nt16(UInt8(ord("2"))), 4)
+
+
+def test_bam_records_as_samtools() raises:
+    """Records as `samtools view -b` encodes the same SAM lines (htslib 1.24; the bytes below are its output)."""
+    var w = RecordWriter()
+    var out = List[UInt8]()
+    var name = "read/1".as_bytes()
+    var qual = '!"#$%&5?@ABCDEFGH'.as_bytes()
+    w.put(
+        out,
+        name.unsafe_ptr(),
+        len(name),
+        16,
+        0,
+        99,
+        60,
+        _ops("3S5M2I4M1D3M"),
+        "ACGTNACGTRACGTACG".as_bytes(),
+        qual.unsafe_ptr(),
+        0,
+        False,
+    )
+    assert_equal(
+        _hex(Span(out)),
+        (
+            "590000000000000063000000073c49120600100011000000ffffffffffffffff00000000726561642f31003400000050000000"
+            "210000004000000012000000300000001248f1248512481240000102030405141e1f2021222324252627"
+        ),
+    )
+    out.clear()
+    # No qualities ('I' throughout), no reference bases (the bin of [pos, pos + 1)), U written as T.
+    var r2 = "r2".as_bytes()
+    w.put(out, r2.unsafe_ptr(), 2, 0, 0, 19999, 255, _ops("2S3I"), "ACGTU".as_bytes(), r2.unsafe_ptr(), -1, False)
+    assert_equal(
+        _hex(Span(out)),
+        "33000000000000001f4e000003ff4a120200000005000000ffffffffffffffff0000000072320024000000310000001248802828282828",
+    )
+    assert_equal(record_end(out.unsafe_ptr()), 20000)
+    out.clear()
+    # Qualities reversed: the last character first.
+    var q3 = "ABC".as_bytes()
+    w.put(out, r2.unsafe_ptr(), 2, 16, 1, 5, 0, _ops("3M"), "ACG".as_bytes(), q3.unsafe_ptr(), 0, True)
+    var n = len(out)
+    assert_equal(Int(out[n - 3]), ord("C") - 33)
+    assert_equal(Int(out[n - 1]), ord("A") - 33)
+    assert_equal(record_end(out.unsafe_ptr()), 8)
+
+
+def test_bam_long_cigar_goes_to_cg() raises:
+    """More than 65,535 operations: <length>S<reference length>N in place and the CIGAR in CG:B,I, as bam_write1."""
+    var cigar = List[CigarOp]()
+    var seq = List[UInt8]()
+    for _ in range(35000):
+        cigar.append(CigarOp(UInt8(ord("M")), 1))
+        cigar.append(CigarOp(UInt8(ord("I")), 1))
+        seq.append(UInt8(ord("A")))
+        seq.append(UInt8(ord("C")))
+    var w = RecordWriter()
+    var out = List[UInt8]()
+    var name = "long".as_bytes()
+    w.put(out, name.unsafe_ptr(), 4, 0, 0, 1000, 60, cigar, Span(seq), name.unsafe_ptr(), -1, False)
+    var p = out.unsafe_ptr()
+    assert_equal(Int(p[16]) | Int(p[17]) << 8, 2)
+    assert_equal(record_end(p), 1000 + 35000)
+    var tag = 36 + 5 + 8 + 35000 + 70000
+    assert_equal(String(unsafe_from_utf8=Span(out)[tag : tag + 4]), "CGBI")
+    assert_equal(len(out), tag + 8 + 4 * 70000)
+
+
+def test_bam_index_kinds() raises:
+    assert_equal(csi_levels(248387328, 14), 5)
+    assert_equal(csi_levels(600_000_000, 14), 6)
+    assert_false(needs_csi([1 << 29]))
+    assert_true(needs_csi([10, (1 << 29) + 1]))
+    assert_equal(BamIndex(["a"], [10], False).suffix(), ".bai")
+    assert_equal(BamIndex(["a"], [10], True).suffix(), ".csi")
+
+
+def _inflate_file(path: String) raises -> List[UInt8]:
+    var data: List[UInt8]
+    with open(path, "r") as f:
+        data = f.read_bytes()
+    var blocks = List[Int]()
+    var got = scan_blocks(Span(data), 0, blocks, path)
+    assert_equal(got[0], len(data))
+    var out = List[UInt8](length=got[1], fill=0)
+    assert_true(
+        inflate_blocks(load_libdeflate(), data.unsafe_ptr(), blocks.unsafe_ptr(), out.unsafe_ptr(), 0, len(blocks) // 4)
+    )
+    return out^
+
+
+def test_bam_sorted_through_spills() raises:
+    """Records staged out of order, spilled at every step, come back sorted as samtools sorts: contig, position,
+    reverse strand, then input order; the BAM's header first."""
+    var w = RecordWriter()
+    var names: List[String] = ["c1", "c2"]
+    var lengths: List[Int] = [3_000_000, 1000]
+    var header = bam_header("@HD\tVN:1.6\tSO:coordinate\n", names, lengths)
+    # Every record a frame of its own, and the frames spilled after every step but the last.
+    var staging = BamStaging(2, 3, 1, "build", frame=1)
+    # (contig, position, flag) in input order; names number them.
+    var input: List[Tuple[Int, Int, Int]] = [
+        (1, 50, 0),
+        (0, 2_500_000, 16),
+        (0, 7, 16),
+        (0, 7, 0),
+        (1, 50, 16),
+        (0, 2_500_000, 0),
+        (0, 7, 0),
+        (1, 10, 0),
+        (0, 1_200_000, 0),
+        (0, 7, 16),
+    ]
+    for i in range(len(input)):
+        var recs = List[UInt8]()
+        var name = String(t"r{i}")
+        var q = "IIII".as_bytes()
+        w.put(
+            recs,
+            name.unsafe_ptr(),
+            name.byte_length(),
+            input[i][2],
+            input[i][0],
+            input[i][1],
+            60,
+            _ops("4M"),
+            "ACGT".as_bytes(),
+            q.unsafe_ptr(),
+            0,
+            False,
+        )
+        staging.make_room(recs.unsafe_ptr(), len(recs))
+        for share in range(3):
+            staging.take_share(share, recs.unsafe_ptr(), len(recs))
+        if i < len(input) - 1:
+            staging.after_shares()
+    assert_equal(staging.spills, len(input) - 1)
+    var path = String("build/test_sorted.bam")
+    write_bam(staging, header, BamIndex(names, lengths, False), path, 1, 2)
+    var raw = _inflate_file(path)
+    assert_equal(String(unsafe_from_utf8=Span(raw)[0:4]), "BAM\x01")
+    var at = len(header)
+    var order = List[Int]()
+    while at < len(raw):
+        var size = Int(raw[at]) | Int(raw[at + 1]) << 8
+        var name_len = Int(raw[at + 12])
+        order.append(Int(String(unsafe_from_utf8=Span(raw)[at + 37 : at + 36 + name_len - 1])))
+        at += 4 + size
+    var want: List[Int] = [3, 6, 2, 9, 8, 5, 1, 7, 0, 4]
+    assert_equal(len(order), len(want))
+    for k in range(len(want)):
+        assert_equal(order[k], want[k])
+    with open(path + ".bai", "r") as f:
+        assert_equal(String(unsafe_from_utf8=f.read_bytes()[0:4]), "BAI\x01")
 
 
 def main() raises:
