@@ -17,7 +17,7 @@ from dromos.graph import (
     reference_samples,
     resolve_reference_sample,
 )
-from dromos.graph_files import write_node_table, write_ref_map
+from dromos.graph_files import folder_of, name_of, write_node_table, write_ref_map
 from dromos.gaf_text import MALFORMED, PLACED, SKIP, UNMAPPED, append_slim, classify
 from dromos.output import decimal_digits
 from dromos.bgzf import load_libdeflate
@@ -680,6 +680,14 @@ def test_graph_files_from_the_graph() raises:
             start += len(g.sequence(Int(walk[i] >> 1)))
         path += 1
     assert_equal(len(m.path_contig), path)
+
+
+def test_folders_and_names() raises:
+    assert_equal(folder_of("a/b/g.gbz"), "a/b")
+    assert_equal(folder_of("/g.gbz"), "/")
+    assert_equal(folder_of("g.gbz"), ".")
+    assert_equal(name_of("a/b/g.gbz"), "g.gbz")
+    assert_equal(name_of("g.gbz"), "g.gbz")
 
 
 def main() raises:

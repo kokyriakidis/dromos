@@ -95,3 +95,29 @@ fails "a missing input" $D index $M /nonexistent.gam x.gz
 fails "an unwritable output" $D index $M $SMALL_GAM /proc/nope/x.gz
 fails "a node table that is not one" $D gam-to-gaf $SMALL_GAF $SMALL_GAM
 fails "a ref map that is not one" $D index $SMALL_GAF $SMALL_GAM x.gz
+# 7. A GBZ given in place of its files (GBZ_SMALL): made once beside it, remade when older than it, beside the output
+# when the graph's folder is not writable, and a clear error otherwise.
+ok() { "$@" && echo "ok    $label" || echo "FAIL  $label"; }
+mkdir -p gw gr; cp $GBZ_SMALL gw/g.gbz; cp $GBZ_SMALL gr/g.gbz; chmod 555 gr
+$D index --reference-sample CHM13 gw/g.gbz empty.gaf e1.gz 2> e1.err
+label="a graph's reference map made beside it"; ok test -s gw/g.gbz.CHM13.refmap
+$PGCATALOG ref-map --graph $GBZ_SMALL --reference-sample CHM13 --out p.refmap
+label="its reference map is pgcatalog's"; ok cmp -s gw/g.gbz.CHM13.refmap p.refmap
+$D index --reference-sample CHM13 gw/g.gbz empty.gaf e2.gz 2> e2.err
+label="a current reference map reused"; ok bash -c "! grep -q 'kept for the next run' e2.err"
+touch -d "2000-01-01" gw/g.gbz.CHM13.refmap
+$D index --reference-sample CHM13 gw/g.gbz empty.gaf e3.gz 2> e3.err
+label="a reference map older than the graph remade"; ok grep -q "kept for the next run" e3.err
+label="no temporary files left"; ok bash -c "! ls gw | grep -q part"
+$D index --reference-sample GRCh38 gw/g.gbz empty.gaf e4.gz 2> /dev/null
+label="each reference sample its own map"; ok test -s gw/g.gbz.GRCh38.refmap
+fails "a graph declaring two reference samples, none chosen" $D index gw/g.gbz empty.gaf x.gz
+fails "a reference sample the graph lacks" $D index --reference-sample NOBODY gw/g.gbz empty.gaf x.gz
+fails "a reference map of another sample" $D index --reference-sample GRCh38 gw/g.gbz.CHM13.refmap empty.gaf x.gz
+$D index --reference-sample CHM13 gr/g.gbz empty.gaf e5.gz 2> /dev/null
+label="a read-only graph folder: the reference map beside the output"; ok test -s g.gbz.CHM13.refmap
+fails "a read-only graph folder: no node table without an output" $D gam-to-gaf gr/g.gbz $SMALL_GAM
+printf "@x\n" | $D gam-to-gaf gw/g.gbz - > /dev/null 2>&1
+$PGCATALOG node-table --graph $GBZ_SMALL --out p.nodes
+label="a graph's node table made beside it, pgcatalog's"; ok cmp -s gw/g.gbz.nodes p.nodes
+chmod 755 gr

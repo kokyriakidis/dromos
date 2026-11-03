@@ -82,6 +82,35 @@ for g in small:$GBZ_SMALL hprc:$GBZ; do
   rm -f "$WORK/d.$n.nodes" "$WORK/d.$n.lengths"
 done
 
+# The graph given in place of its files: they are made once beside it (a link to it in WORK), as pgcatalog makes
+# them, and used as given files are.
+mkdir -p "$WORK/graph"
+L="$WORK/graph/hprc.gbz"
+ln -sf "$GBZ" "$L"
+rm -f "$L".*
+pgcat_index "$SLICE_SLIM" "$WORK/ref.slice.gz"
+"$DROMOS" index -l 0 --reference-sample CHM13 "$L" "$SLICE_SLIM" "$WORK/d.graph.gz" 2> /dev/null
+same_index "index: the graph given" "$WORK/d.graph.gz" "$WORK/ref.slice.gz"
+cmp -s "$L.CHM13.refmap" "$WORK/pgc.hprc.CHM13.refmap" && pass "index: the graph's reference map kept beside it" \
+  || fail "index: the graph's reference map kept beside it"
+"$DROMOS" index -l 0 --reference-sample CHM13 "$L" "$SLICE_SLIM" "$WORK/d.graph.gz" 2> "$WORK/d.graph.err"
+grep -q "kept for the next run" "$WORK/d.graph.err" && fail "index: the kept reference map reused" \
+  || pass "index: the kept reference map reused"
+"$DROMOS" gam-to-gaf "$NODES" "$SMALL_GAM" > "$WORK/small.nodes.gaf"
+"$DROMOS" gam-to-gaf "$L" "$SMALL_GAM" 2> /dev/null | cmp -s - "$WORK/small.nodes.gaf" \
+  && pass "gam-to-gaf: the graph given" || fail "gam-to-gaf: the graph given"
+cmp -s "$L.nodes" "$WORK/pgc.hprc.nodes" && pass "gam-to-gaf: the graph's node table kept beside it" \
+  || fail "gam-to-gaf: the graph's node table kept beside it"
+want=$("$DROMOS" surject --contig "$SURJECT_CONTIG" "$REFMAP" "$NODES" "$SMALL_GAF" 2> /dev/null | records | md5sum)
+got=$("$DROMOS" surject --contig "$SURJECT_CONTIG" --reference-sample CHM13 "$L" "$SMALL_GAF" 2> /dev/null | records \
+  | md5sum)
+[ "$got" == "$want" ] && pass "surject: the graph given" || fail "surject: the graph given"
+got=$("$DROMOS" surject --contig "$SURJECT_CONTIG" --reference-sample CHM13 "$L" "$NODES" "$SMALL_GAF" 2> /dev/null \
+  | records | md5sum)
+[ "$got" == "$want" ] && pass "surject: the graph for its reference map" \
+  || fail "surject: the graph for its reference map"
+rm -f "$L".* "$WORK/d.graph.gz" "$WORK/d.graph.gz.tbi"
+
 # gam-to-gaf: vg's lines, and the slices as checked before.
 "$DROMOS" gam-to-gaf "$NODES" "$SMALL_GAM" > "$WORK/small.gaf"
 cmp -s <(sort "$WORK/small.gaf") <(sort "$SMALL_GAF") && pass "gam-to-gaf: vg convert's lines" || fail "gam-to-gaf: vg convert's lines"

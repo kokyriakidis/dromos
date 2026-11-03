@@ -2,13 +2,17 @@
 pgcatalog's refmap.rs, its format in refmap.mojo) and the node table (`dromos node-table`, a port of pgcatalog's
 nodetable.rs, its format in nodes.mojo), each byte for byte as pgcatalog writes it. The crate reads the graph; the
 files are laid out here, node ranges and paths on all threads, and written at their offsets.
+
+A command given a GBZ in place of a file makes the file once and keeps it beside the graph, `G.gbz.SAMPLE.refmap`
+and `G.gbz.nodes` (`graph_ref_map`, `graph_node_table`), the rules pgphase index kept its reference map by.
 """
 
-from std.os import getenv
+from std.ffi import external_call
+from std.os import getenv, stat
 from std.sys import stderr
 from std.time import perf_counter_ns
 
-from dromos.graph import GbzParts
+from dromos.graph import GbzParts, resolve_reference_sample
 from dromos.output import OutFile
 from dromos.parallel import ParallelTask, parallel_for
 from dromos.refmap import MAGIC as REFMAP_MAGIC, NONE
@@ -463,3 +467,111 @@ def write_ref_map(graph_path: String, sample: String, path: String, threads: Int
     file.put(Span(tail), at)
     file.close()
     timer.lap("reference map written")
+
+
+# Kept beside the graph.
+
+
+def folder_of(path: String) -> String:
+    """The folder a path names a file in ("." for a bare name)."""
+    var slash = path.rfind("/")
+    if slash < 0:
+        return String(".")
+    return String(path[byte = : max(slash, 1)])
+
+
+def name_of(path: String) -> String:
+    var slash = path.rfind("/")
+    return String(path[byte = slash + 1 :]) if slash >= 0 else path
+
+
+def _mtime(path: String) -> Optional[Int]:
+    try:
+        return Int(stat(path).st_mtimespec.tv_sec)
+    except:
+        return None
+
+
+def current(file: String, graph: String) -> Bool:
+    """Whether a kept file is current: newer than the graph (as pgphase index judged its kept reference map)."""
+    var f = _mtime(file)
+    var g = _mtime(graph)
+    return f and g and f.value() >= g.value()
+
+
+def _writable(folder: String) -> Bool:
+    var c = List[UInt8](folder.as_bytes())
+    c.append(0)
+    return external_call["access", Int32](c.unsafe_ptr(), Int32(2)) == 0
+
+
+def _keep(made: String, kept: String) raises:
+    """Renames the file just made, `made`, to `kept`; removes it if that fails."""
+    var a = List[UInt8](made.as_bytes())
+    a.append(0)
+    var b = List[UInt8](kept.as_bytes())
+    b.append(0)
+    if external_call["rename", Int32](a.unsafe_ptr(), b.unsafe_ptr()) != 0:
+        _ = external_call["unlink", Int32](a.unsafe_ptr())
+        raise Error(t"cannot write {kept}")
+
+
+def _remove(path: String):
+    var c = List[UInt8](path.as_bytes())
+    c.append(0)
+    _ = external_call["unlink", Int32](c.unsafe_ptr())
+
+
+def _kept_path(graph: String, name: String, beside_out: Optional[String], what: String, make: String) raises -> String:
+    """Where the graph's file `name` is kept: beside the graph when it is current there or the graph's folder is
+    writable, else beside the output (`beside_out`'s folder); with no output, an error naming what to make."""
+    var beside_graph = folder_of(graph) + "/" + name
+    if current(beside_graph, graph) or _writable(folder_of(graph)):
+        return beside_graph
+    if beside_out:
+        return folder_of(beside_out.value()) + "/" + name
+    raise Error(
+        t"{folder_of(graph)} is not writable, so the graph's {what} cannot be kept beside it: make it with {make}"
+        t" --out FILE and give FILE in place of the graph"
+    )
+
+
+def graph_ref_map(graph: String, sample: Optional[String], beside_out: Optional[String], threads: Int) raises -> String:
+    """The graph's reference map, kept as `G.gbz.SAMPLE.refmap` (SAMPLE: `sample`, or the graph's only declared
+    one): made once (through a temporary name), remade when older than the graph."""
+    var s = resolve_reference_sample(graph, sample)
+    var path = _kept_path(
+        graph,
+        name_of(graph) + "." + s + ".refmap",
+        beside_out,
+        "reference map",
+        String(t"dromos ref-map --graph {graph} --reference-sample {s}"),
+    )
+    if not current(path, graph):
+        print(t"[dromos] the graph's reference map, kept for the next run: {path}", file=stderr)
+        var part = path + ".part" + String(external_call["getpid", Int32]())
+        try:
+            write_ref_map(graph, s, part, threads)
+        except e:
+            _remove(part)
+            raise e^
+        _keep(part, path)
+    return path
+
+
+def graph_node_table(graph: String, beside_out: Optional[String], threads: Int) raises -> String:
+    """The graph's node table with letters, kept as `G.gbz.nodes`: made once (through a temporary name), remade when
+    older than the graph."""
+    var path = _kept_path(
+        graph, name_of(graph) + ".nodes", beside_out, "node table", String(t"dromos node-table --graph {graph}")
+    )
+    if not current(path, graph):
+        print(t"[dromos] the graph's node table, kept for the next run: {path}", file=stderr)
+        var part = path + ".part" + String(external_call["getpid", Int32]())
+        try:
+            write_node_table(graph, part, True, threads)
+        except e:
+            _remove(part)
+            raise e^
+        _keep(part, path)
+    return path

@@ -5,8 +5,8 @@ from std.time import perf_counter_ns
 
 from dromos.contig import Contig
 from dromos.convert import GafSink
-from dromos.graph import reference_samples, resolve_reference_sample
-from dromos.graph_files import write_node_table, write_ref_map
+from dromos.graph import is_gbz, reference_samples, resolve_reference_sample
+from dromos.graph_files import graph_node_table, graph_ref_map, write_node_table, write_ref_map
 from dromos.index import IndexSink
 from dromos.linearize import Window
 from dromos.nodes import NodeTable
@@ -26,34 +26,43 @@ comptime OVERVIEW = """dromos: pangenome graph alignments, fast
   dromos node-table         a GBZ graph's node lengths and letters, which gam-to-gaf and surject read
   dromos reference-samples  the reference samples a GBZ graph declares
 
+Where a command takes the graph's reference map or node table, the GBZ itself may be given: dromos makes the file
+once and keeps it beside the graph (G.gbz.SAMPLE.refmap, G.gbz.nodes).
+
 dromos COMMAND -h shows a command's usage. DROMOS_TIMING=1 reports where the time goes, on stderr.
 """
 
-comptime INDEX_USAGE = """dromos index [-t THREADS] [-l LEVEL] [--gaf | --gam] REFMAP IN OUT
+comptime INDEX_USAGE = """dromos index [-t THREADS] [-l LEVEL] [--reference-sample NAME] [--gaf | --gam] REFMAP IN OUT
 
 IN's alignments placed on the reference, sorted, bgzipped and tabix-indexed as pgphase reads them: OUT and OUT.tbi,
 the files pgphase's previous indexer (pgcat index-gaf --slim) wrote from the same alignments as GAF.
 
-  REFMAP      the graph's reference map (dromos ref-map)
-  IN          a GAM, or a GAF (plain, gzip or BGZF), told apart by their first bytes; - reads stdin
-  -t THREADS  threads [the machine's cores]
-  -l LEVEL    BGZF compression level, 0-12 [1]: 1 deflates about 3 times as fast as 6 into a file 40% larger;
-              6 for a file to keep
-  --gaf       IN is a GAF (not told from its bytes)
-  --gam       IN is a GAM (not told from its bytes)
+  REFMAP                   the graph's reference map (dromos ref-map), or the GBZ graph itself: its reference map
+                           is made once and kept beside it as GRAPH.gbz.SAMPLE.refmap (beside OUT if the graph's
+                           folder is not writable)
+  IN                       a GAM, or a GAF (plain, gzip or BGZF), told apart by their first bytes; - reads stdin
+  --reference-sample NAME  the sample whose paths are the reference: for a graph, the map to make [the graph's
+                           declared reference sample, if it declares exactly one]; for a map, checked against its
+  -t THREADS               threads [the machine's cores]
+  -l LEVEL                 BGZF compression level, 0-12 [1]: 1 deflates about 3 times as fast as 6 into a file 40%
+                           larger; 6 for a file to keep
+  --gaf                    IN is a GAF (not told from its bytes)
+  --gam                    IN is a GAM (not told from its bytes)
 """
 
 comptime GAM_TO_GAF_USAGE = """dromos gam-to-gaf [-t THREADS] [--slim] NODES GAM
 
 GAM as GAF on stdout: the lines vg convert -G writes for it, in the GAM's order.
 
-  NODES       the graph's node table (dromos node-table; with --slim it needs no letters)
+  NODES       the graph's node table (dromos node-table; with --slim it needs no letters), or the GBZ graph itself:
+              its node table is made once and kept beside it as GRAPH.gbz.nodes
   GAM         the alignments; - reads stdin
   -t THREADS  threads [the machine's cores]
   --slim      each line's 12 GAF columns alone (no cs, bq, AS or dv)
 """
 
 comptime SURJECT_USAGE = """dromos surject [options] --contig NAME REFMAP NODES IN > OUT.sam
+dromos surject [options] --contig NAME GRAPH.gbz IN > OUT.sam
 
 IN's alignments as alignments to one reference contig, as SAM on stdout: the records pgcatalog surject writes for the
 same reads and options (the graph's reference map and node table in place of the graph), in IN's order. Reads with no
@@ -62,10 +71,13 @@ base on the contig are left out.
 
   REFMAP                    the graph's reference map (dromos ref-map)
   NODES                     the graph's node table, with letters (dromos node-table)
+  GRAPH.gbz                 the GBZ graph, in place of either or both: its reference map and node table are made
+                            once and kept beside it (GRAPH.gbz.SAMPLE.refmap, GRAPH.gbz.nodes)
   IN                        a GAM, or a GAF with cs (and bq for qualities; plain, gzip or BGZF), told apart by their
                             first bytes; - reads stdin. dromos index's output keeps no cs and cannot be used
   --contig NAME             the reference contig (chr20)
-  --reference-sample NAME   the sample whose path is the reference; REFMAP's, which it must be [REFMAP's]
+  --reference-sample NAME   the sample whose path is the reference; REFMAP's, which it must be [REFMAP's; for a
+                            graph, its declared reference sample, if it declares exactly one]
   --sam-contig NAME         the contig's name in the SAM [<sample>#0#<contig>]
   --graph-placement         place read bases only where the graph puts them: a stretch of more than 50 bases off the
                             reference is not aligned to it, and such read ends are clipped
@@ -175,6 +187,15 @@ struct _Args(Movable):
         var t = self.value("-t")
         return _number(t.value(), "-t", 1, 1024, self.command) if t else default_threads()
 
+    def positional_between(mut self, low: Int, high: Int) -> List[String]:
+        """What is left: from `low` to `high` arguments, none of them an option."""
+        for a in self.items:
+            if a.startswith("-") and a != "-":
+                _fail(String(t"unknown option {a}"), self.command)
+        if len(self.items) < low or len(self.items) > high:
+            _fail(String(t"{low} to {high} arguments wanted, {len(self.items)} given"), self.command)
+        return self.items.copy()
+
     def positional(mut self, count: Int) -> List[String]:
         """What is left: exactly `count` arguments, none of them an option."""
         for a in self.items:
@@ -193,13 +214,18 @@ def index_main() raises:
     var threads = args.threads()
     var level_arg = args.value("-l")
     var level = _number(level_arg.value(), "-l", 0, 12, "index") if level_arg else 1
+    var sample = args.value("--reference-sample")
     var gaf = args.flag("--gaf")
     var gam = args.flag("--gam")
     if gaf and gam:
         _fail("--gaf or --gam, not both", "index")
     var pos = args.positional(3)
+    var map_path = graph_ref_map(pos[0], sample, pos[2], threads) if is_gbz(pos[0]) else pos[0]
     var t0 = perf_counter_ns()
-    var sink = IndexSink(RefMap(pos[0]), threads)
+    var map = RefMap(map_path)
+    if sample and sample.value() != map.sample:
+        raise Error(t"{map_path} is the reference map of {map.sample}, not {sample.value()}")
+    var sink = IndexSink(map^, threads)
     print(
         (
             t"[dromos] reference map loaded: {len(sink.map.contigs)} contigs of {sink.map.sample}"
@@ -219,14 +245,15 @@ def gam_to_gaf_main() raises:
     var threads = args.threads()
     var slim = args.flag("--slim")
     var pos = args.positional(2)
+    var nodes = graph_node_table(pos[0], None, threads) if is_gbz(pos[0]) else pos[0]
     if slim:
-        var sink = GafSink[False](NodeTable(pos[0]), threads)
+        var sink = GafSink[False](NodeTable(nodes), threads)
         try:
             stream_input(_input(pos[1]), threads, sink, AUTO)
         finally:
             sink.finish()
     else:
-        var sink = GafSink[True](NodeTable(pos[0]), threads)
+        var sink = GafSink[True](NodeTable(nodes), threads)
         try:
             stream_input(_input(pos[1]), threads, sink, AUTO)
         finally:
@@ -250,20 +277,26 @@ def surject_main() raises:
         _fail("--gaf or --gam, not both", "surject")
     if not contig_arg:
         _fail("--contig is required", "surject")
-    var pos = args.positional(3)
+    var pos = args.positional_between(2, 3)
+    if len(pos) == 2:
+        if not is_gbz(pos[0]):
+            _fail("3 arguments wanted (REFMAP NODES IN), or 2 with a GBZ graph first", "surject")
+        pos.insert(1, pos[0])
+    var map_path = graph_ref_map(pos[0], sample_arg, None, threads) if is_gbz(pos[0]) else pos[0]
+    var nodes = graph_node_table(pos[1], None, threads) if is_gbz(pos[1]) else pos[1]
     var contig_name = contig_arg.value()
     var t0 = perf_counter_ns()
-    var map = RefMap(pos[0])
+    var map = RefMap(map_path)
     if sample_arg and sample_arg.value() != map.sample:
-        raise Error(t"{pos[0]} is the reference map of {map.sample}, not {sample_arg.value()}")
-    var contig = Contig(map, NodeTable(pos[1]), contig_name)
+        raise Error(t"{map_path} is the reference map of {map.sample}, not {sample_arg.value()}")
+    var contig = Contig(map, NodeTable(nodes), contig_name)
     var windows = List[Window]()
     if catalog_arg:
         windows = load_windows(catalog_arg.value(), contig, map)
         print(t"[dromos] surject: {len(windows)} snarl windows", file=stderr)
     var sam_contig = sam_arg.value() if sam_arg else contig.chrom
     print(t"[dromos] {contig.chrom}: {len(contig.seq)} bases ({Float64(perf_counter_ns() - t0) * 1e-9} s)", file=stderr)
-    var sink = SurjectSink(Surjector(contig^, NodeTable(pos[1]), sam_contig, graph, windows^), threads)
+    var sink = SurjectSink(Surjector(contig^, NodeTable(nodes), sam_contig, graph, windows^), threads)
     try:
         stream_input(_input(pos[2]), threads, sink, GAF if gaf else (GAM if gam else AUTO))
     except e:
