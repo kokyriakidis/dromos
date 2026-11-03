@@ -76,96 +76,161 @@ def encoding(head: Span[UInt8, _]) -> Int:
     return GZIP if gz else PLAIN
 
 
+comptime _DECODE_FAILED = 1
+comptime _TAKE_FAILED = 2
+comptime _SIDE_FAILED = 3
+
+
 @fieldwise_init
-struct _StepTask[S: MessageSink, file_origin: ImmOrigin, lib_origin: ImmOrigin, blocks_origin: ImmOrigin](ParallelTask):
-    """One step: `reads` reads, then `inflates` inflates, then `sides` side tasks, then `formats` slices. The file,
-    libdeflate and the block list are reached through tracked pointers, which keep them alive while the step runs; the
-    chunk buffers and the sink, used after every step, through untracked ones."""
+struct _Reads[file_origin: ImmOrigin](Copyable):
+    """The reads of the chunk after next: `tasks` of them, a share of `length` bytes each from `offset` into `dst`,
+    for the device to have several at once (one, for a pipe). Each task's byte count goes to `got`."""
 
     var file: ImmPointer[RawFile, Self.file_origin]
-    var reads: Int
-    var read_dst: MutPointer[UInt8, MutUntrackedOrigin]
-    var read_count: Int
-    var read_offset: Int
-    var read_got: MutPointer[Int, MutUntrackedOrigin]
-    var lib: ImmPointer[OwnedDLHandle, Self.lib_origin]
-    var raw: ImmPointer[UInt8, ImmUntrackedOrigin]
-    var blocks: ImmPointer[Int, Self.blocks_origin]
-    var inflate_dst: MutPointer[UInt8, MutUntrackedOrigin]
+    var tasks: Int
+    var dst: MutPointer[UInt8, MutUntrackedOrigin]
+    var length: Int
+    var offset: Int
+    var got: MutPointer[Int, MutUntrackedOrigin]
+
+    def run(self, i: Int):
+        var share = self.length // self.tasks
+        var got = self.file[].read(self.dst.unsafe_offset(i * share), share, self.offset + i * share)
+        self.got[unsafe_offset=i] = got
+        if got > 0 and i == self.tasks - 1:
+            self.file[].prefetch(self.offset + self.length, CHUNK)
+
+
+@fieldwise_init
+struct _Plan(Copyable):
+    """What the next chunk's bytes take to become letters (`_plan`): `blocks` (four ints each: source offset and
+    size, destination offset and size) in `tasks` tasks of `per`, the bytes `consumed` (the rest carries to the chunk
+    after) and the letters' `total` (unknown for gzip)."""
+
+    var blocks: List[Int]
+    var per: Int
+    var tasks: Int
+    var consumed: Int
+    var total: Int
+
+
+def _plan(mode: Int, raw: Span[UInt8, _], leftover: Int, threads: Int, path: String) raises -> _Plan:
+    """The next chunk's whole BGZF blocks, plain text's pieces, or for gzip one task (it is one stream). Letters go
+    after `leftover` bytes (the last chunk's unfinished message)."""
+    var blocks = List[Int]()
+    var length = len(raw)
+    var consumed = length
+    var total = 0
+    if mode == BGZF:
+        var scanned = scan_blocks(raw, leftover, blocks, path)
+        consumed = scanned[0]
+        total = scanned[1]
+    elif mode == PLAIN:
+        var at = 0
+        while at < length:
+            var piece = min(PIECE, length - at)
+            blocks.append(at)
+            blocks.append(piece)
+            blocks.append(leftover + at)
+            blocks.append(piece)
+            at += piece
+        total = length
+    if mode == GZIP:
+        var tasks = 1 if length > 0 else 0
+        return _Plan(blocks^, 1, tasks, consumed, total)
+    var count = len(blocks) // 4
+    var per = max(1, ceildiv(count, 8 * threads))
+    return _Plan(blocks^, per, ceildiv(count, per), consumed, total)
+
+
+@fieldwise_init
+struct _Decode[lib_origin: ImmOrigin, blocks_origin: ImmOrigin](Copyable):
+    """The next chunk's bytes `raw[:length]` made letters in `dst` (`out`, a list that may grow, for gzip): task i
+    inflates blocks i * per onward (BGZF), copies pieces (plain), or inflates the whole chunk (gzip)."""
+
     var mode: Int
-    """BGZF, PLAIN (blocks are pieces to copy) or GZIP (one task inflates the whole chunk into `gzip_out`)."""
-    var gzip: MutPointer[GzipStream, MutUntrackedOrigin]
+    var lib: ImmPointer[OwnedDLHandle, Self.lib_origin]
     var zlib: ImmPointer[OwnedDLHandle, ImmUntrackedOrigin]
-    var gzip_out: MutPointer[List[UInt8], MutUntrackedOrigin]
-    var raw_length: Int
-    var block_count: Int
-    var blocks_per: Int
-    var inflates: Int
+    var gzip: MutPointer[GzipStream, MutUntrackedOrigin]
+    var raw: ImmPointer[UInt8, ImmUntrackedOrigin]
+    var length: Int
+    var blocks: ImmPointer[Int, Self.blocks_origin]
+    var count: Int
+    var per: Int
+    var tasks: Int
+    var dst: MutPointer[UInt8, MutUntrackedOrigin]
+    var out: MutPointer[List[UInt8], MutUntrackedOrigin]
+
+    def run(self, i: Int) -> Bool:
+        """Task `i`; false if its input does not inflate."""
+        if self.mode == GZIP:
+            try:
+                self.gzip[].inflate(self.zlib[], self.raw, self.length, self.out[])
+                return True
+            except:
+                return False
+        var first = i * self.per
+        var last = min(self.count, first + self.per)
+        if self.mode == PLAIN:
+            for b in range(first, last):
+                var block = self.blocks.unsafe_offset(4 * b)
+                unsafe_memcpy(
+                    dest=self.dst.unsafe_offset(block[unsafe_offset=2]),
+                    src=self.raw.unsafe_offset(block[unsafe_offset=0]),
+                    count=block[unsafe_offset=1],
+                )
+            return True
+        return inflate_blocks(self.lib[], self.raw, self.blocks, self.dst, first, last)
+
+
+@fieldwise_init
+struct _Takes[S: MessageSink](Copyable):
+    """The current chunk's messages handed to the sink in `tasks` slices of `per` (messages[2k], messages[2k + 1]:
+    message k's start and end in `data`), beside `sides` side tasks of the sink's own."""
+
+    var sink: MutPointer[Self.S, MutUntrackedOrigin]
     var data: ImmPointer[UInt8, ImmUntrackedOrigin]
     var messages: ImmPointer[Int, ImmUntrackedOrigin]
-    var message_count: Int
-    var messages_per: Int
-    var formats: Int
+    var count: Int
+    var per: Int
+    var tasks: Int
     var sides: Int
-    var sink: MutPointer[Self.S, MutUntrackedOrigin]
+
+
+@fieldwise_init
+struct _StepTask[S: MessageSink, file_origin: ImmOrigin, lib_origin: ImmOrigin, blocks_origin: ImmOrigin](ParallelTask):
+    """One step: the reads, then the decoding tasks, then the sink's side tasks, then its slices. The file, the
+    libraries and the block list are reached through tracked pointers, which keep them alive while the step runs; the
+    chunk buffers and the sink, used after every step, through untracked ones."""
+
+    var reads: _Reads[Self.file_origin]
+    var decode: _Decode[Self.lib_origin, Self.blocks_origin]
+    var takes: _Takes[Self.S]
     var failed: MutPointer[Int, MutUntrackedOrigin]
 
     def run(self, index: Int):
         var i = index
-        if i < self.reads:
-            # Read k of the chunk's READS, a share of it each, for the device to have several at once.
-            var share = self.read_count // self.reads
-            var got = self.file[].read(self.read_dst.unsafe_offset(i * share), share, self.read_offset + i * share)
-            self.read_got[unsafe_offset=i] = got
-            if got > 0 and i == self.reads - 1:
-                self.file[].prefetch(self.read_offset + self.read_count, CHUNK)
+        if i < self.reads.tasks:
+            self.reads.run(i)
             return
-        i -= self.reads
-        if i < self.inflates:
-            if self.mode == GZIP:
-                try:
-                    self.gzip[].inflate(self.zlib[], self.raw, self.raw_length, self.gzip_out[])
-                except:
-                    self.failed[] = 1
-                return
-            var first = i * self.blocks_per
-            if self.mode == PLAIN:
-                for b in range(first, min(self.block_count, first + self.blocks_per)):
-                    var block = self.blocks.unsafe_offset(4 * b)
-                    unsafe_memcpy(
-                        dest=self.inflate_dst.unsafe_offset(block[unsafe_offset=2]),
-                        src=self.raw.unsafe_offset(block[unsafe_offset=0]),
-                        count=block[unsafe_offset=1],
-                    )
-                return
-            if not inflate_blocks(
-                self.lib[],
-                self.raw,
-                self.blocks,
-                self.inflate_dst,
-                first,
-                min(self.block_count, first + self.blocks_per),
-            ):
-                self.failed[] = 1
+        i -= self.reads.tasks
+        if i < self.decode.tasks:
+            if not self.decode.run(i):
+                self.failed[] = _DECODE_FAILED
             return
-        i -= self.inflates
-        if i < self.sides:
+        i -= self.decode.tasks
+        ref t = self.takes
+        if i < t.sides:
             try:
-                self.sink[].side_task(i)
+                t.sink[].side_task(i)
             except:
-                self.failed[] = 3
+                self.failed[] = _SIDE_FAILED
             return
-        i -= self.sides
+        i -= t.sides
         try:
-            self.sink[].take(
-                i,
-                self.data,
-                self.messages,
-                i * self.messages_per,
-                min(self.message_count, (i + 1) * self.messages_per),
-            )
+            t.sink[].take(i, t.data, t.messages, i * t.per, min(t.count, (i + 1) * t.per))
         except:
-            self.failed[] = 2
+            self.failed[] = _TAKE_FAILED
 
 
 comptime READS = 4
@@ -276,25 +341,11 @@ def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mu
     while True:
         var t0 = Int(perf_counter_ns())
         # The next chunk's whole blocks (pieces, for plain text); the cut block's bytes carry to the chunk after it.
-        var blocks = List[Int]()
         var leftover = len(bufs[c]) - used
         var length = raws[r].hi - raws[r].lo
-        var consumed = length
-        var total = 0
-        if mode == BGZF:
-            var scanned = scan_blocks(Span(raws[r].buf)[raws[r].lo : raws[r].hi], leftover, blocks, path)
-            consumed = scanned[0]
-            total = scanned[1]
-        elif mode == PLAIN:
-            var at = 0
-            while at < length:
-                var piece = min(PIECE, length - at)
-                blocks.append(at)
-                blocks.append(piece)
-                blocks.append(leftover + at)
-                blocks.append(piece)
-                at += piece
-            total = length
+        var plan = _plan(mode, Span(raws[r].buf)[raws[r].lo : raws[r].hi], leftover, threads, path)
+        var consumed = plan.consumed
+        var total = plan.total
         var nb = 1 - c
         bufs[nb].resize(unsafe_uninit_length=leftover + total)
         var nr = 1 - r
@@ -308,12 +359,6 @@ def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mu
                 src=imm_untracked(raws[r].buf.unsafe_ptr()).unsafe_offset(raws[r].lo + consumed),
                 count=carry,
             )
-        var block_count = len(blocks) // 4
-        var blocks_per = max(1, ceildiv(block_count, 8 * threads))
-        var inflates = ceildiv(block_count, blocks_per)
-        if mode == GZIP:
-            inflates = 1 if length > 0 else 0
-            block_count = inflates
         var message_count = 0 if first else len(messages) // 2
         var messages_per = max(1, ceildiv(message_count, slices))
         var formats = ceildiv(message_count, messages_per)
@@ -322,40 +367,46 @@ def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mu
             got[k] = 0
         var t1 = Int(perf_counter_ns())
         var task = _StepTask(
-            Pointer(to=file).as_imm(),
-            reads,
-            mut_untracked(raws[nr].buf.unsafe_ptr()).unsafe_offset(raws[nr].start),
-            CHUNK,
-            offset,
-            mut_untracked(got.unsafe_ptr()),
-            Pointer(to=lib).as_imm(),
-            imm_untracked(raws[r].buf.unsafe_ptr()).unsafe_offset(raws[r].lo),
-            blocks.unsafe_ptr().as_imm(),
-            mut_untracked(bufs[nb].unsafe_ptr()),
-            mode,
-            mut_untracked(Pointer(to=gzip)),
-            imm_untracked(Pointer(to=zlib)),
-            mut_untracked(Pointer(to=bufs[nb])),
-            length,
-            block_count,
-            blocks_per,
-            inflates,
-            imm_untracked(bufs[c].unsafe_ptr()),
-            imm_untracked(messages.unsafe_ptr()),
-            message_count,
-            messages_per,
-            formats,
-            sides,
-            mut_untracked(Pointer(to=sink)),
+            _Reads(
+                Pointer(to=file).as_imm(),
+                reads,
+                mut_untracked(raws[nr].buf.unsafe_ptr()).unsafe_offset(raws[nr].start),
+                CHUNK,
+                offset,
+                mut_untracked(got.unsafe_ptr()),
+            ),
+            _Decode(
+                mode,
+                Pointer(to=lib).as_imm(),
+                imm_untracked(Pointer(to=zlib)),
+                mut_untracked(Pointer(to=gzip)),
+                imm_untracked(raws[r].buf.unsafe_ptr()).unsafe_offset(raws[r].lo),
+                length,
+                plan.blocks.unsafe_ptr().as_imm(),
+                len(plan.blocks) // 4,
+                plan.per,
+                plan.tasks,
+                mut_untracked(bufs[nb].unsafe_ptr()),
+                mut_untracked(Pointer(to=bufs[nb])),
+            ),
+            _Takes(
+                mut_untracked(Pointer(to=sink)),
+                imm_untracked(bufs[c].unsafe_ptr()),
+                imm_untracked(messages.unsafe_ptr()),
+                message_count,
+                messages_per,
+                formats,
+                sides,
+            ),
             mut_untracked(failed.unsafe_ptr()),
         )
-        parallel_for(task, reads + inflates + formats + sides, threads)
+        parallel_for(task, reads + plan.tasks + sides + formats, threads)
         var t2 = Int(perf_counter_ns())
-        if failed[0] == 1:
-            raise Error(t"{path}: inflation failed")
-        if failed[0] == 2:
+        if failed[0] == _DECODE_FAILED:
+            raise Error(t"{path}: does not inflate (corrupt, or not what it is named)")
+        if failed[0] == _TAKE_FAILED:
             raise Error(t"{path}: {what} could not be read")
-        if failed[0] == 3:
+        if failed[0] == _SIDE_FAILED:
             raise Error(t"{path}: a side task failed")
         # The chunk's bytes: its reads' shares, up to the first short one (the end of the file).
         var read_total = 0
@@ -386,7 +437,7 @@ def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mu
             raws[r].hi = raws[r].start + read_total
             offset += read_total
             at_end = read_total < CHUNK
-        var done = inflates == 0 and len(messages) == 0 and not first and sink.side_tasks() == 0
+        var done = plan.tasks == 0 and len(messages) == 0 and not first and sink.side_tasks() == 0
         first = False
         var t4 = Int(perf_counter_ns())
         step_ns += t2 - t1
