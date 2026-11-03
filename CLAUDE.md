@@ -34,7 +34,8 @@ habits:
 - Build: `pixi run build` (build/dromos); test: `pixi run test`; format: `pixi run format` (120 columns).
 - End to end: `pixi run check ENV_FILE [--full]` (tests/integration/check.sh) checks dromos's outputs against vg's and
   pgcat's byte for byte; ENV_FILE names the data on the machine that has it. Run it after any change that
-  could touch output.
+  could touch output. tests/integration/edges.sh ENV_FILE runs odd and damaged inputs (empty files, gzip and BGZF
+  shapes, the chunk boundary, threads, stdin, truncation): every line must say ok.
 - Toolchain: one Mojo nightly, pinned exactly in `pixi.toml` (1.2.0.dev2026102005), the one karan, sporos and plegma
   build with. Move it on purpose: change the pin, `pixi lock`, build and test.
 - Build and test where the data are (a GAM, the graph's ref map and node table): `pixi run ...`.

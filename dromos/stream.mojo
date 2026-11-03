@@ -445,6 +445,8 @@ def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mu
         serial_ns += (t1 - t0) + (t4 - t3)
         if done:
             break
+    # Whether the gzip stream ended at the end of a member, asked before it is freed (a freed stream has none).
+    var gzip_whole = mode != GZIP or gzip.finished()
     gzip.free(zlib)
     if timing:
         print(
@@ -456,7 +458,7 @@ def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mu
         )
     if raws[r].hi > raws[r].lo:
         raise Error(t"{path}: ends inside a BGZF block")
-    if mode == GZIP and not gzip.finished():
+    if not gzip_whole:
         raise Error(t"{path}: ends inside a gzip member")
     if len(bufs[c]) - used > 0 or framer.remaining > 0:
         raise Error(t"{path}: ends inside a GAM group")

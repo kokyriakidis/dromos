@@ -380,7 +380,7 @@ struct GzipStream(Movable):
                 raise Error(t"zlib: not gzip, or corrupt (inflate returned {ret})")
 
     def finished(self) -> Bool:
-        """Whether the stream ended at the end of a member."""
+        """Whether the stream ended at the end of a member (or never began: an empty file). Ask before `free`."""
         return self.member_done or not self.started
 
     def free(mut self, lib: OwnedDLHandle):
