@@ -2,7 +2,9 @@
 
 Pangenome graph alignments in Mojo: vg's GAM read as fast as the disk delivers it, written as pgphase's index (the
 file `pgcat index-gaf --slim` writes), as the GAF lines `vg convert -G` writes, or as SAM on one reference contig
-(`pgcatalog surject`'s records) (github.com/kokyriakidis/pgphase).
+(`pgcatalog surject`'s records) (github.com/kokyriakidis/pgphase). It reads the GBZ graph itself, through the gbz
+crate, and makes the graph files pgphase's pgcatalog made (`ref-map`, `node-table`): dromos alone turns a graph and
+its alignments into pgphase's inputs.
 
 ## Mojo skills
 
@@ -19,7 +21,17 @@ habits:
 
 ## Layout
 
-- `cli/dromos_cli.mojo`: the commands, `index`, `gam-to-gaf` and `surject`, each with its own options and `-h`.
+- `cli/dromos_cli.mojo`: the commands, `index`, `gam-to-gaf`, `surject`, `ref-map`, `node-table` and
+  `reference-samples`, each with its own options and `-h`.
+- `gbz-ffi/`: the gbz crate (=0.6.2, with simple-sds =0.4.2) behind a C interface, a Rust cdylib
+  (`libdromos_gbz`, built by `pixi run build` beside build/dromos; dromos finds it there, then at $DROMOS_GBZ_LIB).
+  A thin layer: the whole graph (`dgbz_load`), header-only reads (tags, metadata), and the parts a reference map or
+  node table needs (`dgbz_parts_*`: the GBWT and the node letters' pieces, read at once, letters unpacked by range).
+  `ABI` in lib.rs and graph.mojo must agree; raise both on any change to the interface.
+- `dromos/graph.mojo`: the interface in Mojo (`GbzGraph`, `GbzParts`, `Metadata`, `SearchState`), and pgcatalog's
+  graph.rs ported (reference samples and paths, `resolve_reference_sample`, `fingerprint`).
+  `dromos/graph_files.mojo`: `ref-map` and `node-table` (pgcatalog's refmap.rs and nodetable.rs ported), and the
+  files kept beside a graph given in their place (`G.gbz.SAMPLE.refmap`, `G.gbz.nodes`).
 - `dromos/stream.mojo`: the pipeline every command runs on: reads (O_DIRECT), decoding (BGZF, plain, gzip), GAM
   told from GAF by the first bytes (`looks_like_gaf`), framing (GAM messages or GAF lines), and a `MessageSink`
   taking slices of each chunk.
@@ -37,7 +49,14 @@ habits:
 
 ## Working here
 
-- Build: `pixi run build` (build/dromos); test: `pixi run test`; format: `pixi run format` (120 columns).
+- Build: `pixi run build` (build/dromos and build/libdromos_gbz; Rust comes from pixi, pinned in pixi.toml, and
+  gbz-ffi/Cargo.lock is committed); test: `pixi run test`; format: `pixi run format` (120 columns).
+- The gbz crate reads the GBZ: headers and tags, path metadata, GBWT path walks, node sequences, edges, the
+  bidirectional search. Everything above it is Mojo. gbz-ffi holds no pgcatalog logic, and nothing reimplements the
+  GBZ, GBWT or simple-sds formats in Mojo.
+- `dromos ref-map` and `node-table` must write pgcatalog's files byte for byte, and `reference-samples` its lines
+  (pgcatalog from pgphase's plegma-msa branch, 60a3d09, `cargo build --release` in tools/pgcatalog): check any
+  change with `pixi run check` (its graph-file cases, on GBZ and GBZ_SMALL).
 - End to end: `pixi run check ENV_FILE [--full]` (tests/integration/check.sh) checks dromos's outputs against vg's and
   pgcat's byte for byte; ENV_FILE names the data on the machine that has it. Run it after any change that
   could touch output. tests/integration/edges.sh ENV_FILE runs odd and damaged inputs (empty files, gzip and BGZF

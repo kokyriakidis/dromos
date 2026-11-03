@@ -3,14 +3,18 @@
 **Pangenome graph alignments, read as fast as the disk delivers them.**
 
 dromos reads [vg](https://github.com/vgteam/vg)'s graph alignments, GAM or GAF, and turns them into what downstream
-tools need, in one pass over the file, on every core. It is written in [Mojo](https://www.modular.com/mojo) and is
-the indexing engine behind [pgphase](https://github.com/kokyriakidis/pgphase) (`pgphase index`).
+tools need, in one pass over the file, on every core. It reads the GBZ pangenome graph itself, through the
+[gbz](https://github.com/jltsiren/gbwt-rs) crate. It is written in [Mojo](https://www.modular.com/mojo) and is the
+indexing engine behind [pgphase](https://github.com/kokyriakidis/pgphase) (`pgphase index`).
 
 | Command | What it writes |
 |---|---|
 | `dromos index` | the alignments placed on the reference, sorted, bgzipped and tabix-indexed: the index pgphase reads |
 | `dromos gam-to-gaf` | a GAM as the GAF lines `vg convert -G` writes, in the GAM's order |
 | `dromos surject` | the alignments on one reference contig as SAM: the records `pgcatalog surject` writes |
+| `dromos ref-map` | a GBZ graph's reference map, where each node lies on the reference: `pgcatalog ref-map`'s file |
+| `dromos node-table` | a GBZ graph's node lengths and letters, the file `pgcatalog node-table` writes |
+| `dromos reference-samples` | the reference samples a GBZ graph declares |
 
 ## Speed
 
@@ -38,30 +42,50 @@ slice of that GAM (487,571 reads; SAM to /dev/null, 10 threads):
 
 ## Install
 
-dromos builds with [pixi](https://pixi.sh), which fetches the pinned Mojo toolchain and libraries:
+dromos builds with [pixi](https://pixi.sh), which fetches the pinned Mojo toolchain, the Rust toolchain and the
+libraries:
 
 ```sh
 git clone https://github.com/kokyriakidis/dromos && cd dromos
-pixi run build          # build/dromos
+pixi run build          # build/dromos, and beside it build/libdromos_gbz.so (the gbz crate)
 pixi run test           # unit tests
 ```
+
+dromos finds `libdromos_gbz` beside its binary, then at `$DROMOS_GBZ_LIB`; keep the two together.
 
 It is built and tested on Linux x86-64.
 
 ## Usage
 
-Each command reads a file that pgcatalog (pgphase's graph tool, `tools/pgcatalog` in
-[pgphase](https://github.com/kokyriakidis/pgphase)) writes once per graph, so dromos never loads the graph itself:
+### Graph files
+
+`index` places alignments by the graph's reference map, and `gam-to-gaf` and `surject` read its node table. dromos
+makes both from the GBZ, so a command may be given the graph in their place:
 
 ```sh
-pgcatalog ref-map --graph graph.gbz --reference-sample CHM13 --out graph.refmap   # for index
-pgcatalog node-table --graph graph.gbz --out graph.nodes                         # for gam-to-gaf and surject
+dromos index --reference-sample CHM13 graph.gbz reads.gam reads.coord.gaf.gz
+dromos gam-to-gaf graph.gbz reads.gam > reads.gaf
 ```
+
+The first run makes the file and keeps it beside the graph, `graph.gbz.CHM13.refmap` or `graph.gbz.nodes`; later runs
+read it, and a graph newer than the file has it made again. When the graph's folder is not writable, `index` keeps the
+map beside its output; the other commands ask for the file. `--reference-sample` names the reference, needed when the
+graph declares more than one (HPRC graphs declare CHM13 and GRCh38; `dromos reference-samples graph.gbz` lists them).
+The files can also be made on their own:
+
+```sh
+dromos ref-map --graph graph.gbz --reference-sample CHM13 --out graph.refmap
+dromos node-table --graph graph.gbz --out graph.nodes        # --no-letters: lengths alone, for gam-to-gaf --slim
+```
+
+On the HPRC graph a reference map takes 7 s and a node table 6 s, in under 8 GB of memory; pgcatalog takes 42 s and
+32 s, in 14 GB and 10 GB.
 
 ### `dromos index`
 
 ```sh
 dromos index graph.refmap reads.gam reads.coord.gaf.gz       # writes reads.coord.gaf.gz and its .tbi
+dromos index --reference-sample CHM13 graph.gbz reads.gam reads.coord.gaf.gz    # the graph itself
 dromos index graph.refmap reads.gaf.gz reads.coord.gaf.gz    # a GAF: plain, gzip or bgzip
 vg giraffe ... -o gaf | dromos index graph.refmap - reads.coord.gaf.gz    # straight from the aligner
 ```
@@ -75,7 +99,8 @@ vg giraffe ... -o gaf | dromos index graph.refmap - reads.coord.gaf.gz    # stra
   alignment on each contig. Unmapped alignments, and those with no unique place on the reference, are left out and
   counted by reason.
 - **Options.** `-t THREADS` (all cores); `-l LEVEL`, the BGZF level, 0 to 12. The default, 1, writes about three
-  times as fast as 6, into a file 40% larger.
+  times as fast as 6, into a file 40% larger. `--reference-sample NAME`: for a graph, whose reference map to make;
+  for a map, checked against its sample.
 
 ### `dromos gam-to-gaf`
 
@@ -88,6 +113,7 @@ dromos gam-to-gaf --slim graph.nodes reads.gam          # their 12 columns alone
 
 ```sh
 dromos surject --contig chr20 graph.refmap graph.nodes reads.gam > chr20.sam
+dromos surject --contig chr20 --reference-sample CHM13 graph.gbz reads.gam > chr20.sam    # the graph for both
 dromos surject --contig chr20 --sam-contig chr20 graph.refmap graph.nodes reads.gaf.gz \
   | samtools sort -o chr20.bam && samtools index chr20.bam
 ```
@@ -119,6 +145,9 @@ dromos surject --contig chr20 --sam-contig chr20 graph.refmap graph.nodes reads.
   chunks. For the index it sums each mapping's edits as it reads them. GAF lines follow libvgio's
   `alignment_to_gaf` line for line.
 - **No graph in memory.** The reference map and node table are memory-mapped, so their pages load as they are used.
+- **The graph read in parts.** The gbz crate reads the GBZ; dromos does the rest in Mojo. For a reference map or
+  node table it has the crate load the GBWT and the node letters' pieces at the same time, and unpacks letters by
+  node range on every core, where loading the whole graph unpacks them all on one thread first (most of its time).
 - **Surjection in batches.** A read's alignment to the reference costs from nothing to a second. Each step's
   slices gather the reads that touch the contig, as GAF lines; a few hundred MB of them are then aligned by one
   worker a thread taking pieces in turn, so threads wait at the end of a batch, not of every chunk.
@@ -137,6 +166,8 @@ dromos is checked byte for byte against the tools it replaces, on HG002 HiFi ali
 - `surject` writes the same SAM records as `pgcatalog surject` (pgcatalog 0.2.0), from the GAM and from its GAF,
   with and without `--graph-placement` and `--catalog`: chr10 of the slice (487,571 records), and slices of the whole
   GAM on chr20 (48,706) and chr6 across the MHC (47,027).
+- `ref-map` and `node-table` write the same files as `pgcatalog ref-map` and `node-table`, byte for byte, on the HPRC
+  graph and a small one, for each reference sample; `reference-samples` prints the same lines.
 - `tests/integration/edges.sh` covers odd and damaged inputs: empty files, multi-member gzip, lines across chunk
   boundaries, any thread count, stdin, and truncated or corrupt files, which fail instead of leaving a partial
   index.
@@ -150,3 +181,5 @@ tests/integration/edges.sh ENV_FILE     # odd and damaged inputs
 
 MIT; see [`LICENSE`](LICENSE). At run time dromos loads [libdeflate](https://github.com/ebiggers/libdeflate) (MIT),
 [zstd](https://github.com/facebook/zstd) (BSD-3-Clause) and [zlib](https://zlib.net) (zlib licence).
+`libdromos_gbz` builds in the [gbz](https://github.com/jltsiren/gbwt-rs) and
+[simple-sds](https://github.com/jltsiren/simple-sds) crates (both MIT) and, through them, zstd.
