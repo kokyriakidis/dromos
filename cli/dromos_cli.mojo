@@ -42,7 +42,7 @@ the files pgphase's previous indexer (pgcat index-gaf --slim) wrote from the sam
 
   --graph FILE              the pangenome graph (GBZ)
   --cache FILE              the graph's cache: made there on first use (and again when the graph changes), read
-                            after [GRAPH.dromos, beside the graph]
+                            after [GRAPH.gbz.dromos, beside the graph]
   IN                        a GAM, or a GAF (plain, gzip or BGZF), told apart by their first bytes; - reads stdin
   --reference-sample NAME   the sample whose paths are the reference: CHM13 for CHM13#0#chr20 [the graph's declared
                             reference sample, if it declares exactly one; HPRC graphs declare CHM13 and GRCh38 and
@@ -60,7 +60,7 @@ GAM as GAF on stdout: the lines vg convert -G writes for it, in the GAM's order.
 
   --graph FILE              the pangenome graph (GBZ)
   --cache FILE              the graph's cache: made there on first use (and again when the graph changes), read
-                            after [GRAPH.dromos, beside the graph]
+                            after [GRAPH.gbz.dromos, beside the graph]
   GAM                       the alignments; - reads stdin
   -t THREADS                threads [the machine's cores]
   --slim                    each line's 12 GAF columns alone (no cs, bq, AS or dv; the node letters are not read)
@@ -74,7 +74,7 @@ same graph, reads and options, in IN's order. Reads with no base on the contig a
 
   --graph FILE              the pangenome graph (GBZ)
   --cache FILE              the graph's cache: made there on first use (and again when the graph changes), read
-                            after [GRAPH.dromos, beside the graph]
+                            after [GRAPH.gbz.dromos, beside the graph]
   IN                        a GAM, or a GAF with cs (and bq for qualities; plain, gzip or BGZF), told apart by their
                             first bytes; - reads stdin. dromos index's output keeps no cs and cannot be used
   --contig NAME             the reference contig (chr20)
@@ -102,7 +102,7 @@ graph declares, in one file read in place (memory-mapped). Nothing is done when 
 
   --graph FILE              the pangenome graph (GBZ)
   --cache FILE              the graph's cache: made there on first use (and again when the graph changes), read
-                            after [GRAPH.dromos, beside the graph]
+                            after [GRAPH.gbz.dromos, beside the graph]
   --reference-sample NAME   a sample to place beside those the graph declares (a graph declaring none needs one for
                             index and surject)
   -t THREADS                threads [the machine's cores]
