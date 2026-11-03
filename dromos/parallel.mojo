@@ -7,6 +7,7 @@
 from std.atomic import Atomic
 from std.ffi import external_call
 from std.os import abort
+from std.memory import Allocation, Layout, alloc, dealloc
 from std.sys import num_physical_cores
 
 
@@ -73,3 +74,41 @@ def parallel_for[T: ParallelTask](mut task: T, count: Int, num_threads: Int):
     # reach it through an untracked pointer.
     if Int(job.next.load()) < count:
         abort("parallel_for: workers stopped early")
+
+
+struct Background[T: ParallelTask & Movable](Movable):
+    """`task.run(i)` for `i` in `[0, count)` on up to `num_threads` threads of their own, beside the caller's work
+    (parallel_for's included), until `join`. The task is kept here (on the heap, so the threads' pointer to it holds
+    however this moves). Threads that cannot start leave their share undone: a background task must be one whose
+    work others can take."""
+
+    var task: Allocation[Self.T]
+    var job: Allocation[_Job[Self.T]]
+    var handles: List[UInt64]
+
+    def __init__(out self, var task: Self.T, count: Int, num_threads: Int):
+        self.task = alloc(Layout[Self.T](length=1))
+        self.task.unsafe_ptr().unsafe_write(task^)
+        self.job = alloc(Layout[_Job[Self.T]](length=1))
+        self.job.unsafe_ptr().unsafe_write(
+            _Job[Self.T](self.task.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](), count)
+        )
+        var arg = self.job.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]().unsafe_bitcast[NoneType]()
+        self.handles = List[UInt64]()
+        for _ in range(min(num_threads, count, MAX_THREADS)):
+            var h = UInt64(0)
+            if external_call["pthread_create", Int32](Pointer(to=h), Int(0), _worker[Self.T], arg) == 0:
+                self.handles.append(h)
+
+    def join(mut self):
+        """Waits for the threads."""
+        for h in self.handles:
+            _ = external_call["pthread_join", Int32](h, Int(0))
+        self.handles.clear()
+
+    def __deinit__(deinit self):
+        for h in self.handles:
+            _ = external_call["pthread_join", Int32](h, Int(0))
+        _ = self.task.unsafe_ptr().unsafe_take_pointee()
+        dealloc(self.task^)
+        dealloc(self.job^)

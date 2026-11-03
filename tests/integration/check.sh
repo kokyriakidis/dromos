@@ -16,7 +16,8 @@
 #              surject dromos surject ports and whose ref-map and node-table dromos's must match; GBZ the graph the
 #              alignments are on (REFMAP and NODES are its); GBZ_SMALL a small GBZ (tests/data/micb-kir3dl1.gbz)
 #   CATALOG_DIR the graph's catalogs (<contig>.pgsites); SURJECT_CONTIG a contig the alignments lie on (chr10)
-#   WORK       a directory for outputs and the pgcat references (made once, kept)
+#   SNARLS     the graph's snarls cache (<contig>.snarls and graph.id, as pgcatalog build keeps it), copied, not changed
+#   WORK       a directory for outputs and the pgcat and pgcatalog references (made once, kept)
 #
 # Every index is made at -l 0 (stored blocks), where dromos and pgcat write the same bytes: the files must be equal,
 # and their .tbi equal decompressed.
@@ -110,6 +111,64 @@ got=$("$DROMOS" surject --contig "$SURJECT_CONTIG" --reference-sample CHM13 "$L"
 [ "$got" == "$want" ] && pass "surject: the graph for its reference map" \
   || fail "surject: the graph for its reference map"
 rm -f "$L".* "$WORK/d.graph.gz" "$WORK/d.graph.gz.tbi"
+
+# catalog and view: pgcatalog build's catalogs from the same snarls, byte for byte (the small graph from its committed
+# snarls, on 2 threads as pgphase's gate builds it; HPRC contigs, a region, and with --full the whole genome), and
+# pgcatalog view's VCF of them.
+pgcatalog_catalog() {  # folder, region options...: pgcatalog's catalogs, made once
+  local out=$1; shift
+  [ -e "$out/done" ] || { rm -rf "$out"; mkdir -p "$out" && cp -r "$SNARLS_OF" "$out/snarls" \
+    && "$PGCATALOG" build --graph "$GRAPH_OF" --reference-sample CHM13 --out "$out" "$@" 2> "$out/err" \
+    && touch "$out/done"; } || { echo "pgcatalog build failed: $*"; exit 1; }
+}
+dromos_catalog() {  # folder, options...: dromos's catalogs, from a fresh copy of the snarls
+  local out=$1; shift
+  rm -rf "$out"; mkdir -p "$out" && cp -r "$SNARLS_OF" "$out/snarls"
+  "$DROMOS" catalog --graph "$GRAPH_OF" --reference-sample CHM13 --out "$out" "$@" 2> "$out/err"
+}
+same_catalogs() {  # name, dromos folder, pgcatalog folder: every pgcatalog catalog made, the same
+  local name=$1 n=0 bad=0
+  for f in "$3"/*.pgsites; do
+    n=$((n + 1)); cmp -s "$f" "$2/$(basename "$f")" || bad=$((bad + 1))
+  done
+  [ $n -gt 0 ] && [ $bad -eq 0 ] && pass "$name ($n catalogs)" || fail "$name ($bad of $n differ)"
+}
+same_view() {  # name, catalog, region...: dromos view prints what pgcatalog view prints
+  local name=$1 cat=$2; shift 2
+  cmp -s <("$DROMOS" view "$cat" "$@" 2> /dev/null) <("$PGCATALOG" view "$cat" "$@" 2> /dev/null) && pass "$name" \
+    || fail "$name"
+}
+SMALL_SNARLS=tests/data/micb-kir3dl1.catalog/snarls
+GRAPH_OF=$GBZ_SMALL SNARLS_OF=$SMALL_SNARLS
+pgcatalog_catalog "$WORK/pcat.small" --region chr6 --region chr19 --threads 2
+dromos_catalog "$WORK/dcat.small" --region chr6 --region chr19 --threads 2
+same_catalogs "catalog: the small graph" "$WORK/dcat.small" "$WORK/pcat.small"
+cmp -s "$WORK/dcat.small/chr6.pgsites" tests/data/micb-kir3dl1.catalog/chr6.pgsites \
+  && cmp -s "$WORK/dcat.small/chr19.pgsites" tests/data/micb-kir3dl1.catalog/chr19.pgsites \
+  && pass "catalog: the small graph's committed catalogs" || fail "catalog: the small graph's committed catalogs"
+GRAPH_OF=$GBZ SNARLS_OF=$SNARLS
+for c in chr20 chr6 chr1 chrY "chr20:10,000,000-12,000,000"; do
+  d=$(echo "$c" | tr ':,' '__')
+  pgcatalog_catalog "$WORK/pcat.$d" --region "$c" --threads 10
+  dromos_catalog "$WORK/dcat.$d" --region "$c" -t 10
+  same_catalogs "catalog: $c" "$WORK/dcat.$d" "$WORK/pcat.$d"
+done
+dromos_catalog "$WORK/dcat.chr20_3" --region chr20 -t 3
+same_catalogs "catalog: chr20, 3 threads" "$WORK/dcat.chr20_3" "$WORK/pcat.chr20"
+same_view "view: chr20, whole" "$WORK/dcat.chr20/chr20.pgsites"
+same_view "view: chr20, a region" "$WORK/dcat.chr20/chr20.pgsites" "chr20:10,000,000-12,000,000"
+same_view "view: chr20, a region named by sample" "$WORK/dcat.chr20/chr20.pgsites" "CHM13#0#chr20:30000000-30001000"
+same_view "view: chr20, a contig named alone" "$WORK/dcat.chr20/chr20.pgsites" chr20
+same_view "view: chr20, another contig" "$WORK/dcat.chr20/chr20.pgsites" chr21:1-100000
+same_view "view: chr6, the MHC" "$WORK/dcat.chr6/chr6.pgsites" chr6:29,000,000-34,000,000
+same_view "view: chr1, past its end" "$WORK/dcat.chr1/chr1.pgsites" chr1:300000000-300000100
+if [ "$FULL" == "--full" ]; then
+  pgcatalog_catalog "$WORK/pcat.all" --threads 10
+  dromos_catalog "$WORK/dcat.all" -t 10
+  same_catalogs "catalog: the whole genome" "$WORK/dcat.all" "$WORK/pcat.all"
+  same_view "view: chr2, its giant record's region" "$WORK/dcat.all/chr2.pgsites" chr2:1-1000000000
+fi
+rm -rf "$WORK"/dcat.*
 
 # gam-to-gaf: vg's lines, and the slices as checked before.
 "$DROMOS" gam-to-gaf "$NODES" "$SMALL_GAM" > "$WORK/small.gaf"

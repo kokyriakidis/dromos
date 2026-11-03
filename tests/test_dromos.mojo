@@ -1,6 +1,7 @@
 """Tests: protobuf varints, GAM group framing, GAF lines against hand-worked ones, placement on the reference as
-pgcat places alignments, tabix bins as htslib numbers them, surject's alignments as pgcatalog makes them, and a GBZ
-read through the gbz crate (tests/data/micb-kir3dl1.gbz, two reference samples)."""
+pgcat places alignments, tabix bins as htslib numbers them, surject's alignments as pgcatalog makes them, a GBZ read
+through the gbz crate (tests/data/micb-kir3dl1.gbz, two reference samples), snarls streams, and site catalogs as
+pgcatalog writes and reads them (tests/data/micb-kir3dl1.catalog: its snarls and pgcatalog's catalogs)."""
 
 from std.memory import bitcast
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
@@ -18,6 +19,10 @@ from dromos.graph import (
     resolve_reference_sample,
 )
 from dromos.graph_files import folder_of, name_of, write_node_table, write_ref_map
+from dromos.build import natural_less, parse_region
+from dromos.catalog import Graph, ReferencePath, Traversal, build_catalog, traversals, vcf_header
+from dromos.pgsites import Catalog, Writer, compress_sealed, records, same_contig
+from dromos.snarls import NO_PARENT, Snarl, canonical, parse_snarls, read_snarls, snarl_name
 from dromos.gaf_text import MALFORMED, PLACED, SKIP, UNMAPPED, append_slim, classify
 from dromos.output import decimal_digits
 from dromos.bgzf import load_libdeflate
@@ -688,6 +693,272 @@ def test_folders_and_names() raises:
     assert_equal(folder_of("g.gbz"), ".")
     assert_equal(name_of("a/b/g.gbz"), "g.gbz")
     assert_equal(name_of("g.gbz"), "g.gbz")
+
+
+def test_parts_search_as_the_graph() raises:
+    """The parts' edges and bidirectional search, many states at a time, give what the crate's GBZ gives one at a
+    time."""
+    var g = GbzGraph(GBZ)
+    var p = GbzParts(GBZ)
+    p.find_nodes(2)
+    var visits = List[UInt64]()
+    for node in range(g.max_node() + 2):
+        visits.append(UInt64(node << 1))
+        visits.append(UInt64(node << 1 | 1))
+    for predecessors in [False, True]:
+        var out = List[UInt64]()
+        var counts = List[Int64]()
+        p.edges(visits.unsafe_ptr(), len(visits), predecessors, out, counts)
+        var at = 0
+        var one = List[UInt64]()
+        for i in range(len(visits)):
+            var v = visits[i]
+            var has: Bool
+            if predecessors:
+                has = g.predecessors(Int(v >> 1), v & 1 == 1, one)
+            else:
+                has = g.successors(Int(v >> 1), v & 1 == 1, one)
+            if not has:
+                assert_equal(counts[i], -1)
+                continue
+            assert_equal(Int(counts[i]), len(one))
+            for k in range(len(one)):
+                assert_equal(out[at + k], one[k])
+            at += len(one)
+    var states = List[SearchState]()
+    for v in visits:
+        var s = g.search_state(Int(v >> 1), v & 1 == 1)
+        var t = p.search_state(Int(v >> 1), v & 1 == 1)
+        assert_equal(Bool(s), Bool(t))
+        if s:
+            assert_true(s.value() == t.value())
+            states.append(s.value())
+    var out = List[SearchState]()
+    var counts = List[Int64]()
+    p.follow_forward(states.unsafe_ptr(), len(states), out, counts)
+    var at = 0
+    var one = List[SearchState]()
+    for i in range(len(states)):
+        assert_true(g.follow_forward(states[i], one))
+        assert_equal(Int(counts[i]), len(one))
+        for k in range(len(one)):
+            assert_true(out[at + k] == one[k])
+        at += len(one)
+    assert_equal(at, len(out))
+
+
+def _snarl_message(start: UInt64, end: UInt64, parent: Optional[Tuple[UInt64, UInt64]]) -> List[UInt8]:
+    def visit(v: UInt64) -> List[UInt8]:
+        var m = List[UInt8]()
+        _varint(m, 1 << 3)
+        _varint(m, Int(v >> 1))
+        if v & 1 == 1:
+            _varint(m, 3 << 3)
+            _varint(m, 1)
+        return m^
+
+    var m = List[UInt8]()
+    if parent:
+        var pm = List[UInt8]()
+        _bytes_field(pm, 2, visit(parent.value()[0]))
+        _bytes_field(pm, 3, visit(parent.value()[1]))
+        _bytes_field(m, 4, pm)
+    _bytes_field(m, 2, visit(start))
+    _varint(m, 6 << 3)  # a varint field read past
+    _varint(m, 300)
+    _bytes_field(m, 3, visit(end))
+    return m^
+
+
+def _group(mut out: List[UInt8], tag: String, messages: List[List[UInt8]]):
+    _varint(out, len(messages) + 1)
+    _varint(out, tag.byte_length())
+    out.extend(tag.as_bytes())
+    for m in messages:
+        _varint(out, len(m))
+        out.extend(Span(m))
+
+
+def test_snarls_stream() raises:
+    """The groups of vg snarls: SNARL messages (in any case of the tag) read for their visits and parents, other groups
+    skipped; a damaged stream fails."""
+    var stream = List[UInt8]()
+    _group(
+        stream,
+        "SNARL",
+        [
+            _snarl_message(10 << 1, 12 << 1, None),
+            _snarl_message(11 << 1 | 1, 7 << 1, (UInt64(14 << 1 | 1), UInt64(9 << 1))),
+        ],
+    )
+    _group(stream, "OTHER", [List[UInt8](length=5, fill=1)])
+    _group(stream, "snarl", [_snarl_message(3 << 1, 4 << 1 | 1, (UInt64(1 << 1), UInt64(2 << 1)))])
+    var s = parse_snarls(Span(stream), 2)
+    assert_equal(len(s), 3)
+    assert_true(s[0].start == 20 and s[0].end == 24 and not s[0].has_parent())
+    assert_true(s[1].start == 23 and s[1].end == 14 and s[1].parent_start == 29 and s[1].parent_end == 18)
+    assert_true(s[2].start == 6 and s[2].end == 9 and s[2].parent_start == 2 and s[2].parent_end == 4)
+    var cut = List[UInt8](Span(stream)[: len(stream) - 3])
+    var failed = False
+    try:
+        _ = parse_snarls(Span(cut), 2)
+    except e:
+        failed = String(e).startswith("malformed snarls file")
+    assert_true(failed)
+    var no_end = List[UInt8]()
+    var m = List[UInt8]()
+    _bytes_field(m, 2, List[UInt8]([UInt8(8), UInt8(5)]))
+    _group(no_end, "SNARL", [m^])
+    failed = False
+    try:
+        _ = parse_snarls(Span(no_end), 1)
+    except e:
+        failed = String(e) == "malformed snarls file: snarl without end"
+    assert_true(failed)
+
+
+def test_snarl_names_and_keys() raises:
+    assert_equal(snarl_name(12 << 1, 34 << 1), ">12>34")
+    assert_equal(snarl_name(12 << 1 | 1, 3 << 1 | 1), "<12<3")
+    # A snarl read backwards has the same key: (start, end) and (end flipped, start flipped).
+    var a = canonical(5 << 1, 9 << 1)
+    var b = canonical(9 << 1 | 1, 5 << 1 | 1)
+    assert_true(a[0] == b[0] and a[1] == b[1])
+    assert_true(a[0] == 10 and a[1] == 18)
+
+
+def test_regions() raises:
+    var s = parse_region("chr20", "CHM13")
+    assert_true(s.contig == "chr20" and not s.region)
+    s = parse_region("CHM13#0#chr20:10,000,000-12,000,000", "CHM13")
+    assert_true(s.contig == "chr20" and s.region.value()[0] == 10_000_000 and s.region.value()[1] == 12_000_000)
+    for bad in ["chr20:0-5", "chr20:9-5", "chr20:5", "GRCh38#0#chr20", "chr20:a-5"]:
+        var failed = False
+        try:
+            _ = parse_region(bad, "CHM13")
+        except:
+            failed = True
+        assert_true(failed)
+
+
+def test_contigs_in_natural_order() raises:
+    var v: List[String] = ["chrX", "chr10", "chr2", "chr1", "chrM", "chr22", "chrY"]
+    sort(Span(v), natural_less)
+    var want: List[String] = ["chr1", "chr2", "chr10", "chr22", "chrM", "chrX", "chrY"]
+    assert_true(v == want)
+
+
+def test_same_contig() raises:
+    assert_true(same_contig("chr20", "CHM13#0#chr20"))
+    assert_true(same_contig("CHM13#0#chr20", "chr20"))
+    assert_true(same_contig("CHM13#0#chr20", "CHM13#0#chr20"))
+    assert_false(same_contig("GRCh38#0#chr20", "CHM13#0#chr20"))
+    assert_false(same_contig("chr2", "CHM13#0#chr20"))
+
+
+def test_region_queries_return_the_overlapping_records() raises:
+    """Records across several windows, one with a REF reaching far past its window: every region query returns
+    exactly the overlapping records (pgsites.rs's test)."""
+    var path = String("/tmp/dromos_test_region.pgsites")
+    var header = String("##fileformat=VCFv4.2\n##contig=<ID=CHM13#0#chrT,length=1000000>\n#CHROM\tPOS\tID\tREF\tALT\n")
+    var positions = List[Int]()
+    var lengths = List[Int]()
+    var w = Writer(path, header, 3, 2)
+    for k in range(400):
+        var pos = 1 + k * 1_337
+        var length = 250_000 if k == 7 else 2
+        positions.append(pos)
+        lengths.append(length)
+        var line = String(t"CHM13#0#chrT\t{pos}\t>{k}>{k + 1}\t")
+        line += "A" * length if k == 7 else "AC"
+        line += "\tG"
+        var place = w.place(pos, pos + length - 1, length, 3, line.byte_length())
+        var at = w.at(place[0], place[1])
+        for i in range(line.byte_length()):
+            at[unsafe_offset=i] = line.as_bytes()[i]
+        if k % 50 == 0:
+            compress_sealed(w)
+            w.write_done()
+    w.seal()
+    compress_sealed(w)
+    w.write_done()
+    assert_true(w.finish() > 1)
+    var c = Catalog(path)
+    assert_equal(c.chrom, "CHM13#0#chrT")
+    assert_equal(c.header, header)
+    var queries: List[Tuple[Int, Int]] = [
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (100_000, 100_001),
+        (200_000, 260_000),
+        (1, Int.MAX),
+        (600_000, 700_000),
+    ]
+    for q in queries:
+        var got = List[UInt8]()
+        records(c, q[0], q[1], 2, -1, got)
+        var got_pos = List[Int]()
+        var text = String(unsafe_from_utf8=got)
+        for line in text.split("\n"):
+            if line.byte_length() > 0:
+                got_pos.append(Int(line.split("\t")[1]))
+        var want = List[Int]()
+        for k in range(len(positions)):
+            if positions[k] <= q[1] and positions[k] + lengths[k] > q[0]:
+                want.append(positions[k])
+        assert_true(got_pos == want)
+
+
+def _read_all(path: String) raises -> List[UInt8]:
+    with open(path, "r") as f:
+        return f.read_bytes()
+
+
+def test_catalogs_of_the_small_graph() raises:
+    """The small graph's catalogs, built from its snarls, are pgcatalog's byte for byte, on one thread and on
+    several; a region holds the records a query of the whole catalog returns."""
+    var data = String("tests/data/micb-kir3dl1.catalog")
+    var graph = Graph(GBZ, 2)
+    var md = graph.parts.metadata()
+    for threads in [1, 3]:
+        for contig in ["chr6", "chr19"]:
+            var r = ReferencePath(graph, md, "CHM13", contig, threads)
+            var out = String(t"/tmp/dromos_test_{contig}")
+            _ = build_catalog(graph, r, data + "/snarls/" + contig + ".snarls", None, out, 6, threads)
+            assert_true(_read_all(out + ".pgsites") == _read_all(data + "/" + contig + ".pgsites"))
+    var r = ReferencePath(graph, md, "CHM13", "chr6", 2)
+    var whole = Catalog(data + "/chr6.pgsites")
+    var beg = whole.blocks[0] + 2000
+    var end = beg + 5000
+    _ = build_catalog(graph, r, data + "/snarls/chr6.snarls", (beg, end), "/tmp/dromos_test_region", 6, 2)
+    var want = List[UInt8]()
+    records(whole, beg, end, 2, -1, want)
+    var got = List[UInt8]()
+    records(Catalog("/tmp/dromos_test_region.pgsites"), 1, Int.MAX, 2, -1, got)
+    assert_true(len(want) > 0 and got == want)
+
+
+def test_reference_traversals() raises:
+    """Every snarl of the small graph whose boundary nodes the reference visits in order has a traversal from the
+    start's step to the end's."""
+    var graph = Graph(GBZ, 2)
+    var md = graph.parts.metadata()
+    var r = ReferencePath(graph, md, "CHM13", "chr6", 2)
+    var snarls = read_snarls("tests/data/micb-kir3dl1.catalog/snarls/chr6.snarls", 2)
+    var found = 0
+    var block = List[UInt64]()
+    for sn in snarls:
+        var t = Traversal(-1, 0, False)
+        if traversals(r, sn, block, t) == 1:
+            found += 1
+            var first = r.steps[t.s0] ^ UInt64(Int(t.backward))
+            var last = r.steps[t.e0] ^ UInt64(Int(t.backward))
+            assert_true(first >> 1 == sn.start >> 1 and last == sn.end)
+    assert_true(found > 100)
+    assert_true(
+        vcf_header("X", 5).endswith("##contig=<ID=X,length=5>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+    )
 
 
 def main() raises:

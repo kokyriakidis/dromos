@@ -3,6 +3,7 @@
 from std.sys import argv, exit, stderr
 from std.time import perf_counter_ns
 
+from dromos.build import BuildOptions, run_build
 from dromos.contig import Contig
 from dromos.convert import GafSink
 from dromos.graph import is_gbz, reference_samples, resolve_reference_sample
@@ -11,7 +12,7 @@ from dromos.index import IndexSink
 from dromos.linearize import Window
 from dromos.nodes import NodeTable
 from dromos.parallel import default_threads
-from dromos.pgsites import load_windows
+from dromos.pgsites import load_windows, view
 from dromos.refmap import RefMap
 from dromos.stream import AUTO, GAF, GAM, stream_input
 from dromos.surject import SurjectSink, Surjector
@@ -22,6 +23,9 @@ comptime OVERVIEW = """dromos: pangenome graph alignments, fast
   dromos gam-to-gaf  a GAM as GAF, the lines vg convert -G writes
   dromos surject     a GAM or GAF as SAM on one reference contig, the records pgcatalog surject writes
 
+  dromos catalog            a GBZ graph's site catalogs, one per reference contig (<contig>.pgsites), as pgphase
+                            reads them: the files pgcatalog build writes
+  dromos view               a catalog as VCF, whole or a region of it
   dromos ref-map            a GBZ graph's reference map, which index and surject place alignments by
   dromos node-table         a GBZ graph's node lengths and letters, which gam-to-gaf and surject read
   dromos reference-samples  the reference samples a GBZ graph declares
@@ -92,6 +96,42 @@ Between placed stretches, a substitution bubble is aligned base for base and an 
 the reference are aligned or soft-clipped, and ends diverging from the read's own graph alignment clipped.
 """
 
+
+comptime CATALOG_USAGE = """dromos catalog --graph GRAPH.gbz [options]
+
+Site catalogs (DIR/<contig>.pgsites) from a GBZ graph, as pgphase reads them: the files pgcatalog build writes, byte
+for byte. Every snarl the reference path passes through is kept, at every nesting level, with all its alleles.
+
+  --graph FILE              the pangenome graph (GBZ)
+  --out DIR                 where catalogs are written: <contig>.pgsites, or <contig>_<start>-<end>.pgsites for a
+                            region [GRAPH.catalog, in the current folder]
+  --reference-sample NAME   the sample whose paths are the reference: CHM13 for CHM13#0#chr20 [the graph's declared
+                            reference sample, if it declares exactly one; HPRC graphs declare CHM13 and GRCh38 and
+                            need this]
+  --region REGION           a contig (chr20) or part of one (chr20:10000000-12000000, 1-based, inclusive),
+                            repeatable [every reference contig]; a region holds the records a tabix query of the whole
+                            contig's catalog returns
+  -t, --threads N           threads [the machine's cores]
+  --snarls-jobs N           vg snarls runs at a time [6, at most --threads]; fewer when memory is short (each needs
+                            about 20 times its component's size)
+  --snarls-cache DIR        where each contig's snarls are kept and reused by later runs on the same graph
+                            [DIR/snarls]
+  --vg PATH                 the vg binary, for vg chunk and vg snarls, run only for contigs whose snarls are not in
+                            the cache [vg]
+  --level N                 zstd level, 1-22 [6]; higher is smaller and slower
+
+dromos view prints a catalog as VCF; for a tabix-indexed copy:
+  dromos view chr20.pgsites | bgzip > chr20.sites.vcf.gz && tabix -p vcf chr20.sites.vcf.gz
+"""
+
+comptime VIEW_USAGE = """dromos view [-t THREADS] FILE.pgsites [CONTIG[:START-END]]
+
+A catalog as VCF on stdout: its header, then every record, or the records overlapping a region (1-based, inclusive),
+as tabix would return them from the VCF: what pgcatalog view prints. CONTIG is chr20 or CHM13#0#chr20; another
+contig's region prints the header alone.
+
+  -t THREADS  threads, inflating blocks [the machine's cores]
+"""
 
 comptime REF_MAP_USAGE = """dromos ref-map [-t THREADS] [--reference-sample NAME] --graph GRAPH.gbz --out FILE
 
@@ -345,6 +385,57 @@ def node_table_main() raises:
     write_node_table(graph, out, letters, threads)
 
 
+def catalog_main() raises:
+    var args = _Args("catalog")
+    if args.help():
+        print(CATALOG_USAGE, end="")
+        return
+    var o = BuildOptions()
+    var t = args.value("--threads")
+    if not t:
+        t = args.value("-t")
+    o.threads = _number(t.value(), "--threads", 1, 1024, "catalog") if t else default_threads()
+    o.graph = args.value("--graph").or_else(String())
+    o.out = args.value("--out").or_else(String())
+    o.reference_sample = args.value("--reference-sample")
+    while True:
+        var r = args.value("--region")
+        if not r:
+            break
+        o.regions.append(r.value())
+    var jobs = args.value("--snarls-jobs")
+    if jobs:
+        o.snarls_jobs = _number(jobs.value(), "--snarls-jobs", 1, 1024, "catalog")
+    o.snarls_cache = args.value("--snarls-cache")
+    var vg = args.value("--vg")
+    if vg:
+        o.vg = vg.value()
+    var level = args.value("--level")
+    if level:
+        o.level = _number(level.value(), "--level", 1, 22, "catalog")
+    _ = args.positional(0)
+    if not o.graph:
+        print(CATALOG_USAGE, end="", file=stderr)
+        exit(1)
+    if not o.out:
+        # The graph's file name without its last extension, then .catalog, in the current folder.
+        var slash = o.graph.rfind("/")
+        var name = String(o.graph[byte = slash + 1 :]) if slash >= 0 else o.graph
+        var dot = name.rfind(".")
+        o.out = (String(name[byte=:dot]) if dot > 0 else name) + ".catalog"
+    run_build(o)
+
+
+def view_main() raises:
+    var args = _Args("view")
+    if args.help() or len(args.items) == 0:
+        print(VIEW_USAGE, end="")
+        return
+    var threads = args.threads()
+    var pos = args.positional_between(1, 2)
+    view(pos[0], Optional(pos[1]) if len(pos) == 2 else None, threads)
+
+
 def reference_samples_main() raises:
     var args = _Args("reference-samples")
     if args.help():
@@ -372,6 +463,10 @@ def main():
             gam_to_gaf_main()
         elif command == "surject":
             surject_main()
+        elif command == "catalog":
+            catalog_main()
+        elif command == "view":
+            view_main()
         elif command == "ref-map":
             ref_map_main()
         elif command == "node-table":

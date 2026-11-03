@@ -266,6 +266,12 @@ def imm_untracked[T: AnyType](p: MutPointer[T, _]) -> ImmPointer[T, ImmUntracked
 
 
 @always_inline
+def untracked[T: AnyType](p: ImmPointer[T, _]) -> ImmPointer[T, ImmUntrackedOrigin]:
+    """An immutable pointer, untracked: what it points to must outlive its use (a caller's value handed to tasks)."""
+    return p.unsafe_origin_cast[ImmUntrackedOrigin]()
+
+
+@always_inline
 def mut_untracked[T: AnyType](p: MutPointer[T, _]) -> MutPointer[T, MutUntrackedOrigin]:
     return p.unsafe_origin_cast[MutUntrackedOrigin]()
 

@@ -121,3 +121,77 @@ printf "@x\n" | $D gam-to-gaf gw/g.gbz - > /dev/null 2>&1
 $PGCATALOG node-table --graph $GBZ_SMALL --out p.nodes
 label="a graph's node table made beside it, pgcatalog's"; ok cmp -s gw/g.gbz.nodes p.nodes
 chmod 755 gr
+# 8. catalog and view on the small graph (GBZ_SMALL, its committed snarls), against pgcatalog build and view: odd
+# snarls files, regions and contigs, threads; a missing snarls cache made with vg (VG, the vg binary pgcatalog runs).
+S=$OLDPWD/tests/data/micb-kir3dl1.catalog/snarls
+[ -d "$S" ] || S=$HOME/dromos/tests/data/micb-kir3dl1.catalog/snarls
+cat_pair() {  # name, snarls folder, region options...: dromos catalog and pgcatalog build, the same files or failures
+  local name=$1 snarls=$2; shift 2
+  rm -rf ca cb; mkdir -p ca cb; cp -r $snarls ca/snarls; cp -r $snarls cb/snarls
+  $D catalog --graph $GBZ_SMALL --reference-sample CHM13 --out ca "$@" > ca.err 2>&1; local drc=$?
+  $PGCATALOG build --graph $GBZ_SMALL --reference-sample CHM13 --out cb "$@" > cb.err 2>&1; local prc=$?
+  if [ $drc -ne 0 ] || [ $prc -ne 0 ]; then
+    [ $drc -ne 0 ] && [ $prc -ne 0 ] && echo "ok    $name: both fail ($(tail -1 ca.err))" \
+      || echo "FAIL  $name: dromos rc=$drc, pgcatalog rc=$prc"; return
+  fi
+  local n=0 bad=0
+  for f in cb/*.pgsites; do n=$((n + 1)); cmp -s $f ca/$(basename $f) || bad=$((bad + 1)); done
+  [ $(ls ca/*.pgsites 2> /dev/null | wc -l) -eq $n ] && [ $bad -eq 0 ] && echo "ok    $name ($n catalogs)" || echo "FAIL  $name"
+}
+cat_pair "catalog: both contigs" $S --region chr6 --region chr19 --threads 2
+for t in 1 3 7; do cat_pair "catalog: $t threads" $S --region chr6 -t $t; done
+cat_pair "catalog: a region" $S --region chr6:31,500,000-31,520,000
+cat_pair "catalog: a region named by sample" $S --region CHM13#0#chr19:54,800,000-54,900,000
+cat_pair "catalog: a region past the contig's end" $S --region chr6:200000000-200000100
+cat_pair "catalog: a region before the contig's fragment" $S --region chr6:1-1000
+cat_pair "catalog: a one-base region" $S --region chr6:31500001-31500001
+cat_pair "catalog: the same contig twice" $S --region chr6 --region chr6:31,500,000-31,600,000
+cat_pair "catalog: a contig absent" $S --region chrZZ
+cat_pair "catalog: another sample's region" $S --region GRCh38#0#chr6
+cat_pair "catalog: a region start of 0" $S --region chr6:0-5
+mkdir -p odd; cp $S/graph.id odd/
+: > odd/chr6.snarls; cat_pair "catalog: an empty snarls file" odd --region chr6
+gzip -dc $S/chr6.snarls > odd/chr6.snarls; cat_pair "catalog: a plain snarls file" odd --region chr6
+gzip -dc $S/chr6.snarls | gzip -c > odd/chr6.snarls; cat_pair "catalog: a gzip (not BGZF) snarls file" odd --region chr6
+cat $S/chr6.snarls $S/chr19.snarls > odd/chr6.snarls; cat_pair "catalog: two contigs' snarls in one file" odd --region chr6
+head -c 600 $S/chr6.snarls > odd/chr6.snarls; cat_pair "catalog: a snarls file cut short" odd --region chr6
+gzip -dc $S/chr6.snarls | head -c 500 > odd/chr6.snarls; cat_pair "catalog: a plain snarls file cut short" odd --region chr6
+printf 'size=1 fnv1a=0\n' > odd/graph.id; cp $S/chr6.snarls odd/; cat_pair "catalog: another graph's snarls cache" odd --region chr6
+if [ -n "${VG:-}" ]; then
+  mkdir -p none; cat_pair "catalog: no snarls cached (vg chunk and snarls)" none --region chr6 --region chr19 --vg $VG -t 4
+  cmp -s ca/snarls/chr6.snarls cb/snarls/chr6.snarls && cmp -s ca/snarls/chr19.snarls cb/snarls/chr19.snarls \
+    && echo "ok    catalog: vg's snarls cached as pgcatalog caches them" || echo "FAIL  catalog: the snarls cache"
+  label="catalog: vg's work folder removed"; ok bash -c "! ls -a ca | grep -q dromos-work"
+  cat_pair "catalog: a vg that fails" none --region chr6 --vg /bin/false
+fi
+fails "catalog: no graph" $D catalog --out cx
+fails "catalog: a graph that is not one" $D catalog --graph $SMALL_GAF --out cx --reference-sample CHM13
+rm -rf cv; mkdir -p cv; cp -r $S cv/snarls
+$D catalog --graph $GBZ_SMALL --reference-sample CHM13 --out cv --region chr6 --region chr6:200000000-200000100 -t 2 \
+  2> /dev/null
+V=cv/chr6.pgsites
+view_pair() {  # name, catalog, region...: dromos view prints what pgcatalog view prints, or both fail
+  local name=$1 cat=$2; shift 2
+  $D view $cat "$@" > vd.out 2> vd.err; local drc=$?
+  $PGCATALOG view $cat "$@" > vp.out 2> vp.err; local prc=$?
+  if [ $drc -ne 0 ] || [ $prc -ne 0 ]; then
+    [ $drc -ne 0 ] && [ $prc -ne 0 ] && echo "ok    $name: both fail ($(tail -1 vd.err))" \
+      || echo "FAIL  $name: dromos rc=$drc, pgcatalog rc=$prc"; return
+  fi
+  cmp -s vd.out vp.out && echo "ok    $name" || echo "FAIL  $name"
+}
+view_pair "view: whole" $V
+view_pair "view: a region" $V chr6:31,500,000-31,520,000
+view_pair "view: a region by sample" $V CHM13#0#chr6:31500000-31600000
+view_pair "view: the contig alone" $V chr6
+view_pair "view: another contig" $V chr19:1-100000000
+view_pair "view: another sample's contig" $V GRCh38#0#chr6
+view_pair "view: past the end" $V chr6:900000000-900000001
+view_pair "view: one base" $V chr6:31500001-31500001
+view_pair "view: a region without an end" $V chr6:5
+view_pair "view: a region with a bad start" $V chr6:x-5
+view_pair "view: an empty catalog" cv/chr6_200000000-200000100.pgsites
+printf 'PGSITES1xxxxxxxxxxxxxxxxxxxxxxxx' > old.pgsites; view_pair "view: an older catalog format" old.pgsites
+fails "view: not a catalog" $D view $SMALL_GAF
+fails "view: a missing catalog" $D view /nonexistent.pgsites
+head -c 2000 $V > cut.pgsites; fails "view: a catalog cut short" $D view cut.pgsites
