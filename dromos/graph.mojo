@@ -6,7 +6,7 @@ fingerprint), ported line for line.
 The library is found beside the dromos binary, then at $DROMOS_GBZ_LIB.
 """
 
-from std.ffi import OwnedDLHandle, external_call
+from std.ffi import OwnedDLHandle, _DLCallable, external_call
 from std.memory import unsafe_memcpy
 from std.os import getenv
 from std.os.path import exists
@@ -14,7 +14,7 @@ from std.sys.info import CompilationTarget
 
 from dromos.bgzf import RawFile
 
-comptime ABI = 1
+comptime ABI = 2
 """The C interface's version (gbz-ffi's `ABI`)."""
 comptime LIBRARY = "libdromos_gbz" + (".dylib" if CompilationTarget.is_macos() else ".so")
 comptime MAGIC = "GBZ "
@@ -111,6 +111,11 @@ struct GbzLib(Movable):
             unsafe_memcpy(dest=out.unsafe_ptr(), src=_address[UInt64](buf.ptr), count=buf.len)
         self.lib.get_function[NoneType]("dgbz_u64s_free")(Pointer(to=buf))
         return out^
+
+
+def _call[R: TrivialRegisterPassable](lib: GbzLib, name: StaticString) raises -> _DLCallable[R, ImmUntrackedOrigin]:
+    """A function of the library, to call many times: valid while the library is loaded (its owner lives)."""
+    return rebind[_DLCallable[R, ImmUntrackedOrigin]](lib.lib.get_function[R](name))
 
 
 @fieldwise_init
@@ -359,10 +364,17 @@ struct GbzParts(Movable):
 
     var lib: GbzLib
     var ptr: Int
+    var _follow: _DLCallable[Int, ImmUntrackedOrigin]
+    var _edges: _DLCallable[Int, ImmUntrackedOrigin]
+    var _search: _DLCallable[Int32, ImmUntrackedOrigin]
+    """The search's calls, looked up once (a lookup costs more than a small call's work, and takes a lock)."""
 
     def __init__(out self, path: String) raises:
         self.lib = GbzLib()
         self.ptr = 0
+        self._follow = _call[Int](self.lib, "dgbz_parts_follow_forward")
+        self._edges = _call[Int](self.lib, "dgbz_parts_edges")
+        self._search = _call[Int32](self.lib, "dgbz_parts_search_state")
         var status = self.lib.lib.get_function[Int32]("dgbz_parts_load")(
             path.unsafe_ptr(), path.byte_length(), Pointer(to=self.ptr)
         )
@@ -423,6 +435,70 @@ struct GbzParts(Movable):
         if n < 0:
             raise Error("node letters overflow their buffer")
         return n
+
+    def search_state(self, node: Int, reverse: Bool) raises -> Optional[SearchState]:
+        """The state of the haplotypes visiting (node, reverse) (`GbzGraph.search_state`); none if no haplotype
+        does."""
+        var s = SearchState()
+        var found = self._search(self.ptr, node, Int32(reverse), Pointer(to=s))
+        if found == 0:
+            return None
+        return s
+
+    def follow_forward(
+        self, states: ImmPointer[SearchState, _], n: Int, mut out: List[SearchState], mut counts: List[Int64]
+    ) raises:
+        """For each of the `n` states at `states`, the non-empty states it extends to forward (`GbzGraph.
+        follow_forward`), one state's after another into `out`, and how many into `counts` (-1 when its node is not in
+        the graph): one call into the crate for many states."""
+        counts.resize(unsafe_uninit_length=n)
+        out.resize(unsafe_uninit_length=max(len(out), 4 * n + 16))
+        var call = self._follow
+        var done = 0
+        var written = 0
+        while done < n:
+            var got = call(
+                self.ptr,
+                states.unsafe_offset(done),
+                n - done,
+                out.unsafe_ptr().unsafe_offset(written),
+                len(out) - written,
+                counts.unsafe_ptr().unsafe_offset(done),
+            )
+            for i in range(done, done + got):
+                written += max(Int(counts[i]), 0)
+            done += got
+            if done < n:
+                out.resize(unsafe_uninit_length=2 * len(out))
+        out.resize(unsafe_uninit_length=written)
+
+    def edges(
+        self, visits: ImmPointer[UInt64, _], n: Int, predecessors: Bool, mut out: List[UInt64], mut counts: List[Int64]
+    ) raises:
+        """For each of the `n` visits at `visits`, its successors (`GbzGraph.successors`) or, with `predecessors`, its
+        predecessors, one visit's after another into `out`, and how many into `counts` (-1 for a node the graph
+        lacks): one call into the crate for many visits."""
+        counts.resize(unsafe_uninit_length=n)
+        out.resize(unsafe_uninit_length=max(len(out), 4 * n + 16))
+        var call = self._edges
+        var done = 0
+        var written = 0
+        while done < n:
+            var got = call(
+                self.ptr,
+                visits.unsafe_offset(done),
+                n - done,
+                Int32(predecessors),
+                out.unsafe_ptr().unsafe_offset(written),
+                len(out) - written,
+                counts.unsafe_ptr().unsafe_offset(done),
+            )
+            for i in range(done, done + got):
+                written += max(Int(counts[i]), 0)
+            done += got
+            if done < n:
+                out.resize(unsafe_uninit_length=2 * len(out))
+        out.resize(unsafe_uninit_length=written)
 
 
 def gbwt_tag(path: String, key: String) raises -> Optional[String]:

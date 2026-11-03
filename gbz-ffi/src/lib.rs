@@ -12,6 +12,7 @@
 
 use gbz::headers::{GBWTPayload, GBZPayload, Header, SequencesPayload};
 use gbz::support::{Orientation, StringArray, Tags};
+use gbz::bwt::Record;
 use gbz::{BidirectionalState, Metadata, SearchState, ENDMARKER, GBWT, GBZ};
 use simple_sds::int_vector::IntVector;
 use simple_sds::ops::{BitVec, Select, Vector};
@@ -25,7 +26,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 
 /// The interface's version: dromos checks it, so a library left from another build is not used by mistake.
-pub const ABI: u32 = 1;
+pub const ABI: u32 = 2;
 
 #[no_mangle]
 pub extern "C" fn dgbz_abi() -> u32 {
@@ -651,11 +652,28 @@ impl Parts {
     }
 
     fn real(&self) -> &Vec<u64> {
-        self.real_on(std::thread::available_parallelism().map_or(1, |n| n.get()))
+        // Once found, without asking how many cores there are (which reads files on Linux).
+        match self.real.get() {
+            Some(r) => r,
+            None => self.real_on(std::thread::available_parallelism().map_or(1, |n| n.get())),
+        }
     }
 
     fn is_real(real: &[u64], s: usize) -> bool {
         real[s / 64] >> (s % 64) & 1 == 1
+    }
+
+    /// Whether the graph has node `node` (GBZ::has_node).
+    fn has_node(&self, node: usize) -> bool {
+        self.sequence_of(node).is_some_and(|s| Parts::is_real(self.real(), s))
+    }
+
+    /// The record GBZ::successors reads for (node, orientation); None for a node the graph lacks.
+    fn record_of(&self, node: usize, o: Orientation) -> Option<Record<'_>> {
+        if !self.has_node(node) {
+            return None;
+        }
+        self.gbwt.as_ref().record(self.gbwt.node_to_record(gbz::support::encode_node(node, o)))
     }
 
     /// The node range's sequences (first, count) within the GBWT's alphabet.
@@ -862,4 +880,103 @@ pub unsafe extern "C" fn dgbz_parts_letters(
         i = j;
     }
     at as i64
+}
+
+// Edges and bidirectional search on the parts' GBWT, as the crate's GBZ gives them (successors, predecessors,
+// search_state, follow_forward), from the same GBWT functions: the same edges and states. Many at once, so a search
+// pays one call per batch of states, not one per state.
+
+/// The edge ranks EdgeIter visits in a record: all but an endmarker at rank 0.
+fn edge_ranks(record: &Record<'_>) -> std::ops::Range<usize> {
+    let first = (record.outdegree() > 0 && record.successor(0) == ENDMARKER) as usize;
+    first..record.outdegree()
+}
+
+/// For each of the `n` visits at `visits`, its successors (GBZ::successors) or, with `predecessors`, its
+/// predecessors (GBZ::predecessors), as visits, one visit's after another into `out` (room for `cap`), and how many
+/// into `counts` (-1 for a node the graph lacks). Returns how many visits were done: fewer than `n` when the next
+/// one's would not fit.
+#[no_mangle]
+pub unsafe extern "C" fn dgbz_parts_edges(
+    p: *const Parts,
+    visits: *const u64,
+    n: usize,
+    predecessors: i32,
+    out: *mut u64,
+    cap: usize,
+    counts: *mut i64,
+) -> usize {
+    let p = &*p;
+    let mut written = 0;
+    for i in 0..n {
+        let (node, o) = gbz::support::decode_node(*visits.add(i) as usize);
+        // A node's predecessors are the flipped successors of its other orientation.
+        let (o, flip) = if predecessors != 0 { (o.flip(), 1) } else { (o, 0) };
+        let Some(record) = p.record_of(node, o) else {
+            *counts.add(i) = -1;
+            continue;
+        };
+        let ranks = edge_ranks(&record);
+        if written + ranks.len() > cap {
+            return i;
+        }
+        for r in ranks.clone() {
+            *out.add(written) = record.successor(r) as u64 ^ flip;
+            written += 1;
+        }
+        *counts.add(i) = ranks.len() as i64;
+    }
+    n
+}
+
+/// The search state of the haplotypes visiting (node, orientation) into `out` (GBZ::search_state): 1, or 0 when none
+/// do.
+#[no_mangle]
+pub unsafe extern "C" fn dgbz_parts_search_state(p: *const Parts, node: usize, reverse: i32, out: *mut DgbzState) -> i32 {
+    match (*p).gbwt.bd_find(gbz::support::encode_node(node, orientation(reverse))) {
+        Some(s) => {
+            *out = DgbzState::of(&s);
+            1
+        }
+        None => 0,
+    }
+}
+
+/// For each of the `n` states at `states`, the non-empty states it extends to forward, one per successor some of
+/// its haplotypes take (GBZ::follow_forward), one state's after another into `out` (room for `cap`), and how many
+/// into `counts` (-1 when the state's node is not in the graph). Returns how many states were done: fewer than `n`
+/// when the next one's might not fit.
+#[no_mangle]
+pub unsafe extern "C" fn dgbz_parts_follow_forward(
+    p: *const Parts,
+    states: *const DgbzState,
+    n: usize,
+    out: *mut DgbzState,
+    cap: usize,
+    counts: *mut i64,
+) -> usize {
+    let p = &*p;
+    let mut written = 0;
+    for i in 0..n {
+        let state = (*states.add(i)).state();
+        let (node, o) = gbz::support::decode_node(state.forward.node);
+        let Some(record) = p.record_of(node, o) else {
+            *counts.add(i) = -1;
+            continue;
+        };
+        let ranks = edge_ranks(&record);
+        if written + ranks.len() > cap {
+            return i;
+        }
+        let mut k = 0;
+        for r in ranks {
+            if let Some(s) = GBWT::bd_internal(&record, &state, record.successor(r)) {
+                *out.add(written + k) = DgbzState::of(&s);
+                k += 1;
+            }
+        }
+        *counts.add(i) = k as i64;
+        written += k;
+    }
+    n
 }
