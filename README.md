@@ -27,6 +27,15 @@ Inflating vg's DEFLATE is half the work. It runs at about 870 MB/s of output per
 [libdeflate](https://github.com/ebiggers/libdeflate), as fast as DEFLATE decoders go. A 10 GB GAF indexes in under
 5 s, about the speed of the disk.
 
+`dromos surject` against `pgcatalog surject` (which loads the 6 GB graph), on the chr10 alignments of a 3.8 GB
+slice of that GAM (487,571 reads; SAM to /dev/null, 10 threads):
+
+| chr10 of the slice | `pgcatalog surject` (from its GAF) | **`dromos surject`** (from the GAM) |
+|---|---|---|
+| default | 200 s, 11.5 GB | **77 s**, 4.8 GB |
+| `--graph-placement` | 46 s, 10.5 GB | **19 s**, 3.7 GB |
+| `--catalog chr10.pgsites` | 329 s, 14.1 GB | **178 s**, 5.8 GB |
+
 ## Install
 
 dromos builds with [pixi](https://pixi.sh), which fetches the pinned Mojo toolchain and libraries:
@@ -126,7 +135,8 @@ dromos is checked byte for byte against the tools it replaces, on HG002 HiFi ali
   from the GAM and from its GAF in every encoding. At other levels it writes the same decompressed content, with the
   same answer to every tabix query. The whole-genome index matches the previous one record for record.
 - `surject` writes the same SAM records as `pgcatalog surject` (pgcatalog 0.2.0), from the GAM and from its GAF,
-  with and without `--graph-placement` and `--catalog`, on every contig tried.
+  with and without `--graph-placement` and `--catalog`: chr10 of the slice (487,571 records), and slices of the whole
+  GAM on chr20 (48,706) and chr6 across the MHC (47,027).
 - `tests/integration/edges.sh` covers odd and damaged inputs: empty files, multi-member gzip, lines across chunk
   boundaries, any thread count, stdin, and truncated or corrupt files, which fail instead of leaving a partial
   index.
