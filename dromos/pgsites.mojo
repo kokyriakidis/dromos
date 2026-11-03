@@ -18,7 +18,7 @@ a window as long as the block (log <= 31); one over MT_BYTES with zstd's own thr
 how many)."""
 
 from std.ffi import OwnedDLHandle, external_call
-from std.memory import unsafe_memcpy
+from std.memory import unsafe_memcpy, unsafe_memmove
 
 from dromos.bgzf import MappedFile, load_zstd, zstd_decompress
 from dromos.contig import Contig, Reference
@@ -31,6 +31,9 @@ from dromos.stream import imm_untracked, mut_untracked, untracked
 
 comptime MAGIC = "PGSITES2"
 comptime INDEX_FIELDS = 9
+comptime WINDOW_BUFFER = 8 << 20
+comptime _ZSTD_D_WINDOW_LOG_MAX = 100
+"""The bytes of a block surject's windows are read from at a time."""
 comptime BLOCK_BP = 100_000
 comptime BLOCK_BYTES = 4 << 20
 comptime OWN_BLOCK_BYTES = 1 << 20
@@ -171,22 +174,79 @@ def load_windows(path: String, contig: Contig, map: RefMap) raises -> List[Windo
     var index_at = _u64(p, n - 8)
     var count = _u64(p, index_at)
     var all = List[Window]()
-    var raw = List[UInt8]()
-    for b in range(count):
-        var e = index_at + 8 + b * INDEX_FIELDS * 8
-        var offset = _u64(p, e + 3 * 8)
-        var compressed = _u64(p, e + 4 * 8)
-        var raw_length = _u64(p, e + 5 * 8)
-        raw.resize(unsafe_uninit_length=raw_length)
-        zstd_decompress(lib, Span(unsafe_ptr=p.unsafe_offset(offset), length=compressed), raw.unsafe_ptr(), raw_length)
-        var q = raw.unsafe_ptr().as_imm()
-        var at = 0
-        while at < raw_length:
-            var hit = external_call["memchr", Int](q.unsafe_offset(at), Int32(ord("\n")), raw_length - at)
-            var end = raw_length if hit == 0 else hit - Int(q)
-            if end > at:
-                _snarl(contig, map, q, at, end, all)
-            at = end + 1
+    # Each block streamed through a buffer of WINDOW_BUFFER bytes: its whole lines read there, and of a line longer
+    # than the buffer (a giant record) the ID at its start, the rest passed over.
+    var dctx = lib.get_function[Int]("ZSTD_createDCtx")()
+    if dctx == 0:
+        raise Error("zstd: no decompression context")
+    # Catalog frames may use long-distance windows past the streaming default (2^27): allow zstd's largest.
+    _ = lib.get_function[Int]("ZSTD_DCtx_setParameter")(dctx, Int32(_ZSTD_D_WINDOW_LOG_MAX), Int32(31))
+    var buffer = List[UInt8](length=WINDOW_BUFFER, fill=0)
+    var q = buffer.unsafe_ptr().as_imm()
+    var input = List[Int](length=3, fill=0)
+    var output = List[Int](length=3, fill=0)
+    var stream = lib.get_function[Int]("ZSTD_decompressStream")
+    var is_error = lib.get_function[UInt32]("ZSTD_isError")
+    var reset = lib.get_function[Int]("ZSTD_DCtx_reset")
+    try:
+        for b in range(count):
+            var e = index_at + 8 + b * INDEX_FIELDS * 8
+            var offset = _u64(p, e + 3 * 8)
+            var compressed = _u64(p, e + 4 * 8)
+            var raw_length = _u64(p, e + 5 * 8)
+            if is_error(reset(dctx, Int32(1))) != 0:
+                raise Error("zstd: a context did not reset")
+            input[0] = Int(p.unsafe_offset(offset))
+            input[1] = compressed
+            input[2] = 0
+            var have = 0
+            var skipping = False
+            var produced = 0
+            while True:
+                output[0] = Int(buffer.unsafe_ptr())
+                output[1] = WINDOW_BUFFER
+                output[2] = have
+                var left = stream(dctx, output.unsafe_ptr(), input.unsafe_ptr())
+                if is_error(left) != 0:
+                    raise Error(t"{path}: a block does not inflate (zstd error {-left})")
+                var filled = output[2]
+                produced += filled - have
+                var at = 0
+                while at < filled:
+                    var hit = external_call["memchr", Int](q.unsafe_offset(at), Int32(ord("\n")), filled - at)
+                    if hit == 0:
+                        break
+                    var end = hit - Int(q)
+                    if skipping:
+                        skipping = False
+                    elif end > at:
+                        _snarl(contig, map, q, at, end, all)
+                    at = end + 1
+                var tail = filled - at
+                if skipping:
+                    tail = 0
+                elif tail == WINDOW_BUFFER:
+                    # A line longer than the buffer: its ID is in the buffered start; the rest is passed over.
+                    _snarl(contig, map, q, 0, tail, all)
+                    skipping = True
+                    tail = 0
+                if tail > 0 and at > 0:
+                    var dst = mut_untracked(buffer.unsafe_ptr())
+                    var src = imm_untracked(buffer.unsafe_ptr()).unsafe_offset(at)
+                    unsafe_memmove(dest=dst, src=src, count=tail)
+                var grew = filled > have
+                have = tail
+                if left == 0 and input[2] == input[1]:
+                    break
+                if not grew and input[2] == input[1]:
+                    raise Error(t"{path}: a block ends early")
+            # The block's last line, without a newline.
+            if have > 0 and not skipping:
+                _snarl(contig, map, q, 0, have, all)
+            if produced != raw_length:
+                raise Error(t"{path}: a block's size differs from its index")
+    finally:
+        _ = lib.get_function[Int]("ZSTD_freeDCtx")(dctx)
     # The file is read through `p`, untracked: it stays mapped until here.
     _ = file^
 
