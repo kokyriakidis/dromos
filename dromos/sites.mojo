@@ -72,8 +72,8 @@ comptime LONG_BYTES = 1 << 20
 comptime MT_BYTES = 16 << 20
 """A column longer than this is compressed with zstd's own threads (whose output does not depend on how many)."""
 comptime DEFAULT_LEVEL = 9
-comptime META_LEVEL = 19
-"""The header's and the index's zstd level (small frames, read once)."""
+comptime META_LEVEL = 9
+"""The header's and the index's zstd level: 19 makes the HPRC index 2% smaller in 17 times as long (7.9 s)."""
 comptime MAX_SITE = 500
 """The most reference bases a snarl's window may span before padding."""
 comptime WINDOW_PAD = 10
@@ -528,7 +528,7 @@ struct Md5(Movable):
 
     def _block(mut self, p: ImmPointer[UInt8, _]):
         var m = SIMD[DType.uint32, 16]()
-        for i in range(16):
+        comptime for i in range(16):
             m[i] = (
                 UInt32(p[unsafe_offset=4 * i])
                 | (UInt32(p[unsafe_offset=4 * i + 1]) << 8)
@@ -539,21 +539,17 @@ struct Md5(Movable):
         var b = self.state[1]
         var c = self.state[2]
         var d = self.state[3]
-        for i in range(64):
+        comptime for i in range(64):
             var f: UInt32
-            var g: Int
-            if i < 16:
+            comptime if i < 16:
                 f = (b & c) | (~b & d)
-                g = i
             elif i < 32:
                 f = (d & b) | (~d & c)
-                g = (5 * i + 1) & 15
             elif i < 48:
                 f = b ^ c ^ d
-                g = (3 * i + 5) & 15
             else:
                 f = c ^ (b | ~d)
-                g = (7 * i) & 15
+            comptime g = i if i < 16 else ((5 * i + 1) & 15 if i < 32 else ((3 * i + 5) & 15 if i < 48 else (7 * i) & 15))
             f = f + a + _MD5_K[i] + m[g]
             a = d
             d = c

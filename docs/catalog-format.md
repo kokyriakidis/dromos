@@ -206,4 +206,4 @@ filling has one of its own, or it falls in another `build.block_bp` (100,000) wi
 already add up to `build.block_bytes` (4 MiB, newlines counted). These are pgcatalog's PGSITES2 rules: the blocks are
 its blocks. A column over 1 MiB is compressed with long-distance matching and a window as long as it (2^20 to 2^31),
 one over 16 MiB with zstd's own threads (whose output does not depend on how many); a column is stored as it is when
-zstd does not make it smaller. The header and index are compressed at level 19 with checksums.
+zstd does not make it smaller. The header and index are compressed at level 9 with checksums.

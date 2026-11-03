@@ -9,7 +9,7 @@ forward GBWT search, its alleles (the reference, then distinct sequences, most h
 ancestors built so far; records are placed in blocks (pgcatalog's: BLOCK_BP windows, BLOCK_BYTES of text) and each
 sealed block encoded as the catalog's columns (`encode_block`), in parallel. Each step builds one batch while the
 blocks sealed so far are encoded; threads with nothing left in a step build later batches. Heavy snarls are searched
-ahead by the pool's workers when they have nothing else to do, their haplotypes in parts; a record whose line would
+ahead by the pool's workers when the contig's steps leave them free, their haplotypes in parts; a record whose line would
 be longer than STREAM_BYTES is encoded as a job of its own. Every parallel step is a job of the pool (pool.mojo), so
 several contigs can be built at once on the same workers.
 
@@ -644,6 +644,12 @@ struct Builder(Movable):
     var order: List[Int]
     var text_a: List[UInt8]
     var text_b: List[UInt8]
+    var ref_walk: List[UInt64]
+    var kept: List[Int]
+    var kept_len: List[Int]
+    var kept_hash: List[UInt64]
+    var kept_hashed: List[Bool]
+    """`finish`'s buffers, kept from record to record."""
 
     def __init__(out self) raises:
         self.searcher = Searcher()
@@ -652,6 +658,11 @@ struct Builder(Movable):
         self.order = List[Int]()
         self.text_a = List[UInt8]()
         self.text_b = List[UInt8]()
+        self.ref_walk = List[UInt64]()
+        self.kept = List[Int]()
+        self.kept_len = List[Int]()
+        self.kept_hash = List[UInt64]()
+        self.kept_hashed = List[Bool]()
 
     def build(mut self, graph: Graph, r: ReferencePath, sn: Snarl, t: Traversal, mut out: Record) raises:
         """The record of a snarl the reference passes through (record.rs `build_record`); not present when every
@@ -706,7 +717,8 @@ struct Builder(Movable):
         """The record from the snarl's haplotype walks, in `found`."""
         out.present = False
         # The reference's walk, in the snarl's orientation.
-        var ref_walk = List[UInt64]()
+        ref ref_walk = self.ref_walk
+        ref_walk.clear()
         if t.backward:
             for k in range(t.s0, t.e0 - 1, -1):
                 ref_walk.append(r.steps[k] ^ 1)
@@ -765,10 +777,14 @@ struct Builder(Movable):
         var ref_len = _walk_length(graph, ref_span)
         # Kept walks: index into `found` (-1: the reference), length, hash once needed. Equal sequences have equal
         # lengths, so only walks as long as a kept one are hashed, and equal hashes confirmed byte by byte.
-        var kept = List[Int]()
-        var kept_len = List[Int]()
-        var kept_hash = List[UInt64]()
-        var kept_hashed = List[Bool]()
+        ref kept = self.kept
+        ref kept_len = self.kept_len
+        ref kept_hash = self.kept_hash
+        ref kept_hashed = self.kept_hashed
+        kept.clear()
+        kept_len.clear()
+        kept_hash.clear()
+        kept_hashed.clear()
         kept.append(-1)
         kept_len.append(ref_len)
         kept_hash.append(0)
@@ -946,8 +962,9 @@ comptime LOOKAHEAD = 8
 comptime HEAVY_SPAN = 50_000
 comptime HEAVY_NODES = 2_000
 """Snarls spanning at least HEAVY_SPAN reference bases, or HEAVY_NODES node ids (a graph's ids run along it, so the
-nodes between a snarl's boundaries), are heavy: their haplotypes are searched ahead of their turn, by helper threads
-from the start of the contig, split into parts (each a range of the haplotypes) that threads take one at a time."""
+nodes between a snarl's boundaries), are heavy: their haplotypes are searched ahead of their turn from the start of the
+contig, split into parts (each a range of the haplotypes), by the pool's workers when the contig's steps leave them
+any (a job ranked after those steps, before later contigs' jobs)."""
 
 comptime _PART = 0
 comptime _HEAVY = 1
@@ -1114,20 +1131,25 @@ def _at_visit(r: Record, k: Int, i: Int) -> UInt64:
 
 struct IdIndex(Movable):
     """Node ids to their index in a block's node table: open addressing (linear probing) over a power-of-two table
-    kept at most half full, its slots' keys id + 1 (0: empty)."""
+    kept at most half full, its slots' keys id + 1 (0: empty). The table keeps the size its largest block needed;
+    `clear` empties only the slots used."""
 
     var keys: List[UInt64]
     var values: List[UInt32]
     var used: Int
+    var filled: List[Int]
+    """The slots holding a key."""
 
     def __init__(out self):
         self.keys = List[UInt64](length=1024, fill=0)
         self.values = List[UInt32](length=1024, fill=0)
         self.used = 0
+        self.filled = List[Int]()
 
     def clear(mut self):
-        for i in range(len(self.keys)):
-            self.keys[i] = 0
+        for at in self.filled:
+            self.keys[at] = 0
+        self.filled.clear()
         self.used = 0
 
     @always_inline
@@ -1141,6 +1163,7 @@ struct IdIndex(Movable):
         self.keys = List[UInt64](length=2 * len(old_keys), fill=0)
         self.values = List[UInt32](length=2 * len(old_keys), fill=0)
         self.used = 0
+        self.filled.clear()
         for i in range(len(old_keys)):
             if old_keys[i] != 0:
                 _ = self.insert(old_keys[i] - 1, old_values[i])
@@ -1161,6 +1184,7 @@ struct IdIndex(Movable):
                 self.keys[at] = key
                 self.values[at] = value
                 self.used += 1
+                self.filled.append(at)
                 return True
             at = (at + 1) & mask
 
@@ -1485,6 +1509,8 @@ struct _Batch(Movable):
     var hi: Int
     var records: List[Record]
     var items: List[_Item]
+    var cheapest: List[Int]
+    """Its records but the heavy snarls', the narrowest first: the order they fill steps' ends in."""
 
     def __init__(out self, lo: Int, hi: Int):
         self.lo = lo
@@ -1493,6 +1519,21 @@ struct _Batch(Movable):
         for _ in range(hi - lo):
             self.records.append(Record())
         self.items = List[_Item]()
+        self.cheapest = List[Int]()
+
+    def order(mut self, widths: List[Int], heavy_of: List[Int]):
+        """Sorts `cheapest` (once, when the batch is first looked ahead to)."""
+        for k in range(self.lo, self.hi):
+            if heavy_of[k] < 0:
+                self.cheapest.append(k - self.lo)
+        var w = untracked(widths.unsafe_ptr().unsafe_offset(self.lo))
+
+        def narrower(a: Int, b: Int) {w} -> Bool:
+            var wa = w[unsafe_offset=a]
+            var wb = w[unsafe_offset=b]
+            return wa < wb or (wa == wb and a < b)
+
+        sort(Span(self.cheapest), narrower)
 
 
 struct _StepTask(PoolTask):
@@ -1828,7 +1869,7 @@ struct ContigPlan(Movable):
             len(self.regions),
             mut_untracked(self.bad.unsafe_ptr()),
         )
-        pool[].run(pass1, (n + TRAVERSE_SPAN - 1) // TRAVERSE_SPAN, 0, rank)
+        pool[].run(pass1, (n + TRAVERSE_SPAN - 1) // TRAVERSE_SPAN, 0, 2 * rank)
         if self.bad[0] != 0:
             raise Error(t"{r.chrom}: the graph could not be searched")
         self.refs = List[RefTrav]()
@@ -1901,7 +1942,8 @@ struct ContigPlan(Movable):
             )
         )
         if parts > 0:
-            self.helper_job = pool[].submit(self.helpers[], parts, 1, rank)
+            # After the contig's own steps, before the jobs of contigs started later.
+            self.helper_job = pool[].submit(self.helpers[], parts, 0, 2 * rank + 1)
         self.timing.lap(3)
 
     def shared(mut self, graph: Graph) -> _Shared:
@@ -1992,6 +2034,7 @@ def run_steps(graph: Graph, var plan: ContigPlan, level: Int, threads: Int) rais
     for step in range(batches + 1):
         while len(futures) < LOOKAHEAD and made < batches:
             futures.append(OwnedPointer(_Batch(plan.bounds[made], plan.bounds[made + 1])))
+            futures[len(futures) - 1][].order(plan.widths, plan.heavy_of)
             made += 1
         if step == batches:
             w.seal()
@@ -2031,19 +2074,10 @@ def run_steps(graph: Graph, var plan: ContigPlan, level: Int, threads: Int) rais
         for f in range(len(futures)):
             var address = Int(futures[f].ptr())
             ref fb = futures[f][]
-            var first = len(fill)
-            for k in range(fb.lo, fb.hi):
-                if plan.heavy_of[k] < 0 and not fb.records[k - fb.lo].built:
-                    fill.append(k - fb.lo)
+            for k in fb.cheapest:
+                if not fb.records[k].built:
+                    fill.append(k)
                     fill_batch.append(address)
-            var fb_widths = imm_untracked(plan.widths.unsafe_ptr().unsafe_offset(fb.lo))
-
-            def narrower(a: Int, b: Int) {fb_widths} -> Bool:
-                var wa = fb_widths[unsafe_offset=a]
-                var wb = fb_widths[unsafe_offset=b]
-                return wa < wb or (wa == wb and a < b)
-
-            sort(Span(fill)[first:], narrower)
         var fill_next = Atomic[Int64](0)
         var left = Atomic[Int64](Int64(len(jobs)))
         var next = Atomic[Int64](0)
@@ -2064,7 +2098,7 @@ def run_steps(graph: Graph, var plan: ContigPlan, level: Int, threads: Int) rais
             mut_untracked(Pointer(to=left)),
         )
         plan.timing.lap(4)
-        plan.pool[].run(task, min(threads, len(jobs)), 0, plan.rank)
+        plan.pool[].run(task, min(threads, len(jobs)), 0, 2 * plan.rank)
         plan.timing.lap(5)
         # The tasks reach these through untracked pointers: reads after them keep them alive until they are done.
         _ = len(jobs) + len(builders) + Int(next.load()) + chrom.byte_length()
@@ -2095,7 +2129,7 @@ def run_steps(graph: Graph, var plan: ContigPlan, level: Int, threads: Int) rais
                         _GiantTask(sh.graph, item^, level, threads, mut_untracked(giants[len(giants) - 1].ptr()))
                     )
                 )
-                giant_jobs.append(plan.pool[].submit(giant_tasks[len(giant_tasks) - 1][], 1, 0, plan.rank))
+                giant_jobs.append(plan.pool[].submit(giant_tasks[len(giant_tasks) - 1][], 1, 0, 2 * plan.rank))
         cur = futures.pop(0) if len(futures) > 0 else OwnedPointer(_Batch(0, 0))
         plan.timing.lap(4)
     return ContigTail(plan^, w^, giants^, giant_tasks^, giant_jobs^, records_written)

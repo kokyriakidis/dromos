@@ -10,6 +10,9 @@ later). The job table is kept under a spin lock, taken only to pick an index and
 
 from std.atomic import Atomic
 from std.ffi import external_call
+from std.os import getenv
+from std.sys import stderr
+from std.time import perf_counter_ns
 
 from dromos.parallel import MAX_THREADS
 
@@ -55,25 +58,37 @@ struct Pool(Movable):
     its address. `close` stops them once every job is done."""
 
     var jobs: List[_Job]
+    var top: Int
+    """One past the last live job's slot (under the lock): the slots a worker looks through."""
+    var waiting: Atomic[Int64]
+    """Indices of live jobs not yet taken: idle workers look here, without the lock."""
     var lock: Atomic[Int64]
     var stopping: Atomic[Int64]
     var threads: Int
     var handles: List[UInt64]
     var starts: List[_Start]
     """What each worker is started with: the pool and its number (kept here, so it outlives the worker)."""
+    var busy: List[Int]
+    """Per worker, the nanoseconds spent running indices (reported with DROMOS_TIMING)."""
+    var started: Int
 
     def __init__(out self, threads: Int):
         self.jobs = List[_Job]()
         for _ in range(MAX_JOBS):
             self.jobs.append(_Job(_nothing, 0, 0, 0, 0, 0, 0, False))
+        self.top = 0
+        self.waiting = Atomic[Int64](0)
         self.lock = Atomic[Int64](0)
         self.stopping = Atomic[Int64](0)
         self.threads = max(min(threads, MAX_THREADS), 1)
         self.handles = List[UInt64]()
         self.starts = List[_Start]()
+        self.busy = List[Int](length=self.threads, fill=0)
+        self.started = perf_counter_ns()
 
     def start(mut self):
         """Starts the workers (the pool must be where it stays)."""
+        self.started = perf_counter_ns()
         var at = Int(Pointer(to=self))
         self.starts = List[_Start](capacity=self.threads)
         for w in range(self.threads):
@@ -106,6 +121,8 @@ struct Pool(Movable):
             for s in range(MAX_JOBS):
                 if not self.jobs[s].live:
                     self.jobs[s] = _Job(_run_one[T], Int(Pointer(to=task)), count, 0, 0, priority, rank, True)
+                    self.top = max(self.top, s + 1)
+                    _ = self.waiting.fetch_add(Int64(count))
                     self._release()
                     return s
             self._release()
@@ -119,6 +136,8 @@ struct Pool(Movable):
             ref j = self.jobs[slot]
             if j.done >= j.count:
                 j.live = False
+                while self.top > 0 and not self.jobs[self.top - 1].live:
+                    self.top -= 1
                 self._release()
                 return
             self._release()
@@ -129,6 +148,7 @@ struct Pool(Movable):
         """No index of the job in `slot` not yet taken will be; waits for those taken, and frees the slot."""
         self._acquire()
         ref j = self.jobs[slot]
+        _ = self.waiting.fetch_sub(Int64(j.count - j.next))
         j.done += j.count - j.next
         j.count = j.next
         self._release()
@@ -144,9 +164,11 @@ struct Pool(Movable):
 
     def _take(mut self) -> Tuple[_Runner, Int, Int, Int]:
         """The next index to run: (runner, task, index, slot); slot -1 when there is none."""
+        if self.waiting.load() <= 0:
+            return (_nothing, 0, 0, -1)
         self._acquire()
         var best = -1
-        for s in range(MAX_JOBS):
+        for s in range(self.top):
             ref j = self.jobs[s]
             if j.live and j.next < j.count:
                 if best < 0:
@@ -161,6 +183,7 @@ struct Pool(Movable):
         ref j = self.jobs[best]
         var index = j.next
         j.next += 1
+        _ = self.waiting.fetch_sub(1)
         var out = (j.runner, j.task, index, best)
         self._release()
         return out
@@ -176,6 +199,16 @@ struct Pool(Movable):
         for h in self.handles:
             _ = external_call["pthread_join", Int32](h, Int(0))
         self.handles.clear()
+        if getenv("DROMOS_TIMING"):
+            var busy = 0
+            for b in self.busy:
+                busy += b
+            var wall = Float64(perf_counter_ns() - self.started) * 1e-9
+            print(
+                t"dromos timing: pool: {self.threads} workers, {wall} s, busy {Float64(busy) * 1e-9} worker-s"
+                t" ({Float64(busy) * 1e-9 / (wall * Float64(self.threads)) * 100.0}%)",
+                file=stderr,
+            )
 
     def __deinit__(deinit self):
         self.stopping.store(1)
@@ -191,7 +224,9 @@ def _worker(arg: MutOpaquePointer[MutUntrackedOrigin]) abi("C") -> MutOpaquePoin
     while True:
         var t = pool[]._take()
         if t[3] >= 0:
+            var t0 = perf_counter_ns()
             t[0](t[1], t[2], worker)
+            pool[].busy[worker] += perf_counter_ns() - t0
             pool[]._done(t[3])
             naps = 0
             continue
