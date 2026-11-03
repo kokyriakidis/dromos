@@ -78,7 +78,9 @@ contig's catalog returns for that region).
 
 The MD5 is of the contig's reference sequence as the graph spells it: the reference path's fragments laid at their
 offsets, each node's letters in capitals (reverse-complemented when the path visits it backwards), and `N` where no
-fragment lies; this is SAM's M5 of the reference contig.
+fragment lies, `length` letters in all. Where the path spells the whole contig it is the reference FASTA's SAM M5
+(HPRC v2.1's chr20 has CHM13's f1a31f30d3da50893470ff47bf0b5a38; its chrY path stops 4.8 Mb short of CHM13's chrY, so
+its MD5 is that of the 57.7 Mb the graph has).
 
 Properties (all values are text; a reader should ignore keys it does not know):
 
@@ -134,7 +136,8 @@ A block's bytes are its 13 columns, one after another in column order, each stor
 - otherwise one zstd frame of the compressed size, decompressing to the raw size.
 
 Column c starts at `offset + Σ compressed sizes of the columns before it`. A reader decompresses only the columns it
-needs (the letters, columns 9 to 12, for alleles alone).
+needs: positions and IDs need columns 0 to 3; walks 4 to 6 and the node ids (9); alleles also the lengths and letters
+(10 to 12), which hold most of a block's bytes.
 
 Records within a block are in file order (POS, then the ID's text in byte order). Each column below is read in
 record order; "per record" values appear once per record, "per walk" values once per walk of each record, and so on.
