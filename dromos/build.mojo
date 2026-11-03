@@ -1,17 +1,20 @@
-"""`dromos catalog` (pgcatalog's build.rs, ported): catalogs for every reference contig of a graph, for chosen contigs,
-or for regions of them.
+"""`dromos catalog` (pgcatalog's build.rs, ported, into one file): the graph's site catalog of every reference contig,
+of chosen contigs, or of regions of them.
 
 0. The reference paths come from the GBZ's path metadata, read alone.
-1. Snarls come from each contig's connected component alone: one `vg chunk -C` pass extracts the components of the
-   contigs not yet in the snarls cache, and `vg snarls` runs on several at once (it uses about one core each).
-   Whole-genome snarls would make every contig pay for the genome: vg enumerates a snarl's haplotypes before
-   checking which contig it is on.
-2. The graph's parts are read once (the GBWT, and the node letters' pieces, unpacked as they are needed), then each
-   selection is built (catalog.mojo).
+1. Snarls come from the graph's distance index (dist.mojo; GRAPH.dist beside the graph unless told otherwise), checked
+   against the graph, or from vg snarls of each contig's connected component, cached: one `vg chunk -C` pass extracts
+   the components of the contigs not yet in the snarls cache, and `vg snarls` runs on several at once (it uses about
+   one core each). Whole-genome snarls would make every contig pay for the genome: vg enumerates a snarl's haplotypes
+   before checking which contig it is on. `SnarlSource` is the one interface to both.
+2. The graph's parts are read once (the GBWT, and the node letters' pieces, unpacked as they are needed), then the
+   contigs are built CONTIGS_AT_ONCE at a time, the biggest first, their steps on one pool of workers (catalog.mojo),
+   and written into one file in their order (sites.mojo).
 
-The cache records the graph's fingerprint and refuses another graph's snarls.
+The snarls cache records the graph's fingerprint and refuses another graph's snarls.
 """
 
+from std.atomic import Atomic
 from std.ffi import OwnedDLHandle, external_call
 from std.memory import OwnedPointer
 from std.os import getenv, listdir, makedirs, remove, rmdir
@@ -21,9 +24,24 @@ from std.sys.info import CompilationTarget
 from std.time import perf_counter_ns
 
 from dromos.bgzf import RawFile
-from dromos.catalog import ContigPlan, ContigTail, Graph, ReferencePath, Summary, finish_catalog, run_steps
-from dromos.graph import Metadata, fingerprint, reference_paths, resolve_reference_sample
+from dromos.catalog import ContigPlan, Graph, ReferencePath, finish_catalog, run_steps
+from dromos.dist import CHAIN, ORIENTATION, DistIndex
+from dromos.graph import Metadata, fingerprint, graph_tags, reference_paths, resolve_reference_sample
+from dromos.sites import (
+    BLOCK_BP,
+    BLOCK_BYTES,
+    DEFAULT_LEVEL,
+    DROMOS_VERSION,
+    OWN_BLOCK_BYTES,
+    ContigEntry,
+    EncodedBlock,
+    Md5,
+    SitesWriter,
+    put_oriented,
+)
+from dromos.snarls import Snarl, read_snarls
 from dromos.parallel import Background, ParallelTask
+from dromos.pool import Pool
 from dromos.stream import mut_untracked, untracked
 from dromos.output import OutFile, write_all
 
@@ -35,6 +53,7 @@ comptime WORK_PREFIX = ".dromos-work-"
 struct BuildOptions(Movable):
     var graph: String
     var out: String
+    var dist: Optional[String]
     var reference_sample: Optional[String]
     var regions: List[String]
     var snarls_jobs: Optional[Int]
@@ -46,13 +65,14 @@ struct BuildOptions(Movable):
     def __init__(out self):
         self.graph = String()
         self.out = String()
+        self.dist = None
         self.reference_sample = None
         self.regions = List[String]()
         self.snarls_jobs = None
         self.snarls_cache = None
         self.vg = String("vg")
         self.threads = 1
-        self.level = 6
+        self.level = DEFAULT_LEVEL
 
 
 @fieldwise_init
@@ -66,6 +86,9 @@ struct _Log:
 
     def __init__(out self):
         self.t0 = perf_counter_ns()
+
+    def __init__(out self, t0: Int):
+        self.t0 = t0
 
     def __call__[W: Writable](self, message: W):
         var s = Float64(perf_counter_ns() - self.t0) * 1e-9
@@ -327,6 +350,14 @@ def _compute_snarls_in(
     ]
     if not _wait(_spawn(chunk, "/dev/null")):
         raise Error(t"{o.vg} chunk failed")
+    # The vg the snarls come from, for the catalog's header.
+    var version: List[String] = [o.vg, "version"]
+    if _wait(_spawn(version, work + "/vg.version")):
+        var text = _read_text(work + "/vg.version")
+        if text:
+            var lines = text.value().split("\n")
+            if len(lines) > 0:
+                _write_text(cache + "/vg.version", String(lines[0]) + "\n")
     # Then each component's snarls, up to --snarls-jobs at once, a job starting only if the running jobs' and its
     # own predicted peaks fit in the memory available (one job always may).
     var ready = List[Tuple[String, String, Int]]()
@@ -401,11 +432,12 @@ def _compute_snarls(
     paths: List[Tuple[String, List[String]]],
     contigs: List[String],
     cache: String,
+    folder: String,
 ) raises:
-    """Computes the snarls of `contigs` into the cache, in a work folder under --out that is removed afterwards, also
-    when a step fails (it holds the contigs' graphs: 24 GB for HPRC v2.1)."""
-    remove_abandoned_work(o.out)
-    var work = o.out + "/" + WORK_PREFIX + String(external_call["getpid", Int32]())
+    """Computes the snarls of `contigs` into the cache, in a work folder beside the catalog that is removed
+    afterwards, also when a step fails (it holds the contigs' graphs: 24 GB for HPRC v2.1)."""
+    remove_abandoned_work(folder)
+    var work = folder + "/" + WORK_PREFIX + String(external_call["getpid", Int32]())
     makedirs(work, exist_ok=True)
     try:
         _compute_snarls_in(log, o, sample, paths, contigs, cache, work)
@@ -422,203 +454,502 @@ def _read_text(path: String) -> Optional[String]:
         return None
 
 
+def _write_text(path: String, text: String) raises:
+    var f = OutFile(path)
+    f.put(text.as_bytes(), 0)
+    f.close()
+
+
+def _base_name(path: String) -> String:
+    var slash = path.rfind("/")
+    return String(path[byte = slash + 1 :]) if slash >= 0 else path
+
+
+def _folder(path: String) -> String:
+    var slash = path.rfind("/")
+    if slash < 0:
+        return String(".")
+    return String(path[byte=:slash]) if slash > 0 else String("/")
+
+
+def graph_stem(graph: String) -> String:
+    """The graph's path without its .gbz."""
+    return String(graph[byte = : graph.byte_length() - 4]) if graph.endswith(".gbz") else graph
+
+
+def _selection_tag(s: Selection) -> String:
+    if s.region:
+        return String(t"{s.contig}_{s.region.value()[0]}-{s.region.value()[1]}")
+    return s.contig
+
+
+def catalog_path(o: BuildOptions, sample: String) -> String:
+    """Where the catalog goes: GRAPH.SAMPLE.sites beside the graph (GRAPH.SAMPLE.chr20_1-1000.sites for regions, a
+    tag each, joined by +); under --out if it is a folder (or ends with /), else at --out."""
+    var name = graph_stem(o.graph) + "." + sample
+    if len(o.regions) > 0:
+        var tags = List[String]()
+        for r in o.regions:
+            try:
+                tags.append(_selection_tag(parse_region(r, sample)))
+            except:
+                tags.append(r)
+        name += "." + "+".join(tags)
+    name += ".sites"
+    if not o.out:
+        return name
+    if o.out.endswith("/") or isdir(o.out):
+        return o.out.rstrip("/") + "/" + _base_name(name) if o.out != "/" else "/" + _base_name(name)
+    return o.out
+
+
+comptime VG_SNARLS = 0
+comptime DIST_SNARLS = 1
+
+
+struct SnarlSource(Movable):
+    """Where a contig's snarls come from: vg snarls files (a folder of <contig>.snarls, made by vg chunk and vg
+    snarls when missing), or the graph's distance index (dist.mojo). A snarls source computed in dromos itself would
+    be a third kind here."""
+
+    var kind: Int
+    var cache: String
+    var dist: Optional[DistIndex]
+
+    def __init__(out self, cache: String):
+        self.kind = VG_SNARLS
+        self.cache = cache
+        self.dist = None
+
+    def __init__(out self, var dist: DistIndex):
+        self.kind = DIST_SNARLS
+        self.cache = String()
+        self.dist = dist^
+
+    def read(self, graph: Graph, r: ReferencePath, threads: Int) raises -> List[Snarl]:
+        """The snarls of `r`'s contig (its connected component)."""
+        var contig = String(r.chrom[byte = r.chrom.rfind("#") + 1 :])
+        if self.kind == VG_SNARLS:
+            return read_snarls(self.cache + "/" + contig + ".snarls", threads)
+        ref d = self.dist.value()
+        if len(r.steps) == 0:
+            return List[Snarl]()
+        var top = d.top(Int(r.steps[0] >> 1))
+        var last = d.top(Int(r.steps[len(r.steps) - 1] >> 1))
+        if last != top:
+            raise Error(t"{d.path}: {r.chrom} runs through two components of the distance index: another graph's?")
+        check_chain_edges(d, graph, top, r.chrom)
+        var out = List[Snarl]()
+        d.snarls(top, out)
+        return out^
+
+    def props(self, mut out: List[Tuple[String, String]]):
+        if self.kind == DIST_SNARLS:
+            ref d = self.dist.value()
+            out.append(("snarls.source", "distance index"))
+            out.append(("snarls.file", _base_name(d.path)))
+            out.append(("snarls.dist.version", String(d.version)))
+            out.append(("snarls.dist.bytes", String(d.file.size)))
+            out.append(("snarls.orientation", ORIENTATION))
+        else:
+            out.append(("snarls.source", "vg snarls"))
+            var v = _read_text(self.cache + "/vg.version")
+            out.append(("snarls.vg", String(v.value().strip()) if v else String("unknown (snarls found cached)")))
+            out.append(("snarls.orientation", "vg snarls'"))
+
+
+def check_dist(d: DistIndex, graph: Graph) raises:
+    """Refuses a distance index whose node ids are not the graph's: the same smallest and largest id and the same
+    number of nodes."""
+    var g = graph.parts.node_range()
+    var count = d.node_count()
+    if d.min_id != g[1] or d.max_id() != g[2] or count != g[0]:
+        raise Error(
+            t"{d.path} is not this graph's distance index: it holds {count} nodes, ids {d.min_id} to {d.max_id()};"
+            t" the graph {g[0]} nodes, ids {g[1]} to {g[2]}"
+        )
+
+
+def check_chain_edges(d: DistIndex, graph: Graph, top: Int, chrom: String) raises:
+    """Refuses a distance index whose top-level chain (the one `chrom` runs along) steps between nodes the graph has
+    no edge between: each pair of consecutive chain nodes with no snarl between them is one of the graph's edges."""
+    var words = List[UInt64]()
+    var snarl_at = List[Int]()
+    if d.kind(top) < CHAIN:
+        return
+    d.chain_words(top, words, snarl_at)
+    var skip = List[Bool](length=len(words) + 1, fill=False)
+    for i in range(len(snarl_at) // 2):
+        skip[snarl_at[2 * i + 1]] = True
+    var froms = List[UInt64]()
+    var tos = List[UInt64]()
+    var succ = List[UInt64]()
+    var counts = List[Int64]()
+
+    for k in range(1, len(words)):
+        if skip[k]:
+            continue
+        froms.append(words[k - 1])
+        tos.append(words[k])
+        if len(froms) == 1 << 16:
+            _check_edges(d, graph, chrom, froms, tos, succ, counts)
+    if len(froms) > 0:
+        _check_edges(d, graph, chrom, froms, tos, succ, counts)
+
+
+def _check_edges(
+    d: DistIndex,
+    graph: Graph,
+    chrom: String,
+    mut froms: List[UInt64],
+    mut tos: List[UInt64],
+    mut succ: List[UInt64],
+    mut counts: List[Int64],
+) raises:
+    """Each `froms[j]` has an edge to `tos[j]`; the lists are emptied."""
+    graph.parts.edges(froms.unsafe_ptr(), len(froms), False, succ, counts)
+    var at = 0
+    for j in range(len(froms)):
+        var n = Int(counts[j])
+        if n < 0:
+            raise Error(t"{d.path} is not this graph's distance index: node {froms[j] >> 1} is not in the graph")
+        var found = False
+        for x in range(n):
+            found = found or succ[at + x] == tos[j]
+        at += n
+        if not found:
+            raise Error(
+                t"{d.path} is not this graph's distance index: its chain along {chrom} steps from node"
+                t" {froms[j] >> 1} to {tos[j] >> 1}, which the graph does not join"
+            )
+    froms.clear()
+    tos.clear()
+
+
 def run_build(o: BuildOptions) raises:
     var log = _Log()
     var sample = resolve_reference_sample(o.graph, o.reference_sample)
     if not o.reference_sample:
         log(t"reference sample {sample} (the only one the graph declares)")
-    makedirs(o.out, exist_ok=True)
-    var cache = o.snarls_cache.value() if o.snarls_cache else o.out + "/snarls"
-    makedirs(cache, exist_ok=True)
+    var path = catalog_path(o, sample)
+    var folder = _folder(path)
+    makedirs(folder, exist_ok=True)
     var id = fingerprint(o.graph)
-    var id_file = cache + "/graph.id"
-    var cached_id = _read_text(id_file)
-    if cached_id:
-        var c = String(cached_id.value().strip())
-        if c != id:
-            raise Error(t"{cache} holds snarls of another graph ({c}); use another --snarls-cache")
-    else:
-        var f = OutFile(id_file)
-        f.put((id + "\n").as_bytes(), 0)
-        f.close()
 
     var selections = List[Selection]()
     for r in o.regions:
         selections.append(parse_region(r, sample))
+    var paths = reference_paths(o.graph, sample)
+    if len(paths) == 0:
+        raise Error(t"the graph has no {sample}#0#<contig> reference paths")
     var contigs = List[String]()
-    for s in selections:
-        var seen = False
-        for c in contigs:
-            seen = seen or c == s.contig
-        if not seen:
-            contigs.append(s.contig)
-    sort(contigs)
-    var need_paths = len(selections) == 0
+    if len(selections) == 0:
+        for p in paths:
+            contigs.append(p[0])
+    else:
+        for s in selections:
+            var seen = False
+            for c in contigs:
+                seen = seen or c == s.contig
+            if not seen:
+                contigs.append(s.contig)
+    sort(Span(contigs), natural_less)
     for c in contigs:
-        need_paths = need_paths or not isfile(cache + "/" + c + ".snarls")
-    if need_paths:
-        var paths = reference_paths(o.graph, sample)
-        if len(paths) == 0:
-            raise Error(t"the graph has no {sample}#0#<contig> reference paths")
-        if len(selections) == 0:
-            var all = List[String]()
-            for p in paths:
-                all.append(p[0])
-            sort(Span(all), natural_less)
-            for c in all:
-                selections.append(Selection(c, None))
-            contigs = all^
-        for c in contigs:
-            var known = False
-            for p in paths:
-                known = known or p[0] == c
-            if not known:
-                raise Error(t"no reference path {sample}#0#{c} in the graph")
+        var known = False
+        for p in paths:
+            known = known or p[0] == c
+        if not known:
+            raise Error(t"no reference path {sample}#0#{c} in the graph")
+    # Each contig's regions: none when it is selected whole.
+    var regions = List[List[Tuple[Int, Int]]]()
+    for c in contigs:
+        var whole = len(selections) == 0
+        var rs = List[Tuple[Int, Int]]()
+        for s in selections:
+            if s.contig == c:
+                if s.region:
+                    rs.append(s.region.value())
+                else:
+                    whole = True
+        regions.append(List[Tuple[Int, Int]]() if whole else rs^)
+
+    # The snarls: the graph's distance index, or vg snarls (cached, or made now).
+    var dist_path = o.dist
+    if not dist_path and not o.snarls_cache and isfile(graph_stem(o.graph) + ".dist"):
+        dist_path = graph_stem(o.graph) + ".dist"
+    var source: SnarlSource
+    if dist_path:
+        source = SnarlSource(DistIndex(dist_path.value()))
+        log(t"snarls from the distance index {dist_path.value()} (version {source.dist.value().version})")
+    else:
+        var cache = o.snarls_cache.value() if o.snarls_cache else graph_stem(folder + "/" + _base_name(o.graph))
+        if not o.snarls_cache:
+            cache += ".snarls"
+        makedirs(cache, exist_ok=True)
+        var id_file = cache + "/graph.id"
+        var cached_id = _read_text(id_file)
+        if cached_id:
+            var c = String(cached_id.value().strip())
+            if c != id:
+                raise Error(t"{cache} holds snarls of another graph ({c}); use another --snarls-cache")
+        else:
+            _write_text(id_file, id + "\n")
         var missing = List[String]()
         for c in contigs:
             if not isfile(cache + "/" + c + ".snarls"):
                 missing.append(c)
         if len(missing) > 0:
-            _compute_snarls(log, o, sample, paths, missing, cache)
-    log(t"{len(selections)} selection(s) on {len(contigs)} contig(s); snarls in {cache}")
+            _compute_snarls(log, o, sample, paths, missing, cache, folder)
+        source = SnarlSource(cache)
+        log(t"snarls from vg snarls in {cache}")
+    log(t"{len(contigs)} contig(s); writing {path}")
 
     var graph = Graph(o.graph, o.threads)
     log("graph loaded")
+    if source.kind == DIST_SNARLS:
+        check_dist(source.dist.value(), graph)
     var md = graph.parts.metadata()
-    # Each selection is prepared (its reference path, snarls and traversals; its heavy snarls' helpers started)
-    # while the one before is built, and finished (its giant records awaited, its last blocks written) while the one
-    # after is: three at a time.
-    var prepared = OwnedPointer(_Prepared())
-    var preparing = Background(
-        _PrepareTask(
-            untracked(Pointer(to=graph)),
-            untracked(Pointer(to=md)),
-            sample,
-            selections[0].copy(),
-            cache,
-            o.threads,
-            mut_untracked(prepared.ptr()),
-        ),
-        1,
-        1,
-    )
-    var finishing = OwnedPointer(_Finishing())
-    var finisher = Optional[Background[_FinishTask]]()
-    for i in range(len(selections)):
-        preparing.join()
-        if prepared[].error:
-            raise Error(prepared[].error)
-        var plan = prepared[].plan.take()
-        if i + 1 < len(selections):
-            prepared = OwnedPointer(_Prepared())
-            preparing = Background(
-                _PrepareTask(
-                    untracked(Pointer(to=graph)),
-                    untracked(Pointer(to=md)),
-                    sample,
-                    selections[i + 1].copy(),
-                    cache,
-                    o.threads,
-                    mut_untracked(prepared.ptr()),
-                ),
-                1,
-                1,
-            )
-        var tail = run_steps(graph, plan^, _prefix(o.out, selections[i]), o.level, o.threads)
-        if finisher:
-            finisher.value().join()
-            _report(log, finishing[], o.out)
-        finishing = OwnedPointer(_Finishing())
-        finishing[].tail = tail^
-        finishing[].selection = selections[i].copy()
-        finisher = Background(_FinishTask(mut_untracked(finishing.ptr())), 1, 1)
-    if finisher:
-        finisher.value().join()
-        _report(log, finishing[], o.out)
-    # The tasks reach the graph and its metadata through untracked pointers: uses after the last join keep them alive
-    # until every task is done.
+    var props = List[Tuple[String, String]]()
+    var nodes = graph.parts.node_range()
+    props.append(("dromos.version", DROMOS_VERSION))
+    props.append(("graph.file", _base_name(o.graph)))
+    props.append(("graph.fingerprint", id))
+    props.append(("graph.nodes", String(nodes[0])))
+    props.append(("graph.min_node", String(nodes[1])))
+    props.append(("graph.max_node", String(nodes[2])))
+    for t in graph_tags(o.graph):
+        props.append((t[0] + "." + t[1], t[2]))
+    props.append(("reference.sample", sample))
+    source.props(props)
+    props.append(("build.block_bp", String(BLOCK_BP)))
+    props.append(("build.block_bytes", String(BLOCK_BYTES)))
+    props.append(("build.own_block_bytes", String(OWN_BLOCK_BYTES)))
+    props.append(("build.level", String(o.level)))
+    var entries = List[ContigEntry]()
+    for k in range(len(contigs)):
+        entries.append(
+            ContigEntry(contigs[k], String(t"{sample}#0#{contigs[k]}"), 0, List[UInt8](), regions[k].copy(), 0, 0, 0)
+        )
+    var writer = OwnedPointer(SitesWriter(path, props^, entries^))
+    run_contigs(log, graph, md, sample, contigs, regions, source, writer[], o.level, o.threads)
+    var size = writer[].finish()
+    log(t"{path}: {size} bytes")
     _ = graph.max_node
     _ = md^
     log("done")
 
 
-def _prefix(folder: String, s: Selection) -> String:
-    if s.region:
-        return String(t"{folder}/{s.contig}_{s.region.value()[0]}-{s.region.value()[1]}")
-    return String(t"{folder}/{s.contig}")
+def reference_md5(graph: Graph, r: ReferencePath) raises -> List[UInt8]:
+    """MD5 of the contig's reference sequence (SAM's M5): its path's letters in capitals at their positions, N
+    where no fragment lies."""
+    var seq = List[UInt8](length=r.length, fill=UInt8(ord("N")))
+    var p = seq.unsafe_ptr()
+    for k in range(len(r.steps)):
+        var v = r.steps[k]
+        var s = graph.letters(Int(v >> 1))
+        put_oriented(p.unsafe_offset(r.pos[k]), s, v & 1 == 1)
+    var h = Md5()
+    h.update(Span(seq))
+    return h.digest()
 
 
-struct _Prepared(Movable):
-    var plan: Optional[ContigPlan]
-    var error: String
-
-    def __init__(out self):
-        self.plan = None
-        self.error = String()
+comptime CONTIGS_AT_ONCE = 3
+"""Contigs built at a time ($DROMOS_CONTIGS_AT_ONCE to change): their steps share the pool's workers."""
 
 
-@fieldwise_init
-struct _PrepareTask(Movable, ParallelTask):
-    """A selection prepared on a thread of its own: its reference path walked, its plan made."""
+def contig_weight(graph: Graph, md: Metadata, sample: String, contig: String, source: SnarlSource) raises -> Int:
+    """How much work a contig is, roughly, to start the biggest first: its chain's nodes in the distance index, or
+    its vg snarls file's size."""
+    if source.kind == VG_SNARLS:
+        return RawFile(source.cache + "/" + contig + ".snarls").size
+    var sample_id = md.sample_id(sample)
+    var contig_id = md.contig_id(contig)
+    if not sample_id or not contig_id:
+        return 0
+    var names = md.path_names()
+    var best = -1
+    var best_fragment = Int.MAX
+    for id in range(len(names)):
+        var p = names[id]
+        if p.sample == sample_id.value() and p.contig == contig_id.value() and p.phase == 0:
+            if p.fragment < best_fragment:
+                best = id
+                best_fragment = p.fragment
+    if best < 0:
+        return 0
+    var v = graph.parts.path_first(best)
+    ref d = source.dist.value()
+    if v == 0 or d.node_record(Int(v >> 1)) == 0:
+        return 0
+    var top = d.top(Int(v >> 1))
+    return d.entry(top + 1) if d.kind(top) >= CHAIN else 0
+
+
+struct _Shared(Movable):
+    """What every contig's driver reads, and where it writes."""
 
     var graph: ImmPointer[Graph, ImmUntrackedOrigin]
     var md: ImmPointer[Metadata, ImmUntrackedOrigin]
+    var source: ImmPointer[SnarlSource, ImmUntrackedOrigin]
     var sample: String
-    var selection: Selection
-    var cache: String
+    var contigs: List[String]
+    var regions: List[List[Tuple[Int, Int]]]
+    var order: List[Int]
+    """Contig indexes, the biggest first."""
+    var writer: MutPointer[SitesWriter, MutUntrackedOrigin]
+    var pool: MutPointer[Pool, MutUntrackedOrigin]
+    var lock: Atomic[Int64]
+    """Held while a driver hands its contig to the writer."""
+    var failed: Atomic[Int64]
+    var errors: List[String]
+    var level: Int
     var threads: Int
-    var result: MutPointer[_Prepared, MutUntrackedOrigin]
+    var t0: Int
+
+    def __init__(
+        out self,
+        graph: ImmPointer[Graph, ImmUntrackedOrigin],
+        md: ImmPointer[Metadata, ImmUntrackedOrigin],
+        source: ImmPointer[SnarlSource, ImmUntrackedOrigin],
+        sample: String,
+        var contigs: List[String],
+        var regions: List[List[Tuple[Int, Int]]],
+        var order: List[Int],
+        writer: MutPointer[SitesWriter, MutUntrackedOrigin],
+        pool: MutPointer[Pool, MutUntrackedOrigin],
+        level: Int,
+        threads: Int,
+        t0: Int,
+    ):
+        self.graph = graph
+        self.md = md
+        self.source = source
+        self.sample = sample
+        self.contigs = contigs^
+        self.regions = regions^
+        self.errors = List[String](length=len(order), fill=String())
+        self.order = order^
+        self.writer = writer
+        self.pool = pool
+        self.lock = Atomic[Int64](0)
+        self.failed = Atomic[Int64](0)
+        self.level = level
+        self.threads = threads
+        self.t0 = t0
+
+
+@fieldwise_init
+struct _ContigTask(Movable, ParallelTask):
+    """A contig's driver, on a thread of its own: the contig at `order[index]` prepared (its reference path, the MD5
+    of its sequence, its snarls, its plan), built in steps on the pool, finished and handed to the writer."""
+
+    var sh: MutPointer[_Shared, MutUntrackedOrigin]
 
     def run(self, index: Int):
+        ref sh = self.sh[]
+        if sh.failed.load() != 0:
+            return
+        var k = sh.order[index]
         try:
             var t = perf_counter_ns()
-            var r = ReferencePath(self.graph[], self.md[], self.sample, self.selection.contig, self.threads)
+            ref graph = sh.graph[]
+            var r = ReferencePath(graph, sh.md[], sh.sample, sh.contigs[k], sh.threads)
             if getenv("DROMOS_TIMING"):
                 print(
                     t"dromos timing: {r.chrom}: reference path {Float64(perf_counter_ns() - t) * 1e-9} s", file=stderr
                 )
-            var snarls = self.cache + "/" + self.selection.contig + ".snarls"
-            self.result[].plan = ContigPlan(self.graph[], r^, snarls, self.selection.region, self.threads)
+            var chrom = r.chrom
+            var length = r.length
+            var md5 = reference_md5(graph, r)
+            var snarls = sh.source[].read(graph, r, sh.threads)
+            var plan = ContigPlan(graph, r^, snarls^, sh.regions[k], sh.threads, sh.pool, index)
+            var done = finish_catalog(run_steps(graph, plan^, sh.level, sh.threads))
+            var blocks = List[EncodedBlock]()
+            swap(blocks, done[1])
+            ref sm = done[0]
+            while True:
+                var expected = Int64(0)
+                if sh.lock.compare_exchange(expected, 1):
+                    break
+                _ = external_call["usleep", Int32](UInt32(100))
+            try:
+                sh.writer[].complete(k, blocks^, md5, sm.records, length)
+            finally:
+                sh.lock.store(0)
+            var log = _Log(sh.t0)
+            log(
+                t"{chrom}: {sm.records} records from {sm.snarls} snarls ({sm.on_reference} on the reference),"
+                t" {sm.blocks} blocks, {_tenths(sm.seconds)}s"
+            )
         except e:
-            self.result[].error = String(e)
+            sh.errors[index] = String(t"{sh.contigs[k]}: {e}")
+            sh.failed.store(1)
 
 
-struct _Finishing(Movable):
-    var tail: Optional[ContigTail]
-    var selection: Selection
-    var summary: Optional[Summary]
-    var error: String
-
-    def __init__(out self):
-        self.tail = None
-        self.selection = Selection(String(), None)
-        self.summary = None
-        self.error = String()
+def _tenths(seconds: Float64) -> String:
+    var t = String(Int(seconds * 10 + 0.5))
+    if t.byte_length() == 1:
+        t = "0" + t
+    return String(t[byte = : t.byte_length() - 1]) + "." + String(t[byte = t.byte_length() - 1 :])
 
 
-@fieldwise_init
-struct _FinishTask(Movable, ParallelTask):
-    """A selection finished on a thread of its own."""
+def run_contigs(
+    log: _Log,
+    graph: Graph,
+    md: Metadata,
+    sample: String,
+    contigs: List[String],
+    regions: List[List[Tuple[Int, Int]]],
+    source: SnarlSource,
+    mut writer: SitesWriter,
+    level: Int,
+    threads: Int,
+) raises:
+    """Every contig built, CONTIGS_AT_ONCE at a time, the biggest first, each by a driver thread of its own; their
+    parallel steps run on one pool of `threads` workers, which takes a job of a contig started earlier first. The
+    writer puts the contigs in the file in their order, whatever order they finish in."""
+    var weights = List[Int]()
+    for c in contigs:
+        weights.append(contig_weight(graph, md, sample, c, source))
+    var order = List[Int]()
+    for k in range(len(contigs)):
+        order.append(k)
 
-    var slot: MutPointer[_Finishing, MutUntrackedOrigin]
+    def heavier(a: Int, b: Int) {weights} -> Bool:
+        return weights[a] > weights[b] or (weights[a] == weights[b] and a < b)
 
-    def run(self, index: Int):
-        try:
-            self.slot[].summary = finish_catalog(self.slot[].tail.take())
-        except e:
-            self.slot[].error = String(e)
-
-
-def _report(log: _Log, f: _Finishing, folder: String) raises:
-    if f.error:
-        raise Error(f.error)
-    ref sm = f.summary.value()
-    var also = " and the region" if f.selection.region else ""
-    var secs = String(Int(sm.seconds * 10 + 0.5))
-    if secs.byte_length() == 1:
-        secs = "0" + secs
-    secs = String(secs[byte = : secs.byte_length() - 1]) + "." + String(secs[byte = secs.byte_length() - 1 :])
-    log(
-        t"{_prefix(folder, f.selection)}.pgsites: {sm.records} records from {sm.snarls} snarls ({sm.on_reference} on"
-        t" the reference{also}), {sm.blocks} blocks, {secs}s"
+    sort(Span(order), heavier)
+    var at_once = CONTIGS_AT_ONCE
+    var env = getenv("DROMOS_CONTIGS_AT_ONCE")
+    if env:
+        at_once = max(Int(env), 1)
+    var pool = OwnedPointer(Pool(threads))
+    pool[].start()
+    var sh = OwnedPointer(
+        _Shared(
+            untracked(Pointer(to=graph)),
+            untracked(Pointer(to=md)),
+            untracked(Pointer(to=source)),
+            sample,
+            contigs.copy(),
+            regions.copy(),
+            order^,
+            mut_untracked(Pointer(to=writer)),
+            mut_untracked(pool.ptr()),
+            level,
+            threads,
+            log.t0,
+        )
     )
+    var drivers = Background(_ContigTask(mut_untracked(sh.ptr())), len(contigs), min(at_once, len(contigs)))
+    if len(drivers.handles) == 0:
+        raise Error("cannot start a thread")
+    drivers.join()
+    pool[].close()
+    for e in sh[].errors:
+        if e:
+            raise Error(e)
+    # The drivers reach these through untracked pointers: uses after the join keep them alive until they are done.
+    _ = graph.max_node
+    _ = source.kind
+    _ = writer.next

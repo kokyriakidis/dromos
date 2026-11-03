@@ -1,9 +1,12 @@
 """Tests: protobuf varints, GAM group framing, GAF lines against hand-worked ones, placement on the reference as
 pgcat places alignments, tabix bins as htslib numbers them, surject's alignments as pgcatalog makes them, a GBZ read
-through the gbz crate (tests/data/micb-kir3dl1.gbz, two reference samples), snarls streams, and site catalogs as
-pgcatalog writes and reads them (tests/data/micb-kir3dl1.catalog: its snarls and pgcatalog's catalogs)."""
+through the gbz crate (tests/data/micb-kir3dl1.gbz, two reference samples), snarls streams, site catalogs (their
+columns, node tables, index search and checks; tests/data/micb-kir3dl1.catalog: the small graph's vg snarls and
+pgcatalog view's text of pgcatalog's catalogs of it), and snarls from a distance index (tests/data/micb-kir3dl1.dist,
+vg 1.73's)."""
 
-from std.memory import bitcast
+from std.memory import OwnedPointer, bitcast
+from std.os import getenv
 from std.random import random_ui64, seed
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
 
@@ -35,14 +38,41 @@ from dromos.graph import (
     resolve_reference_sample,
 )
 from dromos.prepare import ReferenceSample, folder_of, make_cache, name_of, pack_letters, write_nodes, write_placements
-from dromos.build import natural_less, parse_region
-from dromos.catalog import Graph, ReferencePath, Traversal, build_catalog, traversals, vcf_header
-from dromos.pgsites import Catalog, Writer, compress_sealed, records, same_contig
+from dromos.build import check_dist, natural_less, parse_region, reference_md5
+from dromos.catalog import Encoder, Graph, Placed as SitePlaced, Record, ReferencePath, Traversal, build_catalog
+from dromos.catalog import encode_block, traversals
+from dromos.dist import DistIndex
+from dromos.pool import Pool
+from dromos.sites import (
+    COLUMNS,
+    EXC,
+    NODEID,
+    NODELEN,
+    LONG_BYTES,
+    SEQ,
+    WALK,
+    ContigEntry,
+    Cursor,
+    EncodedBlock,
+    LetterPacker,
+    Md5,
+    NodeTable as SiteNodes,
+    Sites,
+    SitesWriter,
+    hex_string,
+    put_oriented,
+    put_varint,
+    records,
+    same_contig,
+    unzigzag,
+    vcf_header,
+    zigzag,
+)
 from dromos.snarls import NO_PARENT, Snarl, canonical, parse_snarls, read_snarls, snarl_name
 from dromos.gaf_text import MALFORMED, PLACED, SKIP, UNMAPPED, append_slim, classify
 from dromos.output import decimal_digits
 from dromos.bgzf import inflate_blocks, load_libdeflate, scan_blocks
-from dromos.stream import BGZF, GZIP, PLAIN, looks_like_gaf
+from dromos.stream import BGZF, GZIP, PLAIN, looks_like_gaf, mut_untracked
 from dromos.refmap import AMBIGUOUS, INCONSISTENT, MISSING_NODE, NO_ANCHOR, Anchor, Placed, RefMap
 from dromos.tabix import N_BINS, bin_level, bin_parent, reg2bin
 from dromos.linearize import (
@@ -72,6 +102,12 @@ from dromos.linearize import (
 from dromos.bam import BamIndex, RecordWriter, bam_header, csi_levels, needs_csi, nt16, record_end
 from dromos.bam_sort import BamStaging, write_bam
 
+
+
+def _tmp(name: String) -> String:
+    """A scratch file's path: in $DROMOS_TEST_DIR, else /tmp."""
+    var dir = getenv("DROMOS_TEST_DIR")
+    return (dir if dir else String("/tmp")) + "/" + name
 
 def _varint(mut out: List[UInt8], value: Int):
     var v = value
@@ -173,7 +209,7 @@ def _nodes_file(width: Int = 4) raises -> String:
     """A graph cache of nodes 1 ACGTACGT, 2 GGG and 3 TTTTT (node 0 absent), no reference sample."""
     var lengths: List[UInt32] = [UInt32(NONE), 8, 3, 5]
     return _cache(
-        String(t"/tmp/dromos_test_nodes_{width}.bin"), lengths^, "ACGTACGTGGGTTTTT", List[ReferenceSample](), width
+        String(_tmp(String(t"dromos_test_nodes_{width}.bin"))), lengths^, "ACGTACGTGGGTTTTT", List[ReferenceSample](), width
     )
 
 
@@ -317,7 +353,7 @@ def _refmap_file(twice: Bool) raises -> String:
     samples.append(_sample("CHM13", walks^, fragments^, path_contig^, ["chrA", "chrB"]))
     var lengths: List[UInt32] = [UInt32(NONE), 10, 5, 10, 5]
     return _cache(
-        String(t"/tmp/dromos_test_refmap_{Int(twice)}.bin"), lengths^, "AAAAAAAAAACCCCCGGGGGGGGGGTTTTT", samples^
+        String(_tmp(String(t"dromos_test_refmap_{Int(twice)}.bin"))), lengths^, "AAAAAAAAAACCCCCGGGGGGGGGGTTTTT", samples^
     )
 
 
@@ -709,10 +745,10 @@ def test_cache_from_the_graph() raises:
     """A graph cache made from the graph reads back as its nodes and each reference sample's paths, its letters the
     same at 4 bits and 8."""
     var g = GbzGraph(GBZ)
-    make_cache(GBZ, "/tmp/dromos_test.dromos", ["CHM13", "GRCh38"], None, 4, 3)
-    make_cache(GBZ, "/tmp/dromos_test8.dromos", ["GRCh38"], None, 8, 3)
-    var t = NodeTable("/tmp/dromos_test.dromos")
-    var t8 = NodeTable("/tmp/dromos_test8.dromos")
+    make_cache(GBZ, _tmp("dromos_test.dromos"), ["CHM13", "GRCh38"], None, 4, 3)
+    make_cache(GBZ, _tmp("dromos_test8.dromos"), ["GRCh38"], None, 8, 3)
+    var t = NodeTable(_tmp("dromos_test.dromos"))
+    var t8 = NodeTable(_tmp("dromos_test8.dromos"))
     assert_equal(t.count, g.max_node() + 1)
     assert_false(t.wide)
     assert_true(t8.wide)
@@ -746,7 +782,7 @@ def test_cache_from_the_graph() raises:
     var md = g.metadata()
     var names = md.path_names()
     for sample in ["CHM13", "GRCh38"]:
-        var m = RefMap("/tmp/dromos_test.dromos", sample)
+        var m = RefMap(_tmp("dromos_test.dromos"), sample)
         for node in range(t.count):
             assert_equal(m.length(node), len(g.sequence(node)))
         var id_of = md.sample_id(sample).value()
@@ -763,11 +799,11 @@ def test_cache_from_the_graph() raises:
                 start += len(g.sequence(Int(walk[i] >> 1)))
             path += 1
         assert_equal(len(m.path_contig), path)
-    var only = CacheFile("/tmp/dromos_test8.dromos")
+    var only = CacheFile(_tmp("dromos_test8.dromos"))
     assert_equal(len(only.samples), 1)
     var raised = False
     try:
-        _ = RefMap("/tmp/dromos_test8.dromos", "CHM13")
+        _ = RefMap(_tmp("dromos_test8.dromos"), "CHM13")
     except:
         raised = True
     assert_true(raised)
@@ -795,7 +831,7 @@ def test_letters_packed() raises:
 def test_cache_examined() raises:
     """A cache is told from a missing file, another file, another version's cache and a damaged one."""
     var h = Header()
-    assert_equal(examine("/tmp/dromos_no_such_cache", h), MISSING)
+    assert_equal(examine(_tmp("dromos_no_such_cache"), h), MISSING)
     assert_equal(examine(GBZ, h), NOT_A_CACHE)
     var path = _nodes_file()
     assert_equal(examine(path, h), CURRENT)
@@ -812,12 +848,12 @@ def test_cache_examined() raises:
     other[8] = 99
     var cases: List[Tuple[Int, List[UInt8]]] = [(DAMAGED, damaged^), (DAMAGED, cut^), (OTHER_VERSION, other^)]
     for c in cases:
-        with open("/tmp/dromos_test_bad.dromos", "w") as f:
+        with open(_tmp("dromos_test_bad.dromos"), "w") as f:
             f.write_bytes(Span(c[1]))
-        assert_equal(examine("/tmp/dromos_test_bad.dromos", h), c[0])
+        assert_equal(examine(_tmp("dromos_test_bad.dromos"), h), c[0])
         var raised = False
         try:
-            _ = NodeTable("/tmp/dromos_test_bad.dromos")
+            _ = NodeTable(_tmp("dromos_test_bad.dromos"))
         except:
             raised = True
         assert_true(raised)
@@ -992,87 +1028,413 @@ def test_same_contig() raises:
     assert_false(same_contig("chr2", "CHM13#0#chr20"))
 
 
-def test_region_queries_return_the_overlapping_records() raises:
-    """Records across several windows, one with a REF reaching far past its window: every region query returns
-    exactly the overlapping records (pgsites.rs's test)."""
-    var path = String("/tmp/dromos_test_region.pgsites")
-    var header = String("##fileformat=VCFv4.2\n##contig=<ID=CHM13#0#chrT,length=1000000>\n#CHROM\tPOS\tID\tREF\tALT\n")
-    var positions = List[Int]()
-    var lengths = List[Int]()
-    var w = Writer(path, header, 3, 2)
-    for k in range(400):
-        var pos = 1 + k * 1_337
-        var length = 250_000 if k == 7 else 2
-        positions.append(pos)
-        lengths.append(length)
-        var line = String(t"CHM13#0#chrT\t{pos}\t>{k}>{k + 1}\t")
-        line += "A" * length if k == 7 else "AC"
-        line += "\tG"
-        var place = w.place(pos, pos + length - 1, length, 3, line.byte_length())
-        var at = w.at(place[0], place[1])
-        for i in range(line.byte_length()):
-            at[unsafe_offset=i] = line.as_bytes()[i]
-        if k % 50 == 0:
-            compress_sealed(w)
-            w.write_done()
-    w.seal()
-    compress_sealed(w)
-    w.write_done()
-    assert_true(w.finish() > 1)
-    var c = Catalog(path)
-    assert_equal(c.chrom, "CHM13#0#chrT")
-    assert_equal(c.header, header)
-    var queries: List[Tuple[Int, Int]] = [
-        (1, 1),
-        (2, 2),
-        (3, 3),
-        (100_000, 100_001),
-        (200_000, 260_000),
-        (1, Int.MAX),
-        (600_000, 700_000),
-    ]
-    for q in queries:
-        var got = List[UInt8]()
-        records(c, q[0], q[1], 2, -1, got)
-        var got_pos = List[Int]()
-        var text = String(unsafe_from_utf8=got)
-        for line in text.split("\n"):
-            if line.byte_length() > 0:
-                got_pos.append(Int(line.split("\t")[1]))
-        var want = List[Int]()
-        for k in range(len(positions)):
-            if positions[k] <= q[1] and positions[k] + lengths[k] > q[0]:
-                want.append(positions[k])
-        assert_true(got_pos == want)
-
-
 def _read_all(path: String) raises -> List[UInt8]:
     with open(path, "r") as f:
         return f.read_bytes()
 
 
-def test_catalogs_of_the_small_graph() raises:
-    """The small graph's catalogs, built from its snarls, are pgcatalog's byte for byte, on one thread and on
-    several; a region holds the records a query of the whole catalog returns."""
+def test_site_varints() raises:
+    """Column integers: LEB128 varints and zigzag differences read back, and a column cut short is an error."""
+    var values: List[UInt64] = [0, 1, 127, 128, 300, 16383, 16384, UInt64(1) << 42, UInt64.MAX]
+    var col = List[UInt8]()
+    for v in values:
+        put_varint(col, v)
+    var diffs: List[Int] = [0, 1, -1, 63, -64, 1 << 40, -(1 << 40), Int.MAX, Int.MIN]
+    for d in diffs:
+        put_varint(col, zigzag(d))
+    var c = Cursor(col)
+    for v in values:
+        assert_equal(c.varint(), v)
+    for d in diffs:
+        assert_equal(unzigzag(c.varint()), d)
+    assert_equal(c.at, c.end)
+    assert_equal(zigzag(-1), 1)
+    assert_equal(zigzag(1), 2)
+    var cut = List[UInt8]()
+    put_varint(cut, 1 << 20)
+    cut.resize(len(cut) - 1, 0)
+    var failed = False
+    try:
+        var k = Cursor(cut)
+        _ = k.varint()
+    except:
+        failed = True
+    assert_true(failed)
+
+
+def _site_node_cols(ids: List[UInt64], letters: List[String]) -> List[List[UInt8]]:
+    var cols = List[List[UInt8]](length=COLUMNS, fill=List[UInt8]())
+    var packer = LetterPacker()
+    var prev = UInt64(0)
+    var seq = List[UInt8]()
+    var exc = List[UInt8]()
+    for k in range(len(ids)):
+        put_varint(cols[NODEID], ids[k] - prev)
+        prev = ids[k]
+        put_varint(cols[NODELEN], UInt64(letters[k].byte_length()))
+        packer.add(letters[k].as_bytes(), seq, exc)
+    packer.finish(seq)
+    cols[SEQ] = seq^
+    cols[EXC] = exc^
+    return cols^
+
+
+def test_site_node_table() raises:
+    """A block's node table: ids as differences, lengths, letters two bits each with the others (N, IUPAC codes,
+    anything) as exceptions, lower case stored as capitals; read back exactly."""
+    var ids: List[UInt64] = [3, 4, 9, 1000, 1 << 33]
+    var letters: List[String] = ["ACGT", "", "acgtNNa", "RYKM*-ACG", "T" * 37]
+    var cols = _site_node_cols(ids, letters)
+    var t = SiteNodes()
+    t.read(cols, True)
+    assert_equal(t.count(), len(ids))
+    for k in range(len(ids)):
+        assert_equal(t.ids[k], ids[k])
+        var got = String(unsafe_from_utf8=Span(t.letters)[t.starts[k] : t.starts[k + 1]])
+        assert_equal(got, letters[k].upper())
+    # Six exceptions in the third node and six in the fourth.
+    var exc = Cursor(cols[EXC])
+    var n = 0
+    while exc.at < exc.end:
+        _ = exc.varint()
+        _ = exc.byte()
+        n += 1
+    assert_equal(n, 2 + 6)
+    # A SEQ column of the wrong size is refused.
+    cols[SEQ].append(0)
+    var failed = False
+    try:
+        t.read(cols, True)
+    except:
+        failed = True
+    assert_true(failed)
+
+
+def test_md5() raises:
+    var h = Md5()
+    assert_equal(hex_string(Span(h.digest())), "d41d8cd98f00b204e9800998ecf8427e")
+    var fox = String("The quick brown fox jumps over the lazy dog")
+    var whole = Md5()
+    whole.update(fox.as_bytes())
+    assert_equal(hex_string(Span(whole.digest())), "9e107d9d372bb6826bd81d3542a419d6")
+    # In pieces across 64-byte blocks.
+    var long = String("ACGT" * 1000)
+    var once = Md5()
+    once.update(long.as_bytes())
+    var pieces = Md5()
+    var b = long.as_bytes()
+    var at = 0
+    var step = 1
+    while at < len(b):
+        var n = min(step, len(b) - at)
+        pieces.update(b[at : at + n])
+        at += n
+        step = step * 3 + 1
+    assert_true(once.digest() == pieces.digest())
+
+
+def _synthetic_catalog(path: String, firsts: List[Int], ends: List[Int], split: Int) raises:
+    """A catalog of empty blocks (no records), two contigs: the first `split` blocks the first contig's."""
+    var props: List[Tuple[String, String]] = [("graph.fingerprint", "size=1 fnv1a=0"), ("x", "y")]
+    var entries = List[ContigEntry]()
+    entries.append(ContigEntry("chrA", "S#0#chrA", 0, List[UInt8](), List[Tuple[Int, Int]](), 0, 0, 0))
+    entries.append(ContigEntry("chrB", "S#0#chrB", 0, List[UInt8](), [(5, 9)], 0, 0, 0))
+    var w = SitesWriter(path, props^, entries^)
+    var md5 = List[UInt8](length=16, fill=7)
+    for k in [1, 0]:
+        var blocks = List[EncodedBlock]()
+        for b in range(len(firsts)):
+            if (b < split) == (k == 0):
+                var e = EncodedBlock()
+                e.first_pos = firsts[b]
+                e.last_pos = firsts[b]
+                e.max_end = ends[b]
+                blocks.append(e^)
+        w.complete(k, blocks^, md5, 0, 1000 * (k + 1))
+    _ = w.finish()
+
+
+def test_site_index_search() raises:
+    """A region's blocks found by binary search (first_pos, and the running largest max_end, `reach`) are exactly the
+    blocks a scan would read, a block reaching far past its window (a giant record's) included; the header reads
+    back."""
+    var path = String(_tmp("dromos_test_index.sites"))
+    var firsts = List[Int]()
+    var ends = List[Int]()
+    seed(7)
+    var pos = 1
+    for b in range(300):
+        pos += Int(random_ui64(0, 3000))
+        firsts.append(pos)
+        ends.append(pos + (250_000 if b == 40 else Int(random_ui64(0, 5000))))
+    _synthetic_catalog(path, firsts, ends, 120)
+    var s = Sites(path)
+    assert_equal(len(s.contigs), 2)
+    assert_equal(s.contigs[0].name, "chrA")
+    assert_equal(s.contigs[1].regions[0][1], 9)
+    assert_equal(s.contigs[1].length, 2000)
+    assert_equal(s.prop("x").value(), "y")
+    assert_equal(s.contig("S#0#chrB").value(), 1)
+    assert_false(Bool(s.contig("T#0#chrB")))
+    for k in range(2):
+        var lo = 0 if k == 0 else 120
+        var hi = 120 if k == 0 else 300
+        for _ in range(500):
+            var a = Int(random_ui64(1, UInt64(pos)))
+            var e = a + Int(random_ui64(0, 20_000))
+            var got = List[Int]()
+            var span = s.overlapping(k, a, e)
+            for b in range(span[0], span[1]):
+                if s.max_end(b) >= a:
+                    got.append(b)
+            var want = List[Int]()
+            for b in range(lo, hi):
+                if firsts[b] <= e and ends[b] >= a:
+                    want.append(b)
+            assert_true(got == want)
+
+
+def _expect_refused(path: String, words: String) raises:
+    var failed = False
+    try:
+        _ = Sites(path)
+    except e:
+        failed = String(e).find(words) >= 0
+        if not failed:
+            print(e)
+    assert_true(failed)
+
+
+def test_site_catalog_refused_when_damaged() raises:
+    """A truncated catalog, a damaged one, another version's, a .pgsites, an empty file: each refused, saying so."""
+    var path = String(_tmp("dromos_test_bad.sites"))
+    var firsts: List[Int] = [1, 10, 20]
+    var ends: List[Int] = [5, 15, 25]
+    _synthetic_catalog(path, firsts, ends, 2)
+    var good = _read_all(path)
+    _ = Sites(path)
+
+    def put(path: String, data: List[UInt8]) raises:
+        with open(path, "w") as f:
+            f.write_bytes(data)
+
+    var bad = path + ".bad"
+    put(bad, List[UInt8](Span(good)[: len(good) - 10]))
+    _expect_refused(bad, "truncated")
+    var flipped = good.copy()
+    flipped[len(flipped) - 3] ^= 0xFF
+    put(bad, flipped)
+    _expect_refused(bad, "damaged")
+    var version = good.copy()
+    version[8] = 2
+    put(bad, version)
+    _expect_refused(bad, "version 2")
+    var pre = good.copy()
+    pre[30] ^= 1
+    put(bad, pre)
+    _expect_refused(bad, "damaged")
+    put(bad, List[UInt8]("PGSITES2xxxxxxxxxxxxxxxx".as_bytes()))
+    _expect_refused(bad, ".pgsites")
+    put(bad, List[UInt8]())
+    _expect_refused(bad, "not a dromos site catalog")
+
+
+def _view_of(path: String, contig: String, beg: Int = 1, end: Int = Int.MAX) raises -> String:
+    var s = Sites(path)
+    var k = s.contig(contig).value()
+    var c: List[Tuple[String, Int]] = [(s.contigs[k].chrom, s.contigs[k].length)]
+    var out = List[UInt8](vcf_header(c).as_bytes())
+    records(s, k, beg, end, 2, -1, out)
+    return String(unsafe_from_utf8=out)
+
+
+def _small_catalog(path: String, contigs: List[String], regions: List[Tuple[Int, Int]], threads: Int) raises:
+    """The small graph's catalog of `contigs` (each limited to `regions`), from its committed vg snarls."""
     var data = String("tests/data/micb-kir3dl1.catalog")
     var graph = Graph(GBZ, 2)
     var md = graph.parts.metadata()
+    var entries = List[ContigEntry]()
+    for c in contigs:
+        entries.append(ContigEntry(c, "CHM13#0#" + c, 0, List[UInt8](), regions.copy(), 0, 0, 0))
+    var props: List[Tuple[String, String]] = [("graph.fingerprint", fingerprint(GBZ))]
+    var w = SitesWriter(path, props^, entries^)
+    var pool = OwnedPointer(Pool(threads))
+    pool[].start()
+    for k in range(len(contigs)):
+        var r = ReferencePath(graph, md, "CHM13", contigs[k], threads)
+        var length = r.length
+        var md5 = reference_md5(graph, r)
+        var snarls = read_snarls(data + "/snarls/" + contigs[k] + ".snarls", 2)
+        var done = build_catalog(graph, r, snarls^, regions, 9, threads, mut_untracked(pool.ptr()))
+        var blocks = List[EncodedBlock]()
+        swap(blocks, done[1])
+        w.complete(k, blocks^, md5, done[0].records, length)
+    pool[].close()
+    _ = w.finish()
+
+
+def test_catalogs_of_the_small_graph() raises:
+    """The small graph's catalog, built from its snarls, prints pgcatalog view's text of pgcatalog's catalogs (as
+    committed) on one thread and on several; a region holds the records a query of the whole catalog returns."""
+    var data = String("tests/data/micb-kir3dl1.catalog")
+    var contigs: List[String] = ["chr6", "chr19"]
+    var sizes = List[Int]()
     for threads in [1, 3]:
-        for contig in ["chr6", "chr19"]:
-            var r = ReferencePath(graph, md, "CHM13", contig, threads)
-            var out = String(t"/tmp/dromos_test_{contig}")
-            _ = build_catalog(graph, r, data + "/snarls/" + contig + ".snarls", None, out, 6, threads)
-            assert_true(_read_all(out + ".pgsites") == _read_all(data + "/" + contig + ".pgsites"))
-    var r = ReferencePath(graph, md, "CHM13", "chr6", 2)
-    var whole = Catalog(data + "/chr6.pgsites")
-    var beg = whole.blocks[0] + 2000
+        var path = String(_tmp(String(t"dromos_test_small_{threads}.sites")))
+        _small_catalog(path, contigs, List[Tuple[Int, Int]](), threads)
+        sizes.append(len(_read_all(path)))
+        for c in contigs:
+            assert_equal(_view_of(path, c), String(unsafe_from_utf8=_read_all(data + "/" + c + ".vcf")))
+    assert_true(_read_all(_tmp("dromos_test_small_1.sites")) == _read_all(_tmp("dromos_test_small_3.sites")))
+    # A region's catalog: the records the whole one returns for it.
+    var whole = Sites(_tmp("dromos_test_small_1.sites"))
+    var beg = whole.first_pos(0) + 2000
     var end = beg + 5000
-    _ = build_catalog(graph, r, data + "/snarls/chr6.snarls", (beg, end), "/tmp/dromos_test_region", 6, 2)
-    var want = List[UInt8]()
-    records(whole, beg, end, 2, -1, want)
-    var got = List[UInt8]()
-    records(Catalog("/tmp/dromos_test_region.pgsites"), 1, Int.MAX, 2, -1, got)
-    assert_true(len(want) > 0 and got == want)
+    var regions: List[Tuple[Int, Int]] = [(beg, end)]
+    var chr6: List[String] = ["chr6"]
+    _small_catalog(_tmp("dromos_test_region.sites"), chr6, regions, 2)
+    var want = _view_of(_tmp("dromos_test_small_1.sites"), "chr6", beg, end)
+    assert_true(want.count("\n") > 10)
+    assert_equal(_view_of(_tmp("dromos_test_region.sites"), "chr6"), want)
+    var r = Sites(_tmp("dromos_test_region.sites"))
+    assert_equal(r.contigs[0].regions[0][0], beg)
+    # Its MD5 is the reference sequence's.
+    assert_equal(hex_string(Span(r.contigs[0].md5)), hex_string(Span(whole.contigs[0].md5)))
+
+
+def test_giant_record() raises:
+    """A record of a few hundred thousand walks (its WALK column long enough for long-distance matching and zstd's
+    own threads) encoded, written and read back as the VCF line its walks spell."""
+    var graph = Graph(GBZ, 2)
+    # A walk over a few nodes of the graph, varied per allele.
+    var nodes: List[UInt64] = [5, 6, 7, 8, 9, 10, 11, 12]
+    var r = Record()
+    r.present = True
+    r.pos = 1000
+    r.start = UInt64(2 << 1)
+    r.end = UInt64(40 << 1)
+    r.pad = -1
+    var walks = 200_000
+    for k in range(walks):
+        r.starts.append(len(r.visits))
+        r.visits.append(r.start)
+        for j in range(30):
+            var v = nodes[(k * 7 + j * (k % 5 + 1)) % len(nodes)] << 1 | UInt64((k + j) & 1)
+            r.visits.append(v)
+        r.visits.append(r.end)
+        r.ends.append(len(r.visits))
+    for k in range(walks):
+        var n = 0
+        for i in range(r.starts[k] + 1, r.ends[k] - 1):
+            n += graph.length(Int(r.visits[i] >> 1))
+        r.lens.append(n)
+    var items = List[SitePlaced]()
+    items.append(SitePlaced(r^, 3, UInt64(1 << 1), UInt64(99 << 1 | 1), True))
+    var e = Encoder()
+    var block = EncodedBlock()
+    encode_block(graph, Span(items), e, 3, 2, block)
+    assert_true(block.sizes[2 * WALK + 1] > LONG_BYTES)
+    block.first_pos = 1000
+    block.last_pos = 1000
+    block.max_end = 1000
+    block.records = 1
+    var path = String(_tmp("dromos_test_giant.sites"))
+    var entries: List[ContigEntry] = [
+        ContigEntry("chrG", "S#0#chrG", 0, List[UInt8](), List[Tuple[Int, Int]](), 0, 0, 0)
+    ]
+    var w = SitesWriter(path, List[Tuple[String, String]](), entries^)
+    var blocks = List[EncodedBlock]()
+    blocks.append(block^)
+    w.complete(0, blocks^, List[UInt8](length=16, fill=0), 1, 5000)
+    _ = w.finish()
+    # The line, made here from the record's walks and the graph's letters.
+    ref g = items[0].record
+    var want = String("S#0#chrG\t1000\t>2>40\t")
+    for k in range(walks):
+        if k > 1:
+            want += ","
+        var allele = List[UInt8]()
+        for i in range(g.starts[k] + 1, g.ends[k] - 1):
+            var v = g.visits[i]
+            var s = graph.letters(Int(v >> 1))
+            var at = len(allele)
+            allele.resize(at + len(s), 0)
+            put_oriented(allele.unsafe_ptr().unsafe_offset(at), s, v & 1 == 1)
+        want += String(unsafe_from_utf8=allele)
+        if k == 0:
+            want += "\t"
+    want += "\t60\t.\tAT="
+    for k in range(walks):
+        if k > 0:
+            want += ","
+        for i in range(g.starts[k], g.ends[k]):
+            var v = g.visits[i]
+            want += String(t"{'<' if v & 1 == 1 else '>'}{v >> 1}")
+    want += ";LV=3;PS=>1<99\n"
+    var got = _view_of(path, "chrG")
+    assert_equal(String(got[byte = got.find("\nS#0#chrG") + 1 :]), want)
+
+
+def test_snarls_from_the_distance_index() raises:
+    """The small graph's distance index (vg 1.73's, version 4) gives vg snarls' snarls: the same start and end visits,
+    parents the same snarls."""
+    var d = DistIndex("tests/data/micb-kir3dl1.dist")
+    assert_equal(d.version, 4)
+    var graph = Graph(GBZ, 2)
+    check_dist(d, graph)
+    var md = graph.parts.metadata()
+    for c in ["chr6", "chr19"]:
+        var r = ReferencePath(graph, md, "CHM13", c, 2)
+        var got = List[Snarl]()
+        d.snarls(d.top(Int(r.steps[0] >> 1)), got)
+        var want = read_snarls("tests/data/micb-kir3dl1.catalog/snarls/" + c + ".snarls", 2)
+        assert_equal(len(got), len(want))
+
+        def key(s: Snarl) -> Tuple[UInt64, UInt64, UInt64, UInt64]:
+            var p = canonical(s.parent_start, s.parent_end) if s.has_parent() else (NO_PARENT, NO_PARENT)
+            return (s.start, s.end, p[0], p[1])
+
+        def less(a: Snarl, b: Snarl) -> Bool:
+            var x = key(a)
+            var y = key(b)
+            return x[0] < y[0] or (x[0] == y[0] and x[1] < y[1])
+
+        sort(Span(got), less)
+        sort(Span(want), less)
+        for i in range(len(got)):
+            var x = key(got[i])
+            var y = key(want[i])
+            assert_true(x[0] == y[0] and x[1] == y[1] and x[2] == y[2] and x[3] == y[3])
+
+
+def test_distance_index_refused() raises:
+    """Not a distance index, a truncated one, and one of another graph: each refused."""
+    var good = _read_all("tests/data/micb-kir3dl1.dist")
+    var bad = String(_tmp("dromos_test_bad.dist"))
+
+    def put(path: String, data: List[UInt8]) raises:
+        with open(path, "w") as f:
+            f.write_bytes(data)
+
+    put(bad, List[UInt8](Span(good)[: len(good) // 2]))
+    var failed = False
+    try:
+        _ = DistIndex(bad)
+    except e:
+        failed = String(e).find("damaged") >= 0
+    assert_true(failed)
+    put(bad, List[UInt8]("not a distance index at all, just text, long enough to be read as one".as_bytes()))
+    failed = False
+    try:
+        _ = DistIndex(bad)
+    except e:
+        failed = String(e).find("not a distance index") >= 0
+    assert_true(failed)
+    # The graph's own passes its checks.
+    var d = DistIndex("tests/data/micb-kir3dl1.dist")
+    var graph = Graph(GBZ, 2)
+    check_dist(d, graph)
+    assert_true(d.node_count() > 1000)
 
 
 def test_reference_traversals() raises:
@@ -1093,7 +1455,9 @@ def test_reference_traversals() raises:
             assert_true(first >> 1 == sn.start >> 1 and last == sn.end)
     assert_true(found > 100)
     assert_true(
-        vcf_header("X", 5).endswith("##contig=<ID=X,length=5>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+        vcf_header([(String("X"), 5)]).endswith(
+            "##contig=<ID=X,length=5>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        )
     )
 
 
@@ -1103,7 +1467,7 @@ def _hex(data: Span[UInt8, _]) -> String:
     for b in data:
         out.append(digits[Int(b >> 4)])
         out.append(digits[Int(b & 15)])
-    return String(unsafe_from_utf8=out^)
+    return String(unsafe_from_utf8=out)
 
 
 def _ops(text: StaticString) -> List[CigarOp]:

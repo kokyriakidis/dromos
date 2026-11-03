@@ -1,7 +1,6 @@
 """Dromos: pangenome graph alignments, fast. `dromos COMMAND -h` for each command's usage."""
 
 from std.ffi import external_call
-from std.os import stat
 from std.os.path import dirname
 from std.sys import argv, exit, stderr
 from std.time import perf_counter_ns
@@ -11,14 +10,14 @@ from dromos.bam import BamIndex, bam_header, needs_csi
 from dromos.bam_sort import BamStaging, write_bam
 from dromos.contig import Reference
 from dromos.convert import GafSink
-from dromos.graph import reference_samples, resolve_reference_sample
+from dromos.graph import fingerprint, reference_samples, resolve_reference_sample
 from dromos.index import IndexSink
 from dromos.linearize import Window
 from dromos.nodes import NodeTable
 from dromos.output import OutFile
 from dromos.parallel import default_threads
-from dromos.pgsites import load_all_windows, view
 from dromos.prepare import graph_cache
+from dromos.sites import Sites, info, load_all_windows, view
 from dromos.refmap import RefMap
 from dromos.stream import AUTO, GAF, GAM, stream_input
 from dromos.surject import SurjectSink, Surjector
@@ -30,9 +29,9 @@ comptime OVERVIEW = """dromos: pangenome graph alignments, fast
   dromos surject     a GAM or GAF on the reference contigs, the records pgcatalog surject writes: SAM, or a
                      sorted, indexed BAM
 
-  dromos catalog            a GBZ graph's site catalogs, one per reference contig (<contig>.pgsites), as pgphase
-                            reads them: the files pgcatalog build writes
-  dromos view               a catalog as VCF, whole or a region of it
+  dromos catalog            a GBZ graph's site catalog: every snarl on the reference, every contig, one file
+  dromos view               a catalog as VCF (pgcatalog view's text), whole or a region of it
+  dromos catalog-info       a catalog's header: the graph it belongs to, its contigs, its snarls' source
   dromos prepare            a GBZ graph's cache, made ahead of the commands that read it
   dromos reference-samples  the reference samples a GBZ graph declares
 
@@ -96,9 +95,9 @@ each; reads with no base on any are left out.
   --sam-contig NAME         the one contig's name in the SAM or BAM (with a single --contig)
   --graph-placement         place read bases only where the graph puts them: a stretch of more than 50 bases off the
                             reference is not aligned to it, and such read ends are clipped
-  --catalog DIR|FILE        the contigs' catalogs, DIR/<contig>.pgsites as dromos catalog --out DIR writes them (or
-                            one contig's .pgsites file): a read spanning one of a contig's snarl windows is aligned
-                            there as its allele, at minimap2's asm5 costs
+  --catalog FILE            the graph's site catalog (dromos catalog), holding every contig surjected to: a read
+                            spanning one of a contig's snarl windows is aligned there as its allele, at minimap2's
+                            asm5 costs
   -t THREADS                threads [the machine's cores]
   -l LEVEL                  the BAM's deflate level, 0 to 12 [4]
   -m SIZE                   memory for records waiting to be sorted, compressed (K, M or G); past half of it they
@@ -129,38 +128,50 @@ graph declares, in one file read in place (memory-mapped). Nothing is done when 
 
 comptime CATALOG_USAGE = """dromos catalog --graph GRAPH.gbz [options]
 
-Site catalogs (DIR/<contig>.pgsites) from a GBZ graph, as pgphase reads them: the files pgcatalog build writes, byte
-for byte. Every snarl the reference path passes through is kept, at every nesting level, with all its alleles.
+The graph's site catalog, one file: every snarl the reference path passes through, at every nesting level, with all
+its alleles, for every reference contig (or the regions asked for), as binary columns in position blocks
+(docs/catalog-format.md). dromos view prints it as the VCF pgcatalog view prints; its header names the graph it was
+built from, and dromos refuses it with another graph.
 
   --graph FILE              the pangenome graph (GBZ)
-  --out DIR                 where catalogs are written: <contig>.pgsites, or <contig>_<start>-<end>.pgsites for a
-                            region [GRAPH.catalog, in the current folder]
+  --out PATH                the catalog's file, or a folder to put it in [GRAPH.SAMPLE.sites beside the graph;
+                            GRAPH.SAMPLE.chr20_1-1000.sites for regions]
   --reference-sample NAME   the sample whose paths are the reference: CHM13 for CHM13#0#chr20 [the graph's declared
                             reference sample, if it declares exactly one; HPRC graphs declare CHM13 and GRCh38 and
                             need this]
   --region REGION           a contig (chr20) or part of one (chr20:10000000-12000000, 1-based, inclusive),
-                            repeatable [every reference contig]; a region holds the records a tabix query of the whole
+                            repeatable [every reference contig]; a region holds the records a query of the whole
                             contig's catalog returns
   -t, --threads N           threads [the machine's cores]
+  --level N                 zstd level, 1-22 [9]; higher is smaller and slower
+
+Snarls come from the graph's distance index (giraffe's .dist, read in place), else from vg snarls:
+  --dist FILE               the distance index [GRAPH.dist beside the graph, if there]
+  --snarls-cache DIR        vg snarls of each contig (<contig>.snarls), kept for later runs on the same graph; giving
+                            it uses vg snarls even when a .dist is there [GRAPH.snarls beside the catalog]
+  --vg PATH                 the vg binary, for vg chunk and vg snarls, run for contigs not in the cache [vg]
   --snarls-jobs N           vg snarls runs at a time [6, at most --threads]; fewer when memory is short (each needs
                             about 20 times its component's size)
-  --snarls-cache DIR        where each contig's snarls are kept and reused by later runs on the same graph
-                            [DIR/snarls]
-  --vg PATH                 the vg binary, for vg chunk and vg snarls, run only for contigs whose snarls are not in
-                            the cache [vg]
-  --level N                 zstd level, 1-22 [6]; higher is smaller and slower
 
-dromos view prints a catalog as VCF; for a tabix-indexed copy:
-  dromos view chr20.pgsites | bgzip > chr20.sites.vcf.gz && tabix -p vcf chr20.sites.vcf.gz
+For a tabix-indexed VCF of one contig:
+  dromos view GRAPH.CHM13.sites chr20 | bgzip > chr20.sites.vcf.gz && tabix -p vcf chr20.sites.vcf.gz
 """
 
-comptime VIEW_USAGE = """dromos view [-t THREADS] FILE.pgsites [CONTIG[:START-END]]
+comptime VIEW_USAGE = """dromos view [-t THREADS] CATALOG [CONTIG[:START-END]]
 
-A catalog as VCF on stdout: its header, then every record, or the records overlapping a region (1-based, inclusive),
-as tabix would return them from the VCF: what pgcatalog view prints. CONTIG is chr20 or CHM13#0#chr20; another
-contig's region prints the header alone.
+A site catalog as VCF on stdout. With a contig (chr20 or CHM13#0#chr20), and a region of it (1-based, inclusive),
+what pgcatalog view prints of that contig's catalog: its header, then the records overlapping the region, as tabix
+would return them from the VCF. Without one, every contig: one VCF, a ##contig line for each.
 
-  -t THREADS  threads, inflating blocks [the machine's cores]
+  -t THREADS  threads, decoding blocks [the machine's cores]
+"""
+
+comptime CATALOG_INFO_USAGE = """dromos catalog-info CATALOG
+
+A site catalog's header on stdout, a field a line (key, tab, value): the format, the graph it was built from (file,
+fingerprint, node ids, GBZ and GBWT tags), the reference sample, where its snarls came from and how it was built;
+then a line per contig: its name, CHROM, length, the MD5 of its reference sequence (SAM's M5), records, blocks and the
+regions built.
 """
 
 comptime REFERENCE_SAMPLES_USAGE = """dromos reference-samples GRAPH.gbz
@@ -347,11 +358,16 @@ def _writable(path: String) raises:
     _ = external_call["unlink", Int32](c.unsafe_ptr())
 
 
-def _is_dir(path: String) -> Bool:
-    try:
-        return (Int(stat(path).st_mode) & 0o170000) == 0o040000
-    except:
-        return False
+def _same_graph(sites: Sites, graph: String) raises:
+    """Refuses a catalog built from another graph than `graph` (their fingerprints differ)."""
+    var want = sites.prop("graph.fingerprint")
+    var have = fingerprint(graph)
+    if not want or want.value() != have:
+        var built = sites.prop("graph.file").or_else(String("?"))
+        raise Error(
+            t"{sites.path} was built from another graph ({built}, {want.or_else(String('no fingerprint'))}); {graph}"
+            t" is {have}"
+        )
 
 
 def surject_main() raises:
@@ -426,21 +442,9 @@ def surject_main() raises:
         lengths.append(len(reference.contigs[k].seq))
     var windows = List[List[Window]](length=len(names), fill=List[Window]())
     if catalog_arg:
-        var paths = List[String]()
-        var at = catalog_arg.value()
-        if _is_dir(at):
-            for c in names:
-                var f = at + "/" + c + ".pgsites"
-                try:
-                    _ = stat(f)
-                except:
-                    raise Error(t"no catalog {f} for {c}")
-                paths.append(f)
-        elif len(names) == 1:
-            paths.append(at)
-        else:
-            _fail("--catalog FILE is one contig's catalog: give a folder of them for several contigs", "surject")
-        windows = load_all_windows(paths, reference, map, threads)
+        var sites = Sites(catalog_arg.value())
+        _same_graph(sites, graph)
+        windows = load_all_windows(sites, names, reference, map, threads)
         var count = 0
         for w in windows:
             count += len(w)
@@ -528,6 +532,7 @@ def catalog_main() raises:
     o.threads = _number(t.value(), "--threads", 1, 1024, "catalog") if t else default_threads()
     o.graph = args.value("--graph").or_else(String())
     o.out = args.value("--out").or_else(String())
+    o.dist = args.value("--dist")
     o.reference_sample = args.value("--reference-sample")
     while True:
         var r = args.value("--region")
@@ -548,12 +553,8 @@ def catalog_main() raises:
     if not o.graph:
         print(CATALOG_USAGE, end="", file=stderr)
         exit(1)
-    if not o.out:
-        # The graph's file name without its last extension, then .catalog, in the current folder.
-        var slash = o.graph.rfind("/")
-        var name = String(o.graph[byte = slash + 1 :]) if slash >= 0 else o.graph
-        var dot = name.rfind(".")
-        o.out = (String(name[byte=:dot]) if dot > 0 else name) + ".catalog"
+    if o.dist and o.snarls_cache:
+        _fail("--dist or --snarls-cache (the snarls' source), not both", "catalog")
     run_build(o)
 
 
@@ -565,6 +566,14 @@ def view_main() raises:
     var threads = args.threads()
     var pos = args.positional_between(1, 2)
     view(pos[0], Optional(pos[1]) if len(pos) == 2 else None, threads)
+
+
+def catalog_info_main() raises:
+    var args = _Args("catalog-info")
+    if args.help() or len(args.items) == 0:
+        print(CATALOG_INFO_USAGE, end="")
+        return
+    info(args.positional(1)[0])
 
 
 def reference_samples_main() raises:
@@ -598,6 +607,8 @@ def main():
             catalog_main()
         elif command == "view":
             view_main()
+        elif command == "catalog-info":
+            catalog_info_main()
         elif command == "prepare":
             prepare_main()
         elif command == "reference-samples":

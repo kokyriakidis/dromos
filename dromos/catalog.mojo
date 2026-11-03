@@ -1,15 +1,17 @@
-"""One contig's site catalog, or one region of it, from its snarls (pgcatalog's catalog.rs, record.rs and
-reference.rs, ported): every snarl the reference path passes through, at every nesting level, with all its alleles,
-as `vg deconstruct -a` writes them, without what needs haplotype names (genotypes, AC/AF/AN/NS). The file is
-pgcatalog's byte for byte.
+"""One contig's records for the site catalog, or those of regions of it, from its snarls (pgcatalog's catalog.rs,
+record.rs and reference.rs, ported): every snarl the reference path passes through, at every nesting level, with all
+its alleles, as `vg deconstruct -a` writes them, without what needs haplotype names (genotypes, AC/AF/AN/NS). Their
+VCF text (`dromos view`) is pgcatalog's byte for byte.
 
 Pass 1 finds each snarl's reference traversal; snarls the reference does not pass through once have no record. The
 rest are sorted by position, ancestors first at a tie, and built in pgcatalog's batches: a snarl's haplotype walks by
 forward GBWT search, its alleles (the reference, then distinct sequences, most haplotypes first), then LV/PS from the
-ancestors built so far, and the lines written straight into the catalog's blocks, compressed in parallel. Each step
-builds one batch while the previous one's lines are written; threads with nothing left in a step build later batches.
-Heavy snarls are searched ahead by helper threads, their haplotypes in parts; a record whose line is longer than
-STREAM_BYTES is made a window of alleles at a time and compressed as it is made, on a thread of its own.
+ancestors built so far; records are placed in blocks (pgcatalog's: BLOCK_BP windows, BLOCK_BYTES of text) and each
+sealed block encoded as the catalog's columns (`encode_block`), in parallel. Each step builds one batch while the
+blocks sealed so far are encoded; threads with nothing left in a step build later batches. Heavy snarls are searched
+ahead by the pool's workers when they have nothing else to do, their haplotypes in parts; a record whose line would
+be longer than STREAM_BYTES is encoded as a job of its own. Every parallel step is a job of the pool (pool.mojo), so
+several contigs can be built at once on the same workers.
 
 The crate does the search (a batch of states per call) and gives the node letters, a page of node ids at a time as
 they are first needed.
@@ -24,16 +26,46 @@ from std.time import perf_counter_ns
 
 from dromos.graph import NO_LENGTH, GbzParts, Metadata, SearchState
 from dromos.output import decimal_digits, put_padded
-from dromos.parallel import Background, ParallelTask, parallel_for
-from dromos.pgsites import Compressor, FrameStream, Writer
-from dromos.snarls import Snarl, canonical, put_visit, read_snarls
+from dromos.parallel import ParallelTask, parallel_for
+from dromos.pool import Pool, PoolTask
+from dromos.sites import (
+    BLOCK_BP,
+    BLOCK_BYTES,
+    BOUND,
+    COLUMNS,
+    EXC,
+    FLAG_PAD,
+    FLAG_PS,
+    FLAG_REVERSED,
+    FLAGS,
+    LV,
+    NODEID,
+    NODELEN,
+    NWALK,
+    OWN_BLOCK_BYTES,
+    PAD,
+    POS,
+    PS,
+    SEQ,
+    WALK,
+    WLEN,
+    Compressor,
+    EncodedBlock,
+    LetterPacker,
+    complement,
+    put_oriented,
+    put_varint,
+    upper,
+    zigzag,
+)
+from dromos.snarls import Snarl, canonical, put_visit
 from dromos.stream import imm_untracked, mut_untracked, untracked
 
 comptime NONE = UInt32.MAX
 comptime BATCH = 50_000
 """Snarls built per batch: enough to keep every thread busy, few enough that a batch of records fits in memory."""
 comptime STREAM_BYTES = 64 << 20
-"""Records with longer lines are not formatted in memory: they are compressed from their walks as written."""
+"""A record whose VCF line would be longer is encoded on a thread of its own."""
 comptime SEARCH_BATCH = 64
 """Search states extended per call into the crate."""
 comptime PAGE_BITS = 16
@@ -165,71 +197,6 @@ def prefetch(graph: Graph, lo: Int, hi: Int, threads: Int) raises:
     parallel_for(task, last - first + 1, threads)
     if bad != 0:
         raise Error("node letters could not be unpacked")
-
-
-# Letters as alleles are written: upper case, or reverse-complemented.
-
-
-@always_inline
-def _upper(c: UInt8) -> UInt8:
-    return c - 32 if c >= UInt8(ord("a")) and c <= UInt8(ord("z")) else c
-
-
-@always_inline
-def _complement(c: UInt8) -> UInt8:
-    """The crate's COMPLEMENT: A, C, G, T in either case to their complement in capitals, any other letter to N."""
-    var u = _upper(c)
-    if u == UInt8(ord("A")):
-        return UInt8(ord("T"))
-    if u == UInt8(ord("C")):
-        return UInt8(ord("G"))
-    if u == UInt8(ord("G")):
-        return UInt8(ord("C"))
-    if u == UInt8(ord("T")):
-        return UInt8(ord("A"))
-    return UInt8(ord("N"))
-
-
-comptime _W = 16
-"""Letters converted at a time."""
-
-
-@always_inline
-def _upper_lanes(v: SIMD[DType.uint8, _W]) -> SIMD[DType.uint8, _W]:
-    return (v.ge(UInt8(ord("a"))) & v.le(UInt8(ord("z")))).select(v - 32, v)
-
-
-@always_inline
-def _complement_lanes(v: SIMD[DType.uint8, _W]) -> SIMD[DType.uint8, _W]:
-    comptime L = SIMD[DType.uint8, _W]
-    var u = _upper_lanes(v)
-    var out = L(UInt8(ord("N")))
-    out = u.eq(UInt8(ord("A"))).select(L(UInt8(ord("T"))), out)
-    out = u.eq(UInt8(ord("C"))).select(L(UInt8(ord("G"))), out)
-    out = u.eq(UInt8(ord("G"))).select(L(UInt8(ord("C"))), out)
-    return u.eq(UInt8(ord("T"))).select(L(UInt8(ord("A"))), out)
-
-
-@always_inline
-def put_oriented(dst: MutPointer[UInt8, _], src: Span[UInt8, _], reverse: Bool):
-    """A node's letters as visited (pgcatalog's oriented_seq): upper case forward, reverse-complemented backward."""
-    var n = len(src)
-    var s = src.unsafe_ptr()
-    var i = 0
-    if reverse:
-        while i + _W <= n:
-            dst.unsafe_store(i, _complement_lanes(s.unsafe_load[width=_W](n - i - _W).reversed()))
-            i += _W
-        while i < n:
-            dst[unsafe_offset=i] = _complement(s[unsafe_offset=n - 1 - i])
-            i += 1
-    else:
-        while i + _W <= n:
-            dst.unsafe_store(i, _upper_lanes(s.unsafe_load[width=_W](i)))
-            i += _W
-        while i < n:
-            dst[unsafe_offset=i] = _upper(s[unsafe_offset=i])
-            i += 1
 
 
 # The reference path.
@@ -465,160 +432,6 @@ struct Record(Movable):
         return length
 
 
-trait LineSink:
-    """Where a record's line is written."""
-
-    def room(mut self) raises -> Tuple[MutPointer[UInt8, MutUntrackedOrigin], Int]:
-        """Memory for the next bytes: where, and how many (at least one)."""
-        ...
-
-    def grew(mut self, n: Int) raises:
-        """`n` bytes were written where `room` said."""
-        ...
-
-
-struct MemorySink(LineSink):
-    """A line written into memory that has room for it."""
-
-    var at: MutPointer[UInt8, MutUntrackedOrigin]
-
-    def __init__(out self, at: MutPointer[UInt8, MutUntrackedOrigin]):
-        self.at = at
-
-    @always_inline
-    def room(mut self) raises -> Tuple[MutPointer[UInt8, MutUntrackedOrigin], Int]:
-        return (self.at, Int.MAX)
-
-    @always_inline
-    def grew(mut self, n: Int) raises:
-        self.at = self.at.unsafe_offset(n)
-
-
-struct StreamSink(LineSink):
-    """A line compressed as it is written."""
-
-    var stream: FrameStream
-
-    def __init__(out self, var stream: FrameStream):
-        self.stream = stream^
-
-    def room(mut self) raises -> Tuple[MutPointer[UInt8, MutUntrackedOrigin], Int]:
-        return (self.stream.end_ptr(), self.stream.room())
-
-    def grew(mut self, n: Int) raises:
-        self.stream.grew(n)
-
-
-@always_inline
-def _put[S: LineSink](mut out: S, src: Span[UInt8, _]) raises:
-    var done = 0
-    while done < len(src):
-        var r = out.room()
-        var n = min(r[1], len(src) - done)
-        unsafe_memcpy(dest=r[0], src=src.unsafe_ptr().unsafe_offset(done), count=n)
-        out.grew(n)
-        done += n
-
-
-@always_inline
-def _put_byte[S: LineSink](mut out: S, b: UInt8) raises:
-    var r = out.room()
-    r[0][] = b
-    out.grew(1)
-
-
-@always_inline
-def _put_number[S: LineSink](mut out: S, value: Int) raises:
-    var r = out.room()
-    if r[1] >= 24:
-        out.grew(put_padded(r[0], value, 0))
-        return
-    var digits = Array[UInt8, 24](fill=0)
-    var n = put_padded(digits.unsafe_ptr(), value, 0)
-    _put(out, Span(digits)[:n])
-
-
-@always_inline
-def _put_letters[S: LineSink](mut out: S, src: Span[UInt8, _], reverse: Bool) raises:
-    """A node's letters as visited, piece by piece as the sink has room."""
-    var n = len(src)
-    var done = 0
-    while done < n:
-        var r = out.room()
-        var k = min(r[1], n - done)
-        if reverse:
-            put_oriented(r[0], src[n - done - k : n - done], True)
-        else:
-            put_oriented(r[0], src[done : done + k], False)
-        out.grew(k)
-        done += k
-
-
-def _put_allele[S: LineSink](graph: Graph, r: Record, k: Int, mut out: S) raises:
-    """Allele k: the padding base, then its walk's inner nodes' letters (reverse-complemented when the record is)."""
-    if r.pad >= 0:
-        _put_byte(out, UInt8(r.pad))
-    var a = r.starts[k]
-    var b = r.ends[k]
-    if b - a < 2:
-        return
-    if r.reversed:
-        # The bases reverse-complemented: the inner nodes backwards, each in the opposite orientation.
-        for i in range(b - 2, a, -1):
-            var v = r.visits[i] ^ 1
-            _put_letters(out, graph.letters(Int(v >> 1)), v & 1 == 1)
-    else:
-        for i in range(a + 1, b - 1):
-            var v = r.visits[i]
-            _put_letters(out, graph.letters(Int(v >> 1)), v & 1 == 1)
-
-
-def _put_walk[S: LineSink](r: Record, k: Int, mut out: S) raises:
-    """Walk k as the AT field writes it (backwards when the record is reversed)."""
-    var a = r.starts[k]
-    var b = r.ends[k]
-    for i in range(b - a):
-        var v = r.visits[b - 1 - i] if r.reversed else r.visits[a + i]
-        _put_byte(out, UInt8(ord("<")) if (v & 1 == 1) != r.reversed else UInt8(ord(">")))
-        _put_number(out, Int(v >> 1))
-
-
-def _walk_text_length(r: Record, k: Int) -> Int:
-    var n = 0
-    for i in range(r.starts[k], r.ends[k]):
-        n += 1 + decimal_digits(Int(r.visits[i] >> 1))
-    return n
-
-
-def write_line[S: LineSink](graph: Graph, r: Record, chrom: String, lv: Int, ps: Span[UInt8, _], mut out: S) raises:
-    """The record's VCF line, without its newline (record.rs `write_line`)."""
-    _put(out, chrom.as_bytes())
-    _put_byte(out, UInt8(ord("\t")))
-    _put_number(out, r.pos)
-    _put_byte(out, UInt8(ord("\t")))
-    var id = List[UInt8]()
-    put_visit(id, r.start)
-    put_visit(id, r.end)
-    _put(out, Span(id))
-    _put_byte(out, UInt8(ord("\t")))
-    for k in range(r.walks()):
-        if k > 1:
-            _put_byte(out, UInt8(ord(",")))
-        _put_allele(graph, r, k, out)
-        if k == 0:
-            _put_byte(out, UInt8(ord("\t")))
-    _put(out, "\t60\t.\tAT=".as_bytes())
-    for k in range(r.walks()):
-        if k > 0:
-            _put_byte(out, UInt8(ord(",")))
-        _put_walk(r, k, out)
-    _put(out, ";LV=".as_bytes())
-    _put_number(out, lv)
-    if len(ps) > 0:
-        _put(out, ";PS=".as_bytes())
-        _put(out, ps)
-
-
 # Building records.
 
 
@@ -823,11 +636,10 @@ struct Searcher(Movable):
 
 
 struct Builder(Movable):
-    """One thread's record building, its buffers kept from snarl to snarl, and its zstd context (reset for each block:
-    a context made afresh maps and touches megabytes of memory each time)."""
+    """One thread's record building and block encoding, its buffers kept from snarl to snarl and block to block."""
 
     var searcher: Searcher
-    var compressor: Compressor
+    var encoder: Encoder
     var found: WalkSet
     var order: List[Int]
     var text_a: List[UInt8]
@@ -835,7 +647,7 @@ struct Builder(Movable):
 
     def __init__(out self) raises:
         self.searcher = Searcher()
-        self.compressor = Compressor()
+        self.encoder = Encoder()
         self.found = WalkSet()
         self.order = List[Int]()
         self.text_a = List[UInt8]()
@@ -917,11 +729,11 @@ struct Builder(Movable):
         if same:
             first_path_pos += len(fp)
             # The oriented sequence's last letter.
-            prev_char = _complement(fp[0]) if fp_reverse else _upper(fp[len(fp) - 1])
+            prev_char = complement(fp[0]) if fp_reverse else upper(fp[len(fp) - 1])
         else:
             # The complement of its first letter.
-            var first_letter = _complement(fp[len(fp) - 1]) if fp_reverse else _upper(fp[0])
-            prev_char = _complement(first_letter)
+            var first_letter = complement(fp[len(fp) - 1]) if fp_reverse else upper(fp[0])
+            prev_char = complement(first_letter)
         var pos = first_path_pos + 1
 
         # Alleles: the reference, then distinct sequences, most haplotypes first.
@@ -1027,20 +839,6 @@ struct Builder(Movable):
 # A contig's catalog.
 
 
-def vcf_header(chrom: String, length: Int) -> String:
-    return String(
-        "##fileformat=VCFv4.2\n",
-        '##INFO=<ID=AT,Number=R,Type=String,Description="Allele Traversal as path in graph">\n',
-        '##INFO=<ID=LV,Number=1,Type=Integer,Description="Level in the snarl tree (0=top level)">\n',
-        '##INFO=<ID=PS,Number=1,Type=String,Description="ID of variant corresponding to parent snarl">\n',
-        "##contig=<ID=",
-        chrom,
-        ",length=",
-        length,
-        ">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
-    )
-
-
 @fieldwise_init
 struct RefTrav(Copyable, TrivialRegisterPassable):
     """A snarl's single reference traversal, and its sort key: the 0-based position of its leftmost boundary node,
@@ -1067,21 +865,20 @@ comptime NO_TRAVERSAL = -1
 
 
 @fieldwise_init
-struct _TraverseTask(ParallelTask):
-    """Pass 1 on snarls `index * TRAVERSE_SPAN ..`: each one's reference traversal, if it has exactly one (and, for
-    a region, can overlap it), into `found` (NO_TRAVERSAL's s0 otherwise)."""
+struct _TraverseTask(PoolTask):
+    """Pass 1 on snarls `index * TRAVERSE_SPAN ..`: each one's reference traversal, if it has exactly one (and, with
+    regions, can overlap one), into `found` (NO_TRAVERSAL's s0 otherwise)."""
 
     var graph: ImmPointer[Graph, ImmUntrackedOrigin]
     var reference: ImmPointer[ReferencePath, ImmUntrackedOrigin]
     var snarls: ImmPointer[Snarl, ImmUntrackedOrigin]
     var count: Int
     var found: MutPointer[Traversal, MutUntrackedOrigin]
-    var region: Bool
-    var beg: Int
-    var end: Int
+    var regions: ImmPointer[Tuple[Int, Int], ImmUntrackedOrigin]
+    var region_count: Int
     var bad: MutPointer[Int, MutUntrackedOrigin]
 
-    def run(self, index: Int):
+    def run(self, index: Int, worker: Int):
         ref r = self.reference[]
         ref g = self.graph[]
         var lo = index * TRAVERSE_SPAN
@@ -1124,7 +921,7 @@ struct _TraverseTask(ParallelTask):
             var t = Traversal(NO_TRAVERSAL, 0, False)
             if traversals(r, sn, block, t) != 1:
                 continue
-            if self.region:
+            if self.region_count > 0:
                 # The record lies within the boundary nodes' span, or starts one base before it; exact overlap is
                 # checked on the record itself.
                 var left = t.s0 if r.pos[t.s0] <= r.pos[t.e0] else t.e0
@@ -1135,7 +932,11 @@ struct _TraverseTask(ParallelTask):
                 except:
                     self.bad[] = 1
                     return
-                if r.pos[left] > self.end or span_end + 1 < self.beg:
+                var near = False
+                for q in range(self.region_count):
+                    var g = self.regions[unsafe_offset=q]
+                    near = near or not (r.pos[left] > g[1] or span_end + 1 < g[0])
+                if not near:
                     continue
             self.found[unsafe_offset=i] = t
 
@@ -1157,8 +958,8 @@ comptime _UNIT = 3
 @fieldwise_init
 struct _Job(Copyable, TrivialRegisterPassable):
     """A step's task: a part of a heavy snarl's haplotypes, the next no thread has taken (`a`: the heavy snarl), the
-    heavy snarl's record awaited (`a`), another record built (`a`: the batch's record), or a unit's lines written and
-    the unit compressed if sealed (`a`: the unit)."""
+    heavy snarl's record awaited (`a`), another record built (`a`: the batch's record), or a sealed unit encoded
+    (`a`: the unit)."""
 
     var kind: Int
     var a: Int
@@ -1166,16 +967,15 @@ struct _Job(Copyable, TrivialRegisterPassable):
 
 @fieldwise_init
 struct _Item(Copyable, TrivialRegisterPassable):
-    """A record to write: its index in the batch, LV, PS (bytes in the batch's PS text; length 0 for none), its
-    line's length, and its unit and offset there (-1 for a giant)."""
+    """A record to place: its index in the batch, LV, PS (the parent snarl's visits, if `has_ps`), and its VCF line's
+    length (which decides its block)."""
 
     var record: Int
     var lv: Int
-    var ps_at: Int
-    var ps_length: Int
+    var ps_start: UInt64
+    var ps_end: UInt64
+    var has_ps: Bool
     var length: Int
-    var unit: Int
-    var offset: Int
 
 
 comptime _TAKEN = 0
@@ -1255,67 +1055,400 @@ def _take_part(sh: _Shared, mut b: Builder, h: Int) raises -> Bool:
     return True
 
 
-struct _HelperTask(ParallelTask):
-    """Helper threads: the heavy snarls' parts, in position order, ahead of the steps that need them."""
+struct _HelperTask(Movable, PoolTask):
+    """The heavy snarls' parts, in position order, searched ahead of the steps that need them: a background job of
+    the pool, an index a part (of the heavy snarl whose parts it falls among: `first[h] ..< first[h + 1]`), each
+    taking the next part of its snarl not yet taken (a step may have taken them first)."""
 
     var sh: _Shared
-    var count: Int
-    var next: MutPointer[Atomic[Int64], MutUntrackedOrigin]
-    var stop: MutPointer[Atomic[Int64], MutUntrackedOrigin]
+    var first: List[Int]
     var builders: MutPointer[Builder, MutUntrackedOrigin]
+    """One per pool worker."""
 
-    def __init__(
-        out self,
-        var sh: _Shared,
-        count: Int,
-        next: MutPointer[Atomic[Int64], MutUntrackedOrigin],
-        stop: MutPointer[Atomic[Int64], MutUntrackedOrigin],
-        builders: MutPointer[Builder, MutUntrackedOrigin],
-    ):
+    def __init__(out self, var sh: _Shared, var first: List[Int], builders: MutPointer[Builder, MutUntrackedOrigin]):
         self.sh = sh^
-        self.count = count
-        self.next = next
-        self.stop = stop
+        self.first = first^
         self.builders = builders
 
-    def run(self, worker: Int):
-        ref b = self.builders[unsafe_offset=worker]
-        while self.stop[].load() == 0:
-            var h = Int(self.next[].fetch_add(1))
-            if h >= self.count:
-                return
-            try:
-                while _take_part(self.sh, b, h):
-                    pass
-            except:
-                self.sh.bad[] = 1
-                return
+    def run(self, index: Int, worker: Int):
+        var a = 0
+        var b = len(self.first) - 1
+        while b - a > 1:
+            var m = (a + b) // 2
+            if self.first[m] <= index:
+                a = m
+            else:
+                b = m
+        try:
+            _ = _take_part(self.sh, self.builders[unsafe_offset=worker], a)
+        except:
+            self.sh.bad[] = 1
+
+
+# Blocks: records placed in them, then encoded as the catalog's columns.
+
+
+struct Placed(Movable):
+    """A record as a block holds it: the record, its LV, and its PS (the nearest ancestor with a record), if any."""
+
+    var record: Record
+    var lv: Int
+    var ps_start: UInt64
+    var ps_end: UInt64
+    var has_ps: Bool
+
+    def __init__(out self, var record: Record, lv: Int, ps_start: UInt64, ps_end: UInt64, has_ps: Bool):
+        self.record = record^
+        self.lv = lv
+        self.ps_start = ps_start
+        self.ps_end = ps_end
+        self.has_ps = has_ps
+
+
+@always_inline
+def _at_visit(r: Record, k: Int, i: Int) -> UInt64:
+    """Visit `i` of walk `k` as the AT field writes it: when the record is reversed, the walk backwards, each visit
+    flipped."""
+    return r.visits[r.ends[k] - 1 - i] ^ 1 if r.reversed else r.visits[r.starts[k] + i]
+
+
+struct IdIndex(Movable):
+    """Node ids to their index in a block's node table: open addressing (linear probing) over a power-of-two table
+    kept at most half full, its slots' keys id + 1 (0: empty)."""
+
+    var keys: List[UInt64]
+    var values: List[UInt32]
+    var used: Int
+
+    def __init__(out self):
+        self.keys = List[UInt64](length=1024, fill=0)
+        self.values = List[UInt32](length=1024, fill=0)
+        self.used = 0
+
+    def clear(mut self):
+        for i in range(len(self.keys)):
+            self.keys[i] = 0
+        self.used = 0
+
+    @always_inline
+    def _slot(self, key: UInt64) -> Int:
+        var h = key * 0x9E3779B97F4A7C15
+        return Int(h >> 32) & (len(self.keys) - 1)
+
+    def _grow(mut self):
+        var old_keys = self.keys^
+        var old_values = self.values^
+        self.keys = List[UInt64](length=2 * len(old_keys), fill=0)
+        self.values = List[UInt32](length=2 * len(old_keys), fill=0)
+        self.used = 0
+        for i in range(len(old_keys)):
+            if old_keys[i] != 0:
+                _ = self.insert(old_keys[i] - 1, old_values[i])
+
+    @always_inline
+    def insert(mut self, id: UInt64, value: UInt32) -> Bool:
+        """Adds `id` with `value` unless it is there; true if it was added."""
+        if 2 * (self.used + 1) > len(self.keys):
+            self._grow()
+        var key = id + 1
+        var mask = len(self.keys) - 1
+        var at = self._slot(key)
+        while True:
+            var k = self.keys[at]
+            if k == key:
+                return False
+            if k == 0:
+                self.keys[at] = key
+                self.values[at] = value
+                self.used += 1
+                return True
+            at = (at + 1) & mask
+
+    @always_inline
+    def set(mut self, id: UInt64, value: UInt32):
+        """`id`'s value (it must be there)."""
+        var key = id + 1
+        var mask = len(self.keys) - 1
+        var at = self._slot(key)
+        while self.keys[at] != key:
+            at = (at + 1) & mask
+        self.values[at] = value
+
+    @always_inline
+    def get(self, id: UInt64) -> Int:
+        """`id`'s value (it must be there)."""
+        var key = id + 1
+        var mask = len(self.keys) - 1
+        var at = self._slot(key)
+        while self.keys[at] != key:
+            at = (at + 1) & mask
+        return Int(self.values[at])
+
+
+struct Encoder(Movable):
+    """One thread's block encoding: its column buffers, node-table scratch and zstd context, kept from block to
+    block."""
+
+    var cols: List[List[UInt8]]
+    var ids: List[UInt64]
+    var index: IdIndex
+    var compressor: Compressor
+
+    def __init__(out self) raises:
+        self.cols = List[List[UInt8]](length=COLUMNS, fill=List[UInt8]())
+        self.ids = List[UInt64]()
+        self.index = IdIndex()
+        self.compressor = Compressor()
+
+
+def encode_block(
+    graph: Graph, items: Span[Placed, _], mut e: Encoder, level: Int, threads: Int, mut out: EncodedBlock
+) raises:
+    """The records of a block (in file order) as the catalog's columns, each compressed (docs/catalog-format.md):
+    walks as the AT field writes them, their inner visits as indexes into the block's node table (its nodes' ids,
+    lengths and letters)."""
+    for ref c in e.cols:
+        c.clear()
+    var prev_pos = items[0].record.pos
+    var prev_first = 0
+    for i in range(len(items)):
+        ref it = items[i]
+        ref r = it.record
+        put_varint(e.cols[POS], UInt64(r.pos - prev_pos))
+        prev_pos = r.pos
+        var n0 = r.ends[0] - r.starts[0]
+        var first = _at_visit(r, 0, 0)
+        var last = _at_visit(r, 0, n0 - 1)
+        var ok = (last ^ 1 == r.start and first ^ 1 == r.end) if r.reversed else (
+            first == r.start and last == r.end
+        )
+        if not ok:
+            raise Error(t"the record of snarl {r.start}..{r.end}: its first walk does not run between its ID's nodes")
+        var flags = UInt8(0)
+        if r.reversed:
+            flags |= FLAG_REVERSED
+        if r.pad >= 0:
+            flags |= FLAG_PAD
+            e.cols[PAD].append(UInt8(r.pad))
+        if it.has_ps:
+            flags |= FLAG_PS
+        e.cols[FLAGS].append(flags)
+        put_varint(e.cols[BOUND], zigzag(Int(first) - prev_first))
+        put_varint(e.cols[BOUND], zigzag(Int(last) - Int(first)))
+        prev_first = Int(first)
+        put_varint(e.cols[NWALK], UInt64(r.walks()))
+        for k in range(r.walks()):
+            var m = r.ends[k] - r.starts[k]
+            if m < 2 or _at_visit(r, k, 0) != first or _at_visit(r, k, m - 1) != last:
+                raise Error(t"the record of snarl {r.start}..{r.end}: a walk does not share its first walk's ends")
+            put_varint(e.cols[WLEN], UInt64(m - 2))
+        put_varint(e.cols[LV], UInt64(it.lv))
+        if it.has_ps:
+            put_varint(e.cols[PS], zigzag(Int(it.ps_start) - Int(r.start)))
+            put_varint(e.cols[PS], zigzag(Int(it.ps_end) - Int(it.ps_start)))
+    # The node table: the distinct inner nodes, by id.
+    e.ids.clear()
+    e.index.clear()
+    for i in range(len(items)):
+        ref r = items[i].record
+        for k in range(r.walks()):
+            for j in range(r.starts[k] + 1, r.ends[k] - 1):
+                var id = r.visits[j] >> 1
+                if e.index.insert(id, 0):
+                    e.ids.append(id)
+    sort(e.ids)
+    for i in range(len(e.ids)):
+        e.index.set(e.ids[i], UInt32(i))
+    # WALK: each inner visit as its table index (a zigzag difference from the visit before, across walks and
+    # records) and its orientation.
+    var prev = 0
+    for i in range(len(items)):
+        ref r = items[i].record
+        for k in range(r.walks()):
+            var m = r.ends[k] - r.starts[k]
+            for x in range(1, m - 1):
+                var v = _at_visit(r, k, x)
+                var idx = e.index.get(v >> 1)
+                put_varint(e.cols[WALK], zigzag(idx - prev) << 1 | (v & 1))
+                prev = idx
+    # The table: ids as differences, lengths, letters (LetterPacker).
+    var prev_id = UInt64(0)
+    var packer = LetterPacker()
+    var seq = List[UInt8]()
+    var exc = List[UInt8]()
+    swap(seq, e.cols[SEQ])
+    swap(exc, e.cols[EXC])
+    for id in e.ids:
+        put_varint(e.cols[NODEID], id - prev_id)
+        prev_id = id
+        var s = graph.letters(Int(id))
+        put_varint(e.cols[NODELEN], UInt64(len(s)))
+        packer.add(s, seq, exc)
+    packer.finish(seq)
+    swap(seq, e.cols[SEQ])
+    swap(exc, e.cols[EXC])
+    out.data.clear()
+    for c in range(COLUMNS):
+        out.sizes[2 * c] = e.compressor.column(Span(e.cols[c]), level, threads, out.data)
+        out.sizes[2 * c + 1] = len(e.cols[c])
+
+
+struct Unit(Movable):
+    """A block as it is filled: its records, then (once sealed) encoded. A giant's record is encoded elsewhere
+    (_GiantTask), its block set from there."""
+
+    var window: Int
+    var items: List[Placed]
+    var text: Int
+    """The records' VCF text: their lines and newlines."""
+    var first: Int
+    var last: Int
+    var max_end: Int
+    var min_allele: Int
+    var max_walk: Int
+    var count: Int
+    var sealed: Bool
+    """Takes no further records: an own block (a record over OWN_BLOCK_BYTES), a giant, or followed by another."""
+    var giant: Bool
+    var done: Bool
+    """Its block is encoded."""
+    var block: EncodedBlock
+
+    def __init__(out self, window: Int, pos: Int, sealed: Bool):
+        self.window = window
+        self.items = List[Placed]()
+        self.text = 0
+        self.first = pos
+        self.last = pos
+        self.max_end = 0
+        self.min_allele = Int.MAX
+        self.max_walk = 0
+        self.count = 0
+        self.sealed = sealed
+        self.giant = False
+        self.done = False
+        self.block = EncodedBlock()
+
+    def add(mut self, r: Record, length: Int):
+        self.text += length + 1
+        self.last = r.pos
+        self.max_end = max(self.max_end, r.last())
+        self.min_allele = min(self.min_allele, r.min_allele())
+        self.max_walk = max(self.max_walk, r.max_walk())
+        self.count += 1
+
+    def encode(mut self, graph: Graph, mut e: Encoder, level: Int, threads: Int) raises:
+        encode_block(graph, Span(self.items), e, level, threads, self.block)
+        self.finish()
+
+    def finish(mut self):
+        """Its block's index fields; its records freed."""
+        self.block.first_pos = self.first
+        self.block.last_pos = self.last
+        self.block.max_end = self.max_end
+        self.block.records = self.count
+        self.block.min_allele = self.min_allele
+        self.block.max_walk = self.max_walk
+        self.items = List[Placed]()
+        self.done = True
+
+
+struct BlockWriter(Movable):
+    """A contig's blocks as its records arrive in POS order: `place` puts each in a block (a unit), or `place_giant`
+    in one of its own; the caller encodes the sealed units (any thread, each its own) and `take_done` keeps the
+    units done, in order. Units are numbered from 0 in file order; `units` holds those not yet taken, from
+    `base`."""
+
+    var units: List[Unit]
+    var base: Int
+    var blocks: List[EncodedBlock]
+
+    def __init__(out self):
+        self.units = List[Unit]()
+        self.base = 0
+        self.blocks = List[EncodedBlock]()
+
+    def _seal_last(mut self):
+        if len(self.units) > 0:
+            self.units[len(self.units) - 1].sealed = True
+
+    def place(mut self, var item: Placed, length: Int) -> Int:
+        """A record whose line is `length` bytes (newline excluded) into its block; returns the unit. A record
+        starts a new block when it has one of its own, or the block filling is sealed, of another BLOCK_BP window,
+        or BLOCK_BYTES long."""
+        var pos = item.record.pos
+        var window = pos // BLOCK_BP
+        var own = length > OWN_BLOCK_BYTES
+        var n = len(self.units)
+        var new_block = own or n == 0
+        if not new_block:
+            ref b = self.units[n - 1]
+            new_block = b.sealed or b.window != window or b.text >= BLOCK_BYTES
+        if new_block:
+            self._seal_last()
+            self.units.append(Unit(window, pos, own))
+        ref b = self.units[len(self.units) - 1]
+        b.add(item.record, length)
+        b.items.append(item^)
+        return self.base + len(self.units) - 1
+
+    def place_giant(mut self, r: Record, length: Int) -> Int:
+        """A unit for a record encoded elsewhere, after every unit so far (which it seals)."""
+        self._seal_last()
+        var u = Unit(r.pos // BLOCK_BP, r.pos, True)
+        u.giant = True
+        u.add(r, length)
+        self.units.append(u^)
+        return self.base + len(self.units) - 1
+
+    def unit(mut self, id: Int) -> MutPointer[Unit, MutUntrackedOrigin]:
+        """Unit `id`: valid until the next `place`, `place_giant` or `take_done`."""
+        return mut_untracked(self.units.unsafe_ptr().unsafe_offset(id - self.base))
+
+    def seal(mut self):
+        """No further records: the block filling is sealed too."""
+        self._seal_last()
+
+    def take_done(mut self):
+        """Keeps the units done, up to the first not done, in order."""
+        var n = 0
+        while n < len(self.units) and self.units[n].done:
+            n += 1
+        if n == 0:
+            return
+        var rest = List[Unit]()
+        for i in range(len(self.units)):
+            if i < n:
+                var b = EncodedBlock()
+                swap(b, self.units[i].block)
+                self.blocks.append(b^)
+        while len(self.units) > n:
+            rest.append(self.units.pop(n))
+        self.units = rest^
+        self.base += n
 
 
 struct _GiantOut(Movable):
-    """A giant record's block, made on a thread of its own: its frame, and 1 once made (2 if that failed)."""
+    """A giant record's block, made on a thread of its own: its block, and 1 once made (2 if that failed)."""
 
-    var frame: List[UInt8]
+    var block: EncodedBlock
     var state: Atomic[Int64]
     var unit: Int
     var error: String
 
     def __init__(out self, unit: Int):
-        self.frame = List[UInt8]()
+        self.block = EncodedBlock()
         self.state = Atomic[Int64](0)
         self.unit = unit
         self.error = String()
 
 
-struct _GiantTask(ParallelTask):
-    """A record whose line is longer than STREAM_BYTES, compressed as it is written (zstd's own threads compress)."""
+struct _GiantTask(Movable, PoolTask):
+    """A record whose line is longer than STREAM_BYTES, encoded on a thread of its own (zstd's own threads compress
+    its long columns)."""
 
     var graph: ImmPointer[Graph, ImmUntrackedOrigin]
-    var record: Record
-    var chrom: String
-    var lv: Int
-    var ps: List[UInt8]
-    var length: Int
+    var item: List[Placed]
     var level: Int
     var threads: Int
     var result: MutPointer[_GiantOut, MutUntrackedOrigin]
@@ -1323,139 +1456,35 @@ struct _GiantTask(ParallelTask):
     def __init__(
         out self,
         graph: ImmPointer[Graph, ImmUntrackedOrigin],
-        var record: Record,
-        chrom: String,
-        lv: Int,
-        var ps: List[UInt8],
-        length: Int,
+        var item: Placed,
         level: Int,
         threads: Int,
         result: MutPointer[_GiantOut, MutUntrackedOrigin],
     ):
         self.graph = graph
-        self.record = record^
-        self.chrom = chrom
-        self.lv = lv
-        self.ps = ps^
-        self.length = length
+        self.item = List[Placed]()
+        self.item.append(item^)
         self.level = level
         self.threads = threads
         self.result = result
 
-    def run(self, index: Int):
+    def run(self, index: Int, worker: Int):
         try:
-            var sink = StreamSink(FrameStream(self.length + 1, self.level, self.threads))
-            write_giant(self.graph[], self.record, self.chrom, self.lv, Span(self.ps), sink, self.threads)
-            var newline = sink.room()
-            newline[0][] = UInt8(ord("\n"))
-            sink.grew(1)
-            self.result[].frame = sink.stream.finish()
+            var e = Encoder()
+            encode_block(self.graph[], Span(self.item), e, self.level, self.threads, self.result[].block)
             self.result[].state.store(1)
         except e:
             self.result[].error = String(e)
             self.result[].state.store(2)
 
 
-comptime GIANT_WINDOW = 256 << 20
-"""The most of a giant record's line made at once."""
-
-
-@fieldwise_init
-struct _PieceTask(ParallelTask):
-    """Pieces `first + index` of a giant record's line (allele k for piece k, then walk k), each into its buffer."""
-
-    var graph: ImmPointer[Graph, ImmUntrackedOrigin]
-    var record: ImmPointer[Record, ImmUntrackedOrigin]
-    var first: Int
-    var buffers: MutPointer[List[UInt8], MutUntrackedOrigin]
-    var bad: MutPointer[Int, MutUntrackedOrigin]
-
-    def run(self, index: Int):
-        var piece = self.first + index
-        ref r = self.record[]
-        var n = r.walks()
-        var k = piece if piece < n else piece - n
-        var length = r.lens[k] if piece < n else _walk_text_length(r, k)
-        ref buf = self.buffers[unsafe_offset=index]
-        buf = List[UInt8](unsafe_uninit_length=length)
-        var sink = MemorySink(mut_untracked(buf.unsafe_ptr()))
-        try:
-            if piece < n:
-                _put_allele(self.graph[], r, k, sink)
-            else:
-                _put_walk(r, k, sink)
-        except:
-            self.bad[] = 1
-            return
-        if Int(sink.at) - Int(buf.unsafe_ptr()) != length:
-            self.bad[] = 1
-
-
-def write_giant(
-    graph: Graph, r: Record, chrom: String, lv: Int, ps: Span[UInt8, _], mut out: StreamSink, threads: Int
-) raises:
-    """`write_line` for a giant record: its alleles and walks made on `threads` threads, a window of them at a time,
-    and handed to zstd in order."""
-    _put(out, chrom.as_bytes())
-    _put_byte(out, UInt8(ord("\t")))
-    _put_number(out, r.pos)
-    _put_byte(out, UInt8(ord("\t")))
-    var id = List[UInt8]()
-    put_visit(id, r.start)
-    put_visit(id, r.end)
-    _put(out, Span(id))
-    _put_byte(out, UInt8(ord("\t")))
-    var n = r.walks()
-    var pieces = 2 * n
-    var first = 0
-    while first < pieces:
-        var last = first
-        var bytes = 0
-        while last < pieces and (last == first or bytes < GIANT_WINDOW):
-            bytes += r.lens[last] if last < n else _walk_text_length(r, last - n)
-            last += 1
-        var buffers = List[List[UInt8]](length=last - first, fill=List[UInt8]())
-        var bad = 0
-        var task = _PieceTask(
-            untracked(Pointer(to=graph)),
-            untracked(Pointer(to=r)),
-            first,
-            mut_untracked(buffers.unsafe_ptr()),
-            mut_untracked(Pointer(to=bad)),
-        )
-        parallel_for(task, last - first, threads)
-        if bad != 0:
-            raise Error("a giant record's line could not be made")
-        for i in range(first, last):
-            # The separator before the piece: the REF ends at a tab, ALTs are split by commas, then the AT field.
-            if i == 1:
-                _put_byte(out, UInt8(ord("\t")))
-            elif i > 1 and i < n:
-                _put_byte(out, UInt8(ord(",")))
-            elif i == n:
-                if n == 1:
-                    _put_byte(out, UInt8(ord("\t")))
-                _put(out, "\t60\t.\tAT=".as_bytes())
-            elif i > n:
-                _put_byte(out, UInt8(ord(",")))
-            ref buf = buffers[i - first]
-            out.stream.feed(buf.unsafe_ptr(), len(buf))
-        first = last
-    _put(out, ";LV=".as_bytes())
-    _put_number(out, lv)
-    if len(ps) > 0:
-        _put(out, ";PS=".as_bytes())
-        _put(out, ps)
-
-
 struct _Batch(Movable):
-    """A batch of snarls: their records, then, once built, the items to write and where."""
+    """A batch of snarls: their records, then, once built, the items to place, in file order."""
 
     var lo: Int
     var hi: Int
     var records: List[Record]
     var items: List[_Item]
-    var ps_text: List[UInt8]
 
     def __init__(out self, lo: Int, hi: Int):
         self.lo = lo
@@ -1464,24 +1493,19 @@ struct _Batch(Movable):
         for _ in range(hi - lo):
             self.records.append(Record())
         self.items = List[_Item]()
-        self.ps_text = List[UInt8]()
 
 
-struct _StepTask(ParallelTask):
+struct _StepTask(PoolTask):
     """One step's jobs, taken in turn by `workers` workers (each with its own builder): the batch's records built
-    (`cur`), the previous batch's lines written and its sealed units compressed (`prev`)."""
+    (`cur`), and the sealed blocks encoded."""
 
     var sh: _Shared
     var jobs: ImmPointer[_Job, ImmUntrackedOrigin]
     var count: Int
     var next: MutPointer[Atomic[Int64], MutUntrackedOrigin]
     var cur: MutPointer[_Batch, MutUntrackedOrigin]
-    var prev: ImmPointer[_Batch, ImmUntrackedOrigin]
-    var unit_lines: ImmPointer[List[Int], ImmUntrackedOrigin]
-    """Per unit (from the writer's base), the previous batch's items placed in it."""
-    var writer: MutPointer[Writer, MutUntrackedOrigin]
+    var writer: MutPointer[BlockWriter, MutUntrackedOrigin]
     var builders: MutPointer[Builder, MutUntrackedOrigin]
-    var chrom: ImmPointer[String, ImmUntrackedOrigin]
     var level: Int
     var threads: Int
     var fill_batch: ImmPointer[Int, ImmUntrackedOrigin]
@@ -1500,11 +1524,8 @@ struct _StepTask(ParallelTask):
         count: Int,
         next: MutPointer[Atomic[Int64], MutUntrackedOrigin],
         cur: MutPointer[_Batch, MutUntrackedOrigin],
-        prev: ImmPointer[_Batch, ImmUntrackedOrigin],
-        unit_lines: ImmPointer[List[Int], ImmUntrackedOrigin],
-        writer: MutPointer[Writer, MutUntrackedOrigin],
+        writer: MutPointer[BlockWriter, MutUntrackedOrigin],
         builders: MutPointer[Builder, MutUntrackedOrigin],
-        chrom: ImmPointer[String, ImmUntrackedOrigin],
         level: Int,
         threads: Int,
         fill_batch: ImmPointer[Int, ImmUntrackedOrigin],
@@ -1523,16 +1544,13 @@ struct _StepTask(ParallelTask):
         self.count = count
         self.next = next
         self.cur = cur
-        self.prev = prev
-        self.unit_lines = unit_lines
         self.writer = writer
         self.builders = builders
-        self.chrom = chrom
         self.level = level
         self.threads = threads
 
-    def run(self, worker: Int):
-        ref b = self.builders[unsafe_offset=worker]
+    def run(self, seat: Int, worker: Int):
+        ref b = self.builders[unsafe_offset=seat]
         while True:
             var i = Int(self.next[].fetch_add(1))
             if i >= self.count:
@@ -1578,25 +1596,8 @@ struct _StepTask(ParallelTask):
             var rt = self.sh.refs[unsafe_offset=batch.lo + job.a]
             b.build(g, self.sh.reference[], self.sh.snarls[unsafe_offset=rt.snarl], rt.t, batch.records[job.a])
         else:
-            ref w = self.writer[]
-            var u = w.unit(job.a)
-            ref prev = self.prev[]
-            for k in self.unit_lines[unsafe_offset=job.a - w.base]:
-                var it = prev.items[k]
-                var sink = MemorySink(w.at(job.a, it.offset))
-                var start = Int(sink.at)
-                write_line(
-                    g,
-                    prev.records[it.record],
-                    self.chrom[],
-                    it.lv,
-                    Span(prev.ps_text)[it.ps_at : it.ps_at + it.ps_length],
-                    sink,
-                )
-                if Int(sink.at) - start != it.length:
-                    raise Error("a record's line is not the length it was measured")
-            if u[].sealed and not u[].done:
-                u[].compress(b.compressor, self.level, self.threads)
+            var u = self.writer[].unit(job.a)
+            u[].encode(g, b.encoder, self.level, self.threads)
 
 
 struct _Phases:
@@ -1626,7 +1627,7 @@ struct _Phases:
             "sorted, heavy snarls",
             "steps planned and placed",
             "steps",
-            "blocks written",
+            "blocks kept",
             "finished",
             "prepared, waiting",
         ]
@@ -1651,44 +1652,52 @@ def _id_key(r: Record, mut out: List[UInt8]):
     out.append(UInt8(ord("\t")))
 
 
+def _visit_length(v: UInt64) -> Int:
+    return 1 + decimal_digits(Int(v >> 1))
+
+
 def _place(
     mut batch: _Batch,
     mut emitted: List[Bool],
     parent: List[UInt32],
     snarls: List[Snarl],
     refs: List[RefTrav],
-    region: Optional[Tuple[Int, Int]],
+    regions: List[Tuple[Int, Int]],
     chrom: String,
-    mut w: Writer,
 ) -> Int:
-    """A built batch's records to write, in file order, each placed in its unit: LV / PS from the ancestors built so
-    far, as vg's update_nesting_info_tags (the ancestors that have a record count, the nearest names the parent).
-    Returns how many."""
+    """A built batch's records to write, in file order: LV / PS from the ancestors built so far, as vg's
+    update_nesting_info_tags (the ancestors that have a record count, the nearest names the parent). A record
+    outside every region (if any are given) is left out. Returns how many."""
     for k in range(batch.lo, batch.hi):
         emitted[refs[k].snarl] = batch.records[k - batch.lo].present
     batch.items.clear()
-    batch.ps_text.clear()
     for k in range(batch.lo, batch.hi):
         ref r = batch.records[k - batch.lo]
         if not r.present:
             continue
-        if region and (r.pos > region.value()[1] or r.last() < region.value()[0]):
-            continue
+        if len(regions) > 0:
+            var inside = False
+            for g in regions:
+                inside = inside or (r.pos <= g[1] and r.last() >= g[0])
+            if not inside:
+                continue
         var lv = 0
-        var ps_at = len(batch.ps_text)
-        var ps_length = 0
+        var ps_start = UInt64(0)
+        var ps_end = UInt64(0)
+        var has_ps = False
         var c = parent[refs[k].snarl]
         while c != NONE:
             var pi = Int(c)
             if emitted[pi]:
                 lv += 1
-                if ps_length == 0:
-                    put_visit(batch.ps_text, snarls[pi].start)
-                    put_visit(batch.ps_text, snarls[pi].end)
-                    ps_length = len(batch.ps_text) - ps_at
+                if not has_ps:
+                    ps_start = snarls[pi].start
+                    ps_end = snarls[pi].end
+                    has_ps = True
             c = parent[pi]
+        var ps_length = _visit_length(ps_start) + _visit_length(ps_end) if has_ps else 0
         var length = r.line_length(chrom.byte_length(), lv, ps_length)
-        batch.items.append(_Item(k - batch.lo, lv, ps_at, ps_length, length, 0, 0))
+        batch.items.append(_Item(k - batch.lo, lv, ps_start, ps_end, has_ps, length))
     var records_ptr = imm_untracked(batch.records.unsafe_ptr())
     var id_a = List[UInt8]()
     var id_b = List[UInt8]()
@@ -1704,15 +1713,6 @@ def _place(
         return _bytes_less(Span(id_a), Span(id_b))
 
     sort(Span(batch.items), item_less)
-    for ref it in batch.items:
-        ref r = batch.records[it.record]
-        if it.length > STREAM_BYTES:
-            it.unit = w.place_giant(r.pos, r.last(), r.min_allele(), r.max_walk(), it.length + 1)
-            it.offset = -1
-        else:
-            var place = w.place(r.pos, r.last(), r.min_allele(), r.max_walk(), it.length)
-            it.unit = place[0]
-            it.offset = place[1]
     return len(batch.items)
 
 
@@ -1747,14 +1747,16 @@ struct ContigPlan(Movable):
     var heavy_of: List[Int]
     var widths: List[Int]
     """Per reference traversal, the node ids between its snarl's boundaries."""
-    var region: Optional[Tuple[Int, Int]]
+    var regions: List[Tuple[Int, Int]]
+    var pool: MutPointer[Pool, MutUntrackedOrigin]
+    var rank: Int
+    """The contig's place among those built at once: the pool runs its jobs before those of contigs ranked after."""
     var helper_builders: List[Builder]
-    var counters: Allocation[Atomic[Int64]]
-    """The helpers' next heavy snarl, and their stop."""
-    var counters_ptr: MutPointer[Atomic[Int64], MutUntrackedOrigin]
+    var helpers: OwnedPointer[_HelperTask]
+    var helper_job: Int
+    """The helpers' job in the pool (-1 once stopped)."""
     var bad: List[Int]
     """1 once a task failed."""
-    var helpers: Background[_HelperTask]
     var timing: _Phases
     var t0: Int
 
@@ -1762,18 +1764,22 @@ struct ContigPlan(Movable):
         out self,
         graph: Graph,
         var reference: ReferencePath,
-        snarls_path: String,
-        region: Optional[Tuple[Int, Int]],
+        var snarls: List[Snarl],
+        regions: List[Tuple[Int, Int]],
         threads: Int,
+        pool: MutPointer[Pool, MutUntrackedOrigin],
+        rank: Int,
     ) raises:
         self.t0 = perf_counter_ns()
         self.timing = _Phases()
         self.reference = OwnedPointer(reference^)
-        self.region = region
+        self.regions = regions.copy()
+        self.pool = pool
+        self.rank = rank
+        self.helper_job = -1
         self.bad = List[Int](length=1, fill=0)
-        self.helper_builders = List[Builder]()
         self.heavy = List[_Heavy]()
-        self.snarls = read_snarls(snarls_path, threads)
+        self.snarls = snarls^
         self.timing.lap(0)
         var rp = untracked(self.reference.ptr())
         ref r = rp[]
@@ -1810,7 +1816,7 @@ struct ContigPlan(Movable):
         self.timing.lap(1)
 
         # Pass 1: reference traversals, kept when there is exactly one (a snarl the reference crosses twice would
-        # need one record per crossing) and, for a region, when it can overlap.
+        # need one record per crossing) and, with regions, when it can overlap one.
         var found = List[Traversal](unsafe_uninit_length=n)
         var pass1 = _TraverseTask(
             untracked(Pointer(to=graph)),
@@ -1818,12 +1824,11 @@ struct ContigPlan(Movable):
             imm_untracked(self.snarls.unsafe_ptr()),
             n,
             mut_untracked(found.unsafe_ptr()),
-            Bool(region),
-            region.value()[0] if region else 0,
-            region.value()[1] if region else 0,
+            imm_untracked(self.regions.unsafe_ptr()),
+            len(self.regions),
             mut_untracked(self.bad.unsafe_ptr()),
         )
-        parallel_for(pass1, (n + TRAVERSE_SPAN - 1) // TRAVERSE_SPAN, threads)
+        pool[].run(pass1, (n + TRAVERSE_SPAN - 1) // TRAVERSE_SPAN, 0, rank)
         if self.bad[0] != 0:
             raise Error(t"{r.chrom}: the graph could not be searched")
         self.refs = List[RefTrav]()
@@ -1873,14 +1878,15 @@ struct ContigPlan(Movable):
                 var haplotypes = first.value().count() if first else 0
                 self.heavy_of[k] = len(self.heavy)
                 self.heavy.append(_Heavy(k, _parts(span, nodes, haplotypes, threads)))
-        var helpers_n = max(threads // 2, 1)
-        for _ in range(helpers_n):
+        var first = List[Int]()
+        first.append(0)
+        for h in range(len(self.heavy)):
+            first.append(first[len(first) - 1] + len(self.heavy[h].ranges))
+        var parts = first[len(first) - 1]
+        self.helper_builders = List[Builder]()
+        for _ in range(pool[].threads if parts > 0 else 0):
             self.helper_builders.append(Builder())
-        self.counters = alloc(Layout[Atomic[Int64]](length=2))
-        self.counters_ptr = mut_untracked(self.counters.unsafe_ptr())
-        self.counters_ptr.unsafe_write(Atomic[Int64](0))
-        self.counters_ptr.unsafe_offset(1).unsafe_write(Atomic[Int64](0))
-        self.helpers = Background(
+        self.helpers = OwnedPointer(
             _HelperTask(
                 _Shared(
                     untracked(Pointer(to=graph)),
@@ -1890,14 +1896,12 @@ struct ContigPlan(Movable):
                     mut_untracked(self.heavy.unsafe_ptr()),
                     mut_untracked(self.bad.unsafe_ptr()),
                 ),
-                len(self.heavy),
-                self.counters_ptr,
-                self.counters_ptr.unsafe_offset(1),
+                first^,
                 mut_untracked(self.helper_builders.unsafe_ptr()),
-            ),
-            helpers_n,
-            helpers_n if len(self.heavy) > 0 else 0,
+            )
         )
+        if parts > 0:
+            self.helper_job = pool[].submit(self.helpers[], parts, 1, rank)
         self.timing.lap(3)
 
     def shared(mut self, graph: Graph) -> _Shared:
@@ -1912,73 +1916,76 @@ struct ContigPlan(Movable):
 
     def stop(mut self):
         """Stops the helpers (after the parts they are searching) and waits for them."""
-        self.counters_ptr.unsafe_offset(1)[].store(1)
-        self.helpers.join()
+        if self.helper_job >= 0:
+            self.pool[].cancel(self.helper_job)
+            self.helper_job = -1
 
     def __deinit__(deinit self):
-        self.counters_ptr.unsafe_offset(1)[].store(1)
-        self.helpers.join()
-        dealloc(self.counters^)
+        if self.helper_job >= 0:
+            self.pool[].cancel(self.helper_job)
 
 
 struct ContigTail(Movable):
-    """A catalog whose records are all placed: the giant records still compressing on threads of their own, and the
-    blocks left to write."""
+    """A catalog whose records are all placed: the giant records still encoding on threads of their own, and the
+    blocks left to keep."""
 
     var plan: ContigPlan
-    var writer: Writer
+    var writer: BlockWriter
     var giants: List[OwnedPointer[_GiantOut]]
-    var giant_threads: List[Background[_GiantTask]]
+    var giant_tasks: List[OwnedPointer[_GiantTask]]
+    var giant_jobs: List[Int]
+    """The giants' jobs in the pool."""
     var records: Int
 
     def __init__(
         out self,
         var plan: ContigPlan,
-        var writer: Writer,
+        var writer: BlockWriter,
         var giants: List[OwnedPointer[_GiantOut]],
-        var giant_threads: List[Background[_GiantTask]],
+        var giant_tasks: List[OwnedPointer[_GiantTask]],
+        var giant_jobs: List[Int],
         records: Int,
     ):
         self.plan = plan^
         self.writer = writer^
         self.giants = giants^
-        self.giant_threads = giant_threads^
+        self.giant_tasks = giant_tasks^
+        self.giant_jobs = giant_jobs^
         self.records = records
 
 
-def _giants_done(mut giants: List[OwnedPointer[_GiantOut]], mut w: Writer):
-    """The frames of the giants made since, to their units."""
+def _giants_done(mut giants: List[OwnedPointer[_GiantOut]], mut w: BlockWriter):
+    """The blocks of the giants made since, to their units."""
     for i in range(len(giants)):
         if giants[i][].state.load() == 1 and giants[i][].unit >= w.base:
             var u = w.unit(giants[i][].unit)
             if not u[].done:
-                swap(u[].frame, giants[i][].frame)
-                u[].done = True
+                swap(u[].block, giants[i][].block)
+                u[].finish()
 
 
-def run_steps(graph: Graph, var plan: ContigPlan, out_prefix: String, level: Int, threads: Int) raises -> ContigTail:
-    """A prepared catalog's records built, placed, written and compressed, in steps: a step's tasks build one batch's
-    records and, at the same time, write the previous batch's lines into their blocks and compress the sealed ones;
-    between steps the batch just built is placed (one thread) and the blocks done are written, in order. Once every
-    task of a step is taken, the threads build records of the next LOOKAHEAD batches until its last tasks finish, so
-    no step waits idle on one long task. Heavy snarls' parts no helper has taken are searched in the step that needs
-    them; giant records are compressed on threads of their own."""
+def run_steps(graph: Graph, var plan: ContigPlan, level: Int, threads: Int) raises -> ContigTail:
+    """A prepared catalog's records built, placed and encoded, in steps: a step's tasks build one batch's records
+    and, at the same time, encode the blocks sealed so far; between steps the batch just built is placed in blocks
+    (one thread) and the blocks done are kept, in order. Once every task of a step is taken, the threads build
+    records of the next LOOKAHEAD batches until its last tasks finish, so no step waits idle on one long task. Heavy
+    snarls' parts no helper has taken are searched in the step that needs them; giant records are encoded on threads
+    of their own."""
     plan.timing.lap(8)
     var sh = plan.shared(graph)
     var batches = len(plan.bounds) - 1
     ref r = plan.reference[]
     var chrom = r.chrom
-    var w = Writer(out_prefix + ".pgsites", vcf_header(chrom, r.length), level, threads)
+    var w = BlockWriter()
     var emitted = List[Bool](length=len(plan.snarls), fill=False)
     var builders = List[Builder]()
     for _ in range(threads):
         builders.append(Builder())
     var giants = List[OwnedPointer[_GiantOut]]()
-    var giant_threads = List[Background[_GiantTask]]()
+    var giant_tasks = List[OwnedPointer[_GiantTask]]()
+    var giant_jobs = List[Int]()
     var records_written = 0
-    # The batch built, the one before it (its lines written), and up to LOOKAHEAD after it, whose records fill the
-    # steps' ends.
-    var prev = OwnedPointer(_Batch(0, 0))
+    # The batch built and up to LOOKAHEAD after it, whose records fill the steps' ends.
     var cur = OwnedPointer(_Batch(plan.bounds[0], plan.bounds[1]) if batches > 0 else _Batch(0, 0))
     var futures = List[OwnedPointer[_Batch]]()
     var made = min(batches, 1)
@@ -1988,14 +1995,9 @@ def run_steps(graph: Graph, var plan: ContigPlan, out_prefix: String, level: Int
             made += 1
         if step == batches:
             w.seal()
-        # The jobs: heavy snarls' parts no helper has taken first, then units, the other records, and last the heavy
-        # snarls' records awaited (a helper may still be searching a part).
+        # The jobs: heavy snarls' parts no helper has taken first, then the sealed blocks, the other records, and
+        # last the heavy snarls' records awaited (a helper may still be searching a part).
         var jobs = List[_Job]()
-        var unit_lines = List[List[Int]](length=len(w.units), fill=List[Int]())
-        for k in range(len(prev[].items)):
-            var it = prev[].items[k]
-            if it.offset >= 0:
-                unit_lines[it.unit - w.base].append(k)
         for k in range(cur[].lo, cur[].hi):
             var h = plan.heavy_of[k]
             if h >= 0:
@@ -2004,7 +2006,7 @@ def run_steps(graph: Graph, var plan: ContigPlan, out_prefix: String, level: Int
                     jobs.append(_Job(_PART, h))
         for u in range(len(w.units)):
             ref unit = w.units[u]
-            if not unit.giant and (len(unit_lines[u]) > 0 or (unit.sealed and not unit.done)):
+            if unit.sealed and not unit.done and not unit.giant:
                 jobs.append(_Job(_UNIT, w.base + u))
         # Records widest first (the node ids between a snarl's boundaries, as the heavy rule counts them): the
         # costly ones start early and the step ends on cheap ones.
@@ -2051,11 +2053,8 @@ def run_steps(graph: Graph, var plan: ContigPlan, out_prefix: String, level: Int
             len(jobs),
             mut_untracked(Pointer(to=next)),
             mut_untracked(cur.ptr()),
-            imm_untracked(prev.ptr()),
-            imm_untracked(unit_lines.unsafe_ptr()),
             mut_untracked(Pointer(to=w)),
             mut_untracked(builders.unsafe_ptr()),
-            imm_untracked(Pointer(to=chrom)),
             level,
             threads,
             imm_untracked(fill_batch.unsafe_ptr()),
@@ -2065,91 +2064,83 @@ def run_steps(graph: Graph, var plan: ContigPlan, out_prefix: String, level: Int
             mut_untracked(Pointer(to=left)),
         )
         plan.timing.lap(4)
-        parallel_for(task, min(threads, len(jobs)), threads)
+        plan.pool[].run(task, min(threads, len(jobs)), 0, plan.rank)
         plan.timing.lap(5)
         # The tasks reach these through untracked pointers: reads after them keep them alive until they are done.
-        _ = len(jobs) + len(unit_lines) + len(builders) + Int(next.load()) + len(prev[].items) + chrom.byte_length()
+        _ = len(jobs) + len(builders) + Int(next.load()) + chrom.byte_length()
         _ = len(fill) + len(fill_batch) + Int(fill_next.load()) + Int(left.load()) + len(futures)
         if plan.bad[0] != 0:
             plan.stop()
-            raise Error(t"{chrom}: a record could not be built or written")
+            raise Error(t"{chrom}: a record could not be built or encoded")
         _giants_done(giants, w)
-        w.write_done()
+        w.take_done()
         plan.timing.lap(6)
         if step < batches:
             for k in range(cur[].lo, cur[].hi):
                 if plan.heavy_of[k] >= 0:
                     swap(cur[].records[k - cur[].lo], plan.heavy[plan.heavy_of[k]].record)
-            records_written += _place(cur[], emitted, plan.parent, plan.snarls, plan.refs, plan.region, chrom, w)
-            # Giant records leave the batch for threads of their own.
+            records_written += _place(cur[], emitted, plan.parent, plan.snarls, plan.refs, plan.regions, chrom)
             for ref it in cur[].items:
-                if it.offset >= 0:
-                    continue
-                giants.append(OwnedPointer(_GiantOut(it.unit)))
-                var ps = List[UInt8](Span(cur[].ps_text)[it.ps_at : it.ps_at + it.ps_length])
                 var record = Record()
                 swap(record, cur[].records[it.record])
-                giant_threads.append(
-                    Background(
-                        _GiantTask(
-                            sh.graph,
-                            record^,
-                            chrom,
-                            it.lv,
-                            ps^,
-                            it.length,
-                            level,
-                            threads,
-                            mut_untracked(giants[len(giants) - 1].ptr()),
-                        ),
-                        1,
-                        1,
+                var item = Placed(record^, it.lv, it.ps_start, it.ps_end, it.has_ps)
+                if it.length <= STREAM_BYTES:
+                    _ = w.place(item^, it.length)
+                    continue
+                # A giant record leaves the batch for a thread of its own.
+                var unit = w.place_giant(item.record, it.length)
+                giants.append(OwnedPointer(_GiantOut(unit)))
+                giant_tasks.append(
+                    OwnedPointer(
+                        _GiantTask(sh.graph, item^, level, threads, mut_untracked(giants[len(giants) - 1].ptr()))
                     )
                 )
-                if len(giant_threads[len(giant_threads) - 1].handles) == 0:
-                    raise Error("cannot start a thread")
-        prev = cur^
+                giant_jobs.append(plan.pool[].submit(giant_tasks[len(giant_tasks) - 1][], 1, 0, plan.rank))
         cur = futures.pop(0) if len(futures) > 0 else OwnedPointer(_Batch(0, 0))
         plan.timing.lap(4)
-    return ContigTail(plan^, w^, giants^, giant_threads^, records_written)
+    return ContigTail(plan^, w^, giants^, giant_tasks^, giant_jobs^, records_written)
 
 
-def finish_catalog(var tail: ContigTail) raises -> Summary:
-    """The giants still compressing awaited, the last blocks and the index written, the file synced and renamed."""
+def finish_catalog(var tail: ContigTail) raises -> Tuple[Summary, List[EncodedBlock]]:
+    """The giants still encoding awaited, the last blocks kept, the helpers stopped: the contig's blocks."""
     ref w = tail.writer
-    for i in range(len(tail.giant_threads)):
-        tail.giant_threads[i].join()
+    for job in tail.giant_jobs:
+        tail.plan.pool[].wait(job)
     for i in range(len(tail.giants)):
         if tail.giants[i][].state.load() != 1:
             raise Error(
-                t"{tail.plan.reference[].chrom}: a giant record could not be compressed: {tail.giants[i][].error}"
+                t"{tail.plan.reference[].chrom}: a giant record could not be encoded: {tail.giants[i][].error}"
             )
     _giants_done(tail.giants, w)
-    w.write_done()
+    w.take_done()
+    if len(w.units) > 0:
+        raise Error(t"{tail.plan.reference[].chrom}: blocks left unencoded")
     tail.plan.stop()
-    var blocks = w.finish()
     tail.plan.timing.lap(7)
     tail.plan.timing.report(tail.plan.reference[].chrom)
-    return Summary(
+    var blocks = List[EncodedBlock]()
+    swap(blocks, w.blocks)
+    var summary = Summary(
         len(tail.plan.snarls),
         len(tail.plan.refs),
         tail.records,
-        blocks,
+        len(blocks),
         Float64(perf_counter_ns() - tail.plan.t0) * 1e-9,
     )
+    return (summary^, blocks^)
 
 
 def build_catalog(
     graph: Graph,
     reference: ReferencePath,
-    snarls_path: String,
-    region: Optional[Tuple[Int, Int]],
-    out_prefix: String,
+    var snarls: List[Snarl],
+    regions: List[Tuple[Int, Int]],
     level: Int,
     threads: Int,
-) raises -> Summary:
-    """The catalog `<out_prefix>.pgsites` of the reference's contig, or of `region` of it (1-based, inclusive: only
-    the records whose [POS, POS + len(REF) - 1] overlaps it, as `tabix contig:start-end` would return them): prepared,
-    built and finished in turn (`dromos catalog` overlaps one selection's with the next's)."""
-    var plan = ContigPlan(graph, reference.copy(), snarls_path, region, threads)
-    return finish_catalog(run_steps(graph, plan^, out_prefix, level, threads))
+    pool: MutPointer[Pool, MutUntrackedOrigin],
+) raises -> Tuple[Summary, List[EncodedBlock]]:
+    """The blocks of the reference's contig, or of `regions` of it (1-based, inclusive: only the records whose
+    [POS, POS + len(REF) - 1] overlaps one, as `tabix contig:start-end` would return them): prepared, built and
+    finished in turn."""
+    var plan = ContigPlan(graph, reference.copy(), snarls^, regions, threads, pool, 0)
+    return finish_catalog(run_steps(graph, plan^, level, threads))
