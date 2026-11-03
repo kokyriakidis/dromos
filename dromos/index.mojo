@@ -20,7 +20,7 @@ from std.time import perf_counter_ns
 
 from dromos.bgzf import BLOCK, Deflater, eof_block, load_libdeflate, load_zstd, zstd_compress, zstd_decompress
 from dromos.gam import Alignment, slim_line
-from dromos.output import put_padded
+from dromos.output import decimal_digits, put_padded
 from dromos.parallel import ParallelTask, parallel_for
 from dromos.refmap import NO_ANCHOR, Anchor, Placed, RefMap, reason_name
 from dromos.stream import MessageSink, imm_untracked, mut_untracked
@@ -69,13 +69,14 @@ def _get64(p: ImmPointer[UInt8, _], at: Int) -> Int:
 
 def _append_slim(mut out: List[UInt8], p: ImmPointer[UInt8, _], n: Int):
     """pgcat's append_line with slim: the GAF line `p[:n]`'s first 12 columns, then of the rest only its SLIM_TAGS
-    (rq:i:, the rescue's MAPQ; pu:Z:, why a line had no place; rs:Z:, where the rescue put it), in their order."""
+    (rq:i:, the rescue's MAPQ; pu:Z:, why a line had no place; rs:Z:, where the rescue put it), in their order. Tabs
+    are found with memchr: a tag's bytes after its first five are never looked at."""
     var field = 0
     var s = 0
-    for i in range(n + 1):
-        if i < n and p[unsafe_offset=i] != UInt8(ord("\t")):
-            continue
-        var length = i - s
+    while True:
+        var hit = external_call["memchr", Int](p.unsafe_offset(s), Int32(ord("\t")), n - s) if s < n else 0
+        var e = n if hit == 0 else hit - Int(p)
+        var length = e - s
         if field < 12:
             if field > 0:
                 out.append(UInt8(ord("\t")))
@@ -93,7 +94,9 @@ def _append_slim(mut out: List[UInt8], p: ImmPointer[UInt8, _], n: Int):
                 out.append(UInt8(ord("\t")))
                 out.extend(Span(unsafe_ptr=p.unsafe_offset(s), length=length))
         field += 1
-        s = i + 1
+        if e >= n:
+            break
+        s = e + 1
 
 
 @always_inline
@@ -207,16 +210,6 @@ struct _Slot(Movable):
         self.at = 0
 
 
-@always_inline
-def _digits(v: Int) -> Int:
-    var n = 1
-    var bound = 10
-    while v >= bound and n < 19:
-        n += 1
-        bound *= 10
-    return n
-
-
 struct IndexSink(MessageSink, Movable):
     """GAM messages placed and gathered by bucket (see the module's notes)."""
 
@@ -327,40 +320,50 @@ struct IndexSink(MessageSink, Movable):
         first: Int,
         last: Int,
     ):
-        """Lines `first ..< last` of a GAF, read as pgcat reads them: a line's trailing carriage return left out, the
-        line classified as text, and a placed one kept slim (its 12 columns and SLIM_TAGS)."""
+        """The lines of pieces `first ..< last` of a GAF (frame_lines), read as pgcat reads them: a line's trailing
+        carriage return left out, the line classified as text, and a placed one kept slim (its 12 columns and
+        SLIM_TAGS)."""
         var placed = Placed(0, 0, 0)
         for m in range(first, last):
-            var start = messages[unsafe_offset=2 * m]
-            var n = messages[unsafe_offset=2 * m + 1] - start
-            var p = data.unsafe_offset(start)
-            if n > 0 and p[unsafe_offset=n - 1] == UInt8(ord("\r")):
-                n -= 1
-            var why = 0
-            var aligned = 0
-            var kind = self._classify(p, n, st.walk, st.anchors, placed, why, aligned)
-            if kind == _SKIP:
-                continue
-            st.counts[C_LINES] += 1
-            if kind == _PLACED:
-                var r = self.rank[placed.contig]
-                st.counts[C_PLACED] += 1
-                st.span[r] = max(st.span[r], aligned)
-                var at = len(st.recs)
-                st.recs.resize(unsafe_uninit_length=at + HEADER)
-                _append_slim(st.recs, p, n)
-                var h = st.recs.unsafe_ptr().unsafe_offset(at)
-                _store(h, r, 4)
-                _store(h.unsafe_offset(4), placed.start, 8)
-                _store(h.unsafe_offset(12), placed.end, 8)
-                _store(h.unsafe_offset(20), len(st.recs) - at - HEADER, 4)
-            elif kind == _UNMAPPED:
-                st.counts[C_UNMAPPED] += 1
-            elif kind == _UNPLACED:
-                st.counts[C_UNPLACED] += 1
-                st.counts[C_WHY + why - NO_ANCHOR] += 1
-            else:
-                st.counts[C_MALFORMED] += 1
+            var at = messages[unsafe_offset=2 * m]
+            var stop = messages[unsafe_offset=2 * m + 1]
+            while at < stop:
+                var hit = external_call["memchr", Int](data.unsafe_offset(at), Int32(ord("\n")), stop - at)
+                var end = stop if hit == 0 else hit - Int(data)
+                self._take_line(st, data.unsafe_offset(at), end - at, placed)
+                at = end + 1
+
+    @always_inline
+    def _take_line(self, mut st: _Slice, p: ImmPointer[UInt8, _], length: Int, mut placed: Placed):
+        """One GAF line, `p[:length]` without its newline."""
+        var n = length
+        if n > 0 and p[unsafe_offset=n - 1] == UInt8(ord("\r")):
+            n -= 1
+        var why = 0
+        var aligned = 0
+        var kind = self._classify(p, n, st.walk, st.anchors, placed, why, aligned)
+        if kind == _SKIP:
+            return
+        st.counts[C_LINES] += 1
+        if kind == _PLACED:
+            var r = self.rank[placed.contig]
+            st.counts[C_PLACED] += 1
+            st.span[r] = max(st.span[r], aligned)
+            var at = len(st.recs)
+            st.recs.resize(unsafe_uninit_length=at + HEADER)
+            _append_slim(st.recs, p, n)
+            var h = st.recs.unsafe_ptr().unsafe_offset(at)
+            _store(h, r, 4)
+            _store(h.unsafe_offset(4), placed.start, 8)
+            _store(h.unsafe_offset(12), placed.end, 8)
+            _store(h.unsafe_offset(20), len(st.recs) - at - HEADER, 4)
+        elif kind == _UNMAPPED:
+            st.counts[C_UNMAPPED] += 1
+        elif kind == _UNPLACED:
+            st.counts[C_UNPLACED] += 1
+            st.counts[C_WHY + why - NO_ANCHOR] += 1
+        else:
+            st.counts[C_MALFORMED] += 1
 
     def _place(
         self,
@@ -418,14 +421,15 @@ struct IndexSink(MessageSink, Movable):
         var ends = SIMD[DType.int64, 16](0)
         var field = 0
         var s = 0
-        for i in range(n + 1):
-            if i == n or p[unsafe_offset=i] == UInt8(ord("\t")):
-                starts[field] = Int64(s)
-                ends[field] = Int64(i)
-                field += 1
-                s = i + 1
-                if field == 12:
-                    break
+        while field < 12:
+            var hit = external_call["memchr", Int](p.unsafe_offset(s), Int32(ord("\t")), n - s) if s < n else 0
+            var e = n if hit == 0 else hit - Int(p)
+            starts[field] = Int64(s)
+            ends[field] = Int64(e)
+            field += 1
+            if e >= n:
+                break
+            s = e + 1
         if field < 12:
             return _MALFORMED
         var strand_at = Int(starts[4])
@@ -699,7 +703,7 @@ struct IndexSink(MessageSink, Movable):
             var e = _get64(p, at + 8)
             var length = _get32(p, at + 16)
             # contig \t start+1 \t end \t line \n
-            var out_len = name_len + 1 + _digits(s + 1) + 1 + _digits(e) + 1 + length + 1
+            var out_len = name_len + 1 + decimal_digits(s + 1) + 1 + decimal_digits(e) + 1 + length + 1
             slot.recs.append(_Rec(s, e, at + 20, length, out_len))
             slot.text_len += out_len
             at += 20 + length

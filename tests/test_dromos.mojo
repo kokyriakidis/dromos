@@ -6,6 +6,7 @@ from std.testing import TestSuite, assert_equal, assert_true
 
 from dromos.gam import Alignment, Framer, frame, gaf_line, slim_line, varint
 from dromos.nodes import NodeTable
+from dromos.output import decimal_digits
 from dromos.refmap import AMBIGUOUS, INCONSISTENT, MISSING_NODE, NO_ANCHOR, Anchor, Placed, RefMap
 from dromos.tabix import N_BINS, bin_level, bin_parent, reg2bin
 
@@ -284,6 +285,16 @@ def test_bins_as_htslib() raises:
     assert_equal(bin_level(0), 0)
     assert_equal(bin_level(4681), 5)
     assert_equal(bin_parent(4681), 585)
+
+
+def test_decimal_digits() raises:
+    var bound = 1
+    for d in range(1, 19):
+        assert_equal(decimal_digits(bound), d)
+        assert_equal(decimal_digits(bound * 10 - 1), d)
+        bound *= 10
+    assert_equal(decimal_digits(0), 1)
+    assert_equal(decimal_digits(9223372036854775807), 19)
 
 
 def main() raises:

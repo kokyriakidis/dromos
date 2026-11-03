@@ -627,8 +627,13 @@ def _gaf_line[
         put_int(out, a.score)
     if a.quality_length > 0:
         put_text(out, "\tbq:Z:")
+        # Phred+33, a byte at a time in a loop the compiler vectorizes.
+        var at = len(out)
+        out.resize(unsafe_uninit_length=at + a.quality_length)
+        var dst = out.unsafe_ptr().unsafe_offset(at)
+        var src = p.unsafe_offset(a.quality_at)
         for k in range(a.quality_length):
-            out.append(p[unsafe_offset=a.quality_at + k] + 33)
+            dst[unsafe_offset=k] = src[unsafe_offset=k] + 33
     put_text(out, "\tcs:Z:")
     out.extend(Span(cs.text))
     if a.identity > 0:

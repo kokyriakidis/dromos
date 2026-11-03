@@ -14,6 +14,8 @@ The table is one file, little-endian, every section starting at a multiple of 8 
 
 from std.os import stat
 
+from dromos.bgzf import MappedFile
+
 comptime MAGIC = "DROMOSN1"
 """The table's first eight bytes."""
 
@@ -33,9 +35,10 @@ trait Nodes:
 
 
 struct NodeTable(Movable, Nodes):
-    """A node table read whole into memory."""
+    """A node table, mapped into memory: its pages are read as they are first touched, by whichever thread touches
+    them (a table of letters is several GB; reading it whole first held every run up)."""
 
-    var data: List[UInt8]
+    var file: MappedFile
     var count: Int
     var lengths_at: Int
     var offsets_at: Int
@@ -43,40 +46,40 @@ struct NodeTable(Movable, Nodes):
     var bases_at: Int
 
     def __init__(out self, path: String) raises:
-        self.data = read_file(path)
-        var n = len(self.data)
+        self.file = MappedFile(path)
+        var n = self.file.size
         var magic = MAGIC.as_bytes()
         var ok = n >= 24
-        for i in range(8):
-            ok = ok and self.data[i] == magic[i]
+        for i in range(min(8, n)):
+            ok = ok and self.file.ptr[unsafe_offset=i] == magic[i]
         if not ok:
             raise Error(t"{path}: not a dromos node table")
-        self.count = Int(_u64_at(self.data, 8))
+        self.count = Int(_u64_at(self.file.ptr, 8))
         self.lengths_at = 16
         var at = self.lengths_at + 4 * self.count
         at += (8 - at % 8) % 8
         if at + 8 > n:
             raise Error(t"{path}: truncated node table")
-        var has_letters = _u64_at(self.data, at) == 1
+        var has_letters = _u64_at(self.file.ptr, at) == 1
         at += 8
         self.offsets_at = -1
         self.bases_at = -1
         if has_letters:
             self.offsets_at = at
             self.bases_at = at + 8 * (self.count + 1)
-            if self.bases_at > n or self.bases_at + Int(_u64_at(self.data, self.offsets_at + 8 * self.count)) > n:
+            if self.bases_at > n or self.bases_at + Int(_u64_at(self.file.ptr, self.offsets_at + 8 * self.count)) > n:
                 raise Error(t"{path}: truncated node letters")
 
     @always_inline
     def _u64(self, at: Int) -> UInt64:
-        return self.data.unsafe_ptr().unsafe_offset(at).unsafe_bitcast[UInt64]()[]
+        return self.file.ptr.unsafe_offset(at).unsafe_bitcast[UInt64]()[]
 
     @always_inline
     def length(self, node: Int) -> Int:
         """Node `node`'s length; 0 for an id the graph lacks."""
         if node < 0 or node >= self.count:
             return 0
-        return Int(self.data.unsafe_ptr().unsafe_offset(self.lengths_at).unsafe_bitcast[UInt32]()[unsafe_offset=node])
+        return Int(self.file.ptr.unsafe_offset(self.lengths_at).unsafe_bitcast[UInt32]()[unsafe_offset=node])
 
     def has_letters(self) -> Bool:
         return self.offsets_at >= 0
@@ -86,16 +89,16 @@ struct NodeTable(Movable, Nodes):
         """Letter `i` of node `node` read in orientation `reverse` (its reverse complement when true)."""
         var start = Int(self._u64(self.offsets_at + 8 * node))
         var length = Int(self._u64(self.offsets_at + 8 * (node + 1))) - start
-        var bases = self.data.unsafe_ptr().unsafe_offset(self.bases_at + start)
+        var bases = self.file.ptr.unsafe_offset(self.bases_at + start)
         if not reverse:
             return bases[unsafe_offset=i]
         return complement(bases[unsafe_offset=length - 1 - i])
 
 
 @always_inline
-def _u64_at(data: List[UInt8], at: Int) -> UInt64:
-    """The little-endian u64 at byte `at` of `data` (a multiple of 8 in the table)."""
-    return data.unsafe_ptr().unsafe_offset(at).unsafe_bitcast[UInt64]()[]
+def _u64_at(p: ImmPointer[UInt8, _], at: Int) -> UInt64:
+    """The little-endian u64 at byte `at` of the table (a multiple of 8 in it)."""
+    return p.unsafe_offset(at).unsafe_bitcast[UInt64]()[]
 
 
 @always_inline

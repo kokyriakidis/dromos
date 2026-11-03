@@ -201,25 +201,27 @@ def mut_untracked[T: AnyType](p: MutPointer[T, _]) -> MutPointer[T, MutUntracked
     return p.unsafe_origin_cast[MutUntrackedOrigin]()
 
 
-def frame_lines(data: Span[UInt8, _], mut messages: List[Int], final: Bool) -> Int:
-    """Appends (start, end) of each whole line at the front of `data`, its newline left out; returns the bytes they
-    take. With `final` (no more data), what follows the last newline is a line too."""
+def frame_lines(data: Span[UInt8, _], mut messages: List[Int], final: Bool, pieces: Int) -> Int:
+    """Cuts the whole lines at the front of `data` into up to `pieces` pieces of whole lines, appending each piece's
+    start and end (its last newline included): a slice finds the lines of its piece itself. Returns the bytes the
+    pieces take. With `final` (no more data), what follows the last newline is a line too."""
     var p = data.unsafe_ptr()
     var n = len(data)
+    var used = n
+    if not final:
+        var last = external_call["memrchr", Int](p, Int32(ord("\n")), n)
+        used = 0 if last == 0 else last - Int(p) + 1
+    var target = max(1, (used + pieces - 1) // pieces)
     var at = 0
-    while at < n:
-        var hit = external_call["memchr", Int](p.unsafe_offset(at), Int32(ord("\n")), n - at)
-        if hit == 0:
-            break
-        var nl = hit - Int(p)
+    while at < used:
+        var cut = min(used, at + target)
+        if cut < used:
+            var hit = external_call["memchr", Int](p.unsafe_offset(cut - 1), Int32(ord("\n")), used - cut + 1)
+            cut = used if hit == 0 else hit - Int(p) + 1
         messages.append(at)
-        messages.append(nl)
-        at = nl + 1
-    if final and at < n:
-        messages.append(at)
-        messages.append(n)
-        at = n
-    return at
+        messages.append(cut)
+        at = cut
+    return used
 
 
 def stream_gam[S: MessageSink](gam_path: String, threads: Int, mut sink: S) raises:
@@ -228,8 +230,8 @@ def stream_gam[S: MessageSink](gam_path: String, threads: Int, mut sink: S) rais
 
 
 def stream_gaf[S: MessageSink](gaf_path: String, threads: Int, mut sink: S) raises:
-    """Hands every line of the GAF at `gaf_path` (plain, gzip or BGZF), in order, to `sink`: each message is a
-    line's start and end, its newline left out."""
+    """Hands every line of the GAF at `gaf_path` (plain, gzip or BGZF), in order, to `sink`: each message is a piece
+    of whole lines (`frame_lines`), its lines the sink's to find."""
     stream_input[lines=True](gaf_path, threads, sink)
 
 
@@ -375,7 +377,7 @@ def stream_input[S: MessageSink, //, lines: Bool](path: String, threads: Int, mu
         messages.clear()
         comptime if lines:
             # The last of the input is in hand once nothing more was read and nothing is carried.
-            used = frame_lines(Span(bufs[nb]), messages, reads == 0 and carry == 0)
+            used = frame_lines(Span(bufs[nb]), messages, reads == 0 and carry == 0, slices)
         else:
             used = framer.frame(Span(bufs[nb]), messages)
         c = nb

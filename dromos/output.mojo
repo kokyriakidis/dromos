@@ -1,5 +1,6 @@
 """Buffered byte output to a file descriptor with fast integer formatting."""
 
+from std.bit import count_leading_zeros
 from std.ffi import external_call
 from std.sys import exit, stderr
 from std.sys.info import CompilationTarget
@@ -25,7 +26,7 @@ struct OutputBuffer(Movable):
         if self.fd >= 0 and len(bytes) >= _FLUSH_AT:
             # Large blocks go out directly, without a copy into the buffer.
             self.flush()
-            _write_all(self.fd, bytes.unsafe_ptr(), len(bytes))
+            write_all(self.fd, bytes.unsafe_ptr(), len(bytes))
             return
         self.buf.extend(bytes)
         if len(self.buf) >= _FLUSH_AT and self.fd >= 0:
@@ -69,11 +70,11 @@ struct OutputBuffer(Movable):
     def flush(mut self):
         if self.fd < 0:
             return
-        _write_all(self.fd, self.buf.unsafe_ptr(), len(self.buf))
+        write_all(self.fd, self.buf.unsafe_ptr(), len(self.buf))
         self.buf.clear()
 
 
-def _write_all(fd: Int32, data: ImmPointer[UInt8, _], length: Int):
+def write_all(fd: Int32, data: ImmPointer[UInt8, _], length: Int):
     """Writes every byte, retrying interrupted writes; any other failure (a
     full disk, a closed pipe) ends the program with an error, never silently
     truncated output."""
@@ -128,15 +129,56 @@ comptime _PAIRS = "0001020304050607080910111213141516171819202122232425262728293
 """The decimal digit pairs 00 to 99, for writing two digits per step."""
 
 
+comptime _POW10 = SIMD[DType.int64, 32](
+    1,
+    10,
+    100,
+    1000,
+    10000,
+    100000,
+    1000000,
+    10000000,
+    100000000,
+    1000000000,
+    10000000000,
+    100000000000,
+    1000000000000,
+    10000000000000,
+    100000000000000,
+    1000000000000000,
+    10000000000000000,
+    100000000000000000,
+    1000000000000000000,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+)
+
+
+@always_inline
+def decimal_digits(value: Int) -> Int:
+    """How many decimal digits non-negative `value` has: from its bit length (times log10 2, as 1233 / 4096), less
+    one when it falls short of that power of ten (Hacker's Delight)."""
+    var bits = 64 - Int(count_leading_zeros(UInt64(value | 1)))
+    var t = (bits * 1233) >> 12
+    return max(1, t + Int(Int64(value) >= _POW10[t]))
+
+
 @inline(.always)
 def put_padded(dst: MutPointer[UInt8, _], value: Int, width: Int) -> Int:
     """Writes non-negative `value` right-aligned in `width` columns (wider
     when it needs more digits); returns the bytes written."""
-    var digits = 1
-    var bound = 10
-    while value >= bound and digits < 19:
-        digits += 1
-        bound *= 10
+    var digits = decimal_digits(value)
     var n = max(width, digits)
     for i in range(n - digits):
         dst[unsafe_offset=i] = UInt8(ord(" "))

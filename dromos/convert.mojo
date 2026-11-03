@@ -2,28 +2,34 @@
 
 from dromos.gam import Alignment, gaf_line, slim_line
 from dromos.nodes import NodeTable
-from dromos.output import OutputBuffer
+from dromos.output import write_all
 from dromos.stream import MessageSink, mut_untracked
 
 
 struct GafSink[tags: Bool](MessageSink, Movable):
-    """Each slice writes its messages' lines into a text of its own; between steps the texts go out in order."""
+    """Each slice writes its messages' lines into a text of its own. The step after, a side task writes them out in
+    order (on stdout) while the next chunk's lines are made: two texts a slice, taking turns."""
 
     var nodes: NodeTable
     var texts: List[List[UInt8]]
+    var prev: List[List[UInt8]]
+    """The last step's texts, being written."""
+    var pending: Int
+    """How many of `prev` are still to write."""
     var alignments: List[Alignment]
     var walks: List[List[Int]]
-    var out: OutputBuffer
 
     def __init__(out self, var nodes: NodeTable, threads: Int):
         self.nodes = nodes^
         self.texts = List[List[UInt8]](length=4 * threads, fill=List[UInt8]())
+        self.prev = List[List[UInt8]](length=4 * threads, fill=List[UInt8]())
+        self.pending = 0
         self.alignments = List[Alignment]()
         for _ in range(4 * threads):
             self.alignments.append(Alignment())
         self.walks = List[List[Int]](length=4 * threads, fill=List[Int]())
-        self.out = OutputBuffer(1)
-        self.out.write("@HD\tVN:Z:1.0\n")
+        var header = "@HD\tVN:Z:1.0\n".as_bytes()
+        write_all(1, header.unsafe_ptr(), len(header))
 
     def slices(self) -> Int:
         return len(self.texts)
@@ -49,14 +55,22 @@ struct GafSink[tags: Bool](MessageSink, Movable):
                 _ = slim_line(data, a[], self.nodes, text[], walk[])
 
     def side_tasks(self) -> Int:
-        return 0
+        return 1 if self.pending > 0 else 0
 
     def side_task(mut self, index: Int) raises:
-        pass
+        self._write_pending()
+
+    def _write_pending(mut self):
+        for t in range(self.pending):
+            write_all(1, self.prev[t].unsafe_ptr(), len(self.prev[t]))
+        self.pending = 0
 
     def after_step(mut self, slices: Int) raises:
+        # `prev` was written in the step just run; the step's texts are the next to write.
         for t in range(slices):
-            self.out.write_bytes(Span(self.texts[t]))
+            swap(self.texts[t], self.prev[t])
+        self.pending = slices
 
     def finish(mut self):
-        self.out.flush()
+        """Writes what is left (also after an error, so the lines made so far are out)."""
+        self._write_pending()
