@@ -12,14 +12,25 @@ license-file = "LICENSE"
 # The nightly karan, sporos and plegma build with, so they link into one program. Move it on purpose, rebuild and test.
 mojo = "==1.2.0.dev2026102005"
 libdeflate = ">=1.26,<2"
+# Builds gbz-ffi, the gbz crate behind a C interface (libdromos_gbz beside build/dromos).
+rust = "==1.98.1"
 
 [tasks]
 # `mojo build -o` writes into a directory but will not create one.
 prepare = "mkdir -p build"
-build = { cmd = "mojo build -I . cli/dromos_cli.mojo -o build/dromos", depends-on = ["prepare"] }
-build-tests = { cmd = "mojo build -I . tests/test_dromos.mojo -o build/test_dromos", depends-on = ["prepare"] }
+# For the host CPU, as mojo build compiles dromos.
+build-gbz = { cmd = "cargo build --release --locked --manifest-path gbz-ffi/Cargo.toml --target-dir build/cargo", env = { RUSTFLAGS = "-C target-cpu=native" }, depends-on = ["prepare"] }
+build = { cmd = "mojo build -I . cli/dromos_cli.mojo -o build/dromos", depends-on = ["gbz-lib"] }
+build-tests = { cmd = "mojo build -I . tests/test_dromos.mojo -o build/test_dromos", depends-on = ["gbz-lib"] }
 test = { cmd = "./build/test_dromos", depends-on = ["build-tests"] }
 check = { cmd = "tests/integration/check.sh", depends-on = ["build"] }
 format = "mojo format -l 120 dromos cli tests"
 # Pulls the latest Mojo skills from github.com/modular/skills into .claude/skills for coding agents.
 sync-skills = "bash .claude/sync-skills.sh"
+
+# The library beside build/dromos, where dromos looks for it first.
+[target.linux.tasks]
+gbz-lib = { cmd = "cp build/cargo/release/libdromos_gbz.so build/", depends-on = ["build-gbz"] }
+
+[target.osx.tasks]
+gbz-lib = { cmd = "cp build/cargo/release/libdromos_gbz.dylib build/", depends-on = ["build-gbz"] }

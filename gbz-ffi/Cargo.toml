@@ -1,0 +1,23 @@
+[package]
+name = "dromos-gbz"
+version = "0.1.0"
+authors = ["Konstantinos Kyriakidis <kkyriaki@ucsc.edu>"]
+edition = "2021"
+# gbz and simple-sds use edition 2024 and let chains.
+rust-version = "1.88"
+description = "The gbz crate behind a C interface, for dromos: GBZ graphs read by the crate, everything above it in Mojo"
+license = "MIT"
+publish = false
+
+[lib]
+name = "dromos_gbz"
+crate-type = ["cdylib"]
+
+[dependencies]
+gbz = "=0.6.2"
+simple-sds = "=0.4.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
