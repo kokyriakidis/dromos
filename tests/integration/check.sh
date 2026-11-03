@@ -270,6 +270,10 @@ same_bam "surject -o: every contig, the GAM" "$WORK/all.gam.bam" "$SMALL_GAM" al
 "$DROMOS" surject $SO "$SMALL_GAF" -o "$WORK/all.spill.bam" -m 1M 2> /dev/null
 cmp -s "$WORK/all.bam" "$WORK/all.spill.bam" && cmp -s "$WORK/all.bam.bai" "$WORK/all.spill.bam.bai" \
   && pass "surject -o: spilled to disk, the same BAM and index" || fail "surject -o: spilled to disk, the same BAM and index"
+"$DROMOS" surject $SO "$SMALL_GAF" -o "$WORK/all.csi.bam" --csi 2> /dev/null
+cmp -s "$WORK/all.bam" "$WORK/all.csi.bam" && ! test -e "$WORK/all.csi.bam.bai" \
+  && same_bam "surject -o --csi: a .csi as samtools index -c makes it" "$WORK/all.csi.bam" "$SMALL_GAF" placed \
+  || fail "surject -o --csi: a .csi as samtools index -c makes it"
 "$DROMOS" surject $SO "$SMALL_GAF" -o "$WORK/all.gp.bam" --graph-placement 2> /dev/null
 same_bam "surject -o --graph-placement: every contig" "$WORK/all.gp.bam" "$SMALL_GAF" all --graph-placement
 "$DROMOS" surject $SO "$SMALL_GAF" -o "$WORK/all.cat.bam" --catalog "$CATALOG_DIR" 2> /dev/null

@@ -82,6 +82,7 @@ each; reads with no base on any are left out.
   -o OUT.bam                a BAM sorted as samtools sort sorts it, and its index (OUT.bam.bai, or .csi when a
                             contig is longer than a .bai holds); without it, SAM on stdout in IN's order (a read's
                             records in contig order)
+  --csi                     index the BAM as .csi (as samtools index -c) even when a .bai would hold it
 
   --graph FILE              the pangenome graph (GBZ)
   --cache FILE              the graph's cache: made there on first use (and again when the graph changes), read
@@ -370,6 +371,7 @@ def surject_main() raises:
     var memory_arg = args.value("-m")
     var tmp_arg = args.value("--tmp-dir")
     var placement = args.flag("--graph-placement")
+    var csi = args.flag("--csi")
     var gaf = args.flag("--gaf")
     var gam = args.flag("--gam")
     if gaf and gam:
@@ -382,8 +384,8 @@ def surject_main() raises:
             _fail(String(t"--sam-names is full or short, not {names_arg.value()}"), "surject")
     var level = _number(level_arg.value(), "-l", 0, 12, "surject") if level_arg else 4
     var memory = _size(memory_arg.value(), "-m", "surject") if memory_arg else 8 << 30
-    if not out_arg and (level_arg or memory_arg or tmp_arg):
-        _fail("-l, -m and --tmp-dir are for a BAM (-o)", "surject")
+    if not out_arg and (level_arg or memory_arg or tmp_arg or csi):
+        _fail("-l, -m, --tmp-dir and --csi are for a BAM (-o)", "surject")
     var graph = _graph(args, SURJECT_USAGE)
     var pos = args.positional(1)
     var sample = resolve_reference_sample(graph, sample_arg)
@@ -496,7 +498,7 @@ def surject_main() raises:
         raise e^
     sink.finish(threads, complete=True)
     sink.report(what)
-    write_bam(sink.staging, header, BamIndex(sam_names, lengths, needs_csi(lengths)), out, level, threads)
+    write_bam(sink.staging, header, BamIndex(sam_names, lengths, csi or needs_csi(lengths)), out, level, threads)
 
 
 def prepare_main() raises:

@@ -20,7 +20,7 @@ def read(path):
     def take(fmt):
         nonlocal at
         v = struct.unpack_from("<" + fmt, data, at)
-        at += struct.calcsize(fmt)
+        at += struct.calcsize("<" + fmt)
         return v
 
     magic = data[:4]
