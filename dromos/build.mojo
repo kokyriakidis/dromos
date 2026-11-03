@@ -728,7 +728,9 @@ def run_build(o: BuildOptions) raises:
     var entries = List[ContigEntry]()
     for k in range(len(contigs)):
         entries.append(
-            ContigEntry(contigs[k], String(t"{sample}#0#{contigs[k]}"), 0, List[UInt8](), regions[k].copy(), 0, 0, 0)
+            ContigEntry(
+                contigs[k], String(t"{sample}#0#{contigs[k]}"), 0, List[UInt8](), regions[k].copy(), 0, 0, 0, 0
+            )
         )
     var writer = OwnedPointer(SitesWriter(path, props^, entries^))
     run_contigs(log, graph, md, sample, contigs, regions, source, writer[], o.level, o.threads)

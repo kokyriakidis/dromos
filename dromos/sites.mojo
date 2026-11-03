@@ -14,6 +14,7 @@ another graph's alignments.
 
 from std.ffi import OwnedDLHandle, external_call
 from std.memory import unsafe_memcpy
+from std.sys.info import Endian
 
 from dromos.bgzf import MappedFile, load_libdeflate, load_zstd
 from dromos.contig import Contig, Reference
@@ -59,8 +60,8 @@ comptime FLAG_PAD = 2
 comptime FLAG_PS = 4
 """The record has a PS (a parent snarl with a record)."""
 comptime INDEX_ARRAYS = 9
-"""Per-block arrays of the index before the column sizes: first_pos, last_pos, max_end, reach, offset, records,
-min_allele, max_walk, crc32."""
+"""Per-block arrays of a contig's index before the column sizes: first_pos, last_pos, max_end, reach, offset,
+records, min_allele, max_walk, crc32."""
 comptime BLOCK_BP = 100_000
 """A block holds the records whose POS falls in one BLOCK_BP window..."""
 comptime BLOCK_BYTES = 4 << 20
@@ -692,15 +693,59 @@ struct ContigEntry(Copyable, Movable):
     """MD5 of its reference sequence (16 bytes; SAM's M5)."""
     var regions: List[Tuple[Int, Int]]
     """The regions built (1-based, inclusive); none: the whole contig."""
-    var first_block: Int
     var blocks: Int
     var records: Int
+    var index_offset: Int
+    var index_size: Int
+    """Where its index frame is, and its size."""
+
+
+def _index_bytes(blocks: Span[EncodedBlock, _], offsets: List[Int], crcs: List[Int]) -> List[UInt8]:
+    """A contig's index, as its frame holds it decompressed."""
+    var out = List[UInt8]()
+    var n = len(blocks)
+    put_u64(out, n)
+    put_u64(out, COLUMNS)
+    var reach = 0
+    var reaches = List[Int]()
+    for i in range(n):
+        reach = max(reach, blocks[i].max_end)
+        reaches.append(reach)
+    for a in range(INDEX_ARRAYS):
+        for i in range(n):
+            ref b = blocks[i]
+            var v: Int
+            if a == 0:
+                v = b.first_pos
+            elif a == 1:
+                v = b.last_pos
+            elif a == 2:
+                v = b.max_end
+            elif a == 3:
+                v = reaches[i]
+            elif a == 4:
+                v = offsets[i]
+            elif a == 5:
+                v = b.records
+            elif a == 6:
+                v = b.min_allele
+            elif a == 7:
+                v = b.max_walk
+            else:
+                v = crcs[i]
+            put_u64(out, v)
+    for which in range(2):
+        for i in range(n):
+            for col in range(COLUMNS):
+                put_u64(out, blocks[i].sizes[2 * col + which])
+    return out^
 
 
 struct SitesWriter(Movable):
     """Writes `<path>.tmp` and renames it to `path` once complete, so a catalog is never seen half written. Contigs
-    are built in any order (any thread, one `complete` at a time, which a lock keeps) and written in the header's
-    order as each one and those before it are complete."""
+    are built in any order (any thread, one `complete` at a time, which the caller's lock keeps) and their blocks
+    written in the header's order as each one and those before it are complete; each contig's index then, and the
+    header last."""
 
     var path: String
     var file: OutFile
@@ -710,10 +755,8 @@ struct SitesWriter(Movable):
     var staged: List[List[EncodedBlock]]
     var ready: List[Bool]
     var next: Int
-    var arrays: List[List[Int]]
-    """The index's per-block arrays (INDEX_ARRAYS), in file order."""
-    var sizes: List[Int]
-    """Per block, per column: compressed, raw."""
+    var indexes: List[List[UInt8]]
+    """Each written contig's index, decompressed."""
     var crc_lib: OwnedDLHandle
 
     def __init__(out self, path: String, var props: List[Tuple[String, String]], var contigs: List[ContigEntry]) raises:
@@ -723,14 +766,12 @@ struct SitesWriter(Movable):
         self.props = props^
         self.contigs = contigs^
         self.staged = List[List[EncodedBlock]]()
+        self.indexes = List[List[UInt8]]()
         for _ in range(len(self.contigs)):
             self.staged.append(List[EncodedBlock]())
+            self.indexes.append(List[UInt8]())
         self.ready = List[Bool](length=len(self.contigs), fill=False)
         self.next = 0
-        self.arrays = List[List[Int]]()
-        for _ in range(INDEX_ARRAYS):
-            self.arrays.append(List[Int]())
-        self.sizes = List[Int]()
         self.crc_lib = load_libdeflate()
         # The preamble's room, filled in by `finish`.
         self.file.put(Span(List[UInt8](length=PREAMBLE, fill=0)), 0)
@@ -750,29 +791,15 @@ struct SitesWriter(Movable):
             self.next += 1
 
     def _write(mut self, k: Int) raises:
-        ref c = self.contigs[k]
-        c.first_block = len(self.arrays[0])
-        c.blocks = len(self.staged[k])
-        var reach = 0
+        ref blocks = self.staged[k]
+        self.contigs[k].blocks = len(blocks)
+        var offsets = List[Int]()
+        var crcs = List[Int]()
         var out = List[UInt8]()
-        for i in range(len(self.staged[k])):
-            ref b = self.staged[k][i]
-            reach = max(reach, b.max_end)
-            var crc = crc32(self.crc_lib, Span(b.data))
-            var fields: List[Int] = [
-                b.first_pos,
-                b.last_pos,
-                b.max_end,
-                reach,
-                self.offset + len(out),
-                b.records,
-                b.min_allele,
-                b.max_walk,
-                Int(crc),
-            ]
-            for i in range(INDEX_ARRAYS):
-                self.arrays[i].append(fields[i])
-            self.sizes.extend(Span(b.sizes))
+        for i in range(len(blocks)):
+            ref b = blocks[i]
+            offsets.append(self.offset + len(out))
+            crcs.append(Int(crc32(self.crc_lib, Span(b.data))))
             out.extend(Span(b.data))
             if len(out) >= 64 << 20:
                 self.file.put(Span(out), self.offset)
@@ -780,14 +807,22 @@ struct SitesWriter(Movable):
                 out.clear()
         self.file.put(Span(out), self.offset)
         self.offset += len(out)
+        self.indexes[k] = _index_bytes(Span(blocks), offsets, crcs)
         self.staged[k] = List[EncodedBlock]()
 
     def finish(mut self) raises -> Int:
-        """Writes the header and the index after the blocks, then the preamble; syncs the file and renames it.
-        Returns the file's size."""
+        """Writes each contig's index frame after the blocks, then the header, then the preamble; syncs the file and
+        renames it. Returns the file's size."""
         if self.next != len(self.contigs):
             raise Error(t"{self.path}: contigs left unwritten")
         var c = Compressor()
+        var tail = List[UInt8]()
+        var index_at = self.offset
+        for k in range(len(self.contigs)):
+            var size = c.append(Span(self.indexes[k]), META_LEVEL, 1, tail, checksum=True)
+            self.contigs[k].index_offset = self.offset + len(tail) - size
+            self.contigs[k].index_size = size
+        var index_size = len(tail)
         var header = List[UInt8]()
         put_u64(header, VERSION)
         put_u64(header, len(self.props))
@@ -800,28 +835,16 @@ struct SitesWriter(Movable):
             put_str(header, e.chrom)
             put_u64(header, e.length)
             header.extend(Span(e.md5))
-            put_u64(header, e.first_block)
             put_u64(header, e.blocks)
             put_u64(header, e.records)
+            put_u64(header, e.index_offset)
+            put_u64(header, e.index_size)
             put_u64(header, len(e.regions))
             for r in e.regions:
                 put_u64(header, r[0])
                 put_u64(header, r[1])
-        var index = List[UInt8]()
-        var blocks = len(self.arrays[0])
-        put_u64(index, blocks)
-        put_u64(index, COLUMNS)
-        for a in self.arrays:
-            for v in a:
-                put_u64(index, v)
-        for which in range(2):
-            for b in range(blocks):
-                for col in range(COLUMNS):
-                    put_u64(index, self.sizes[b * 2 * COLUMNS + 2 * col + which])
-        var tail = List[UInt8]()
+        var header_at = self.offset + len(tail)
         var header_size = c.append(Span(header), META_LEVEL, 1, tail, checksum=True)
-        var index_size = c.append(Span(index), META_LEVEL, 1, tail, checksum=True)
-        var header_at = self.offset
         self.file.put(Span(tail), self.offset)
         self.offset += len(tail)
         var pre = List[UInt8](MAGIC.as_bytes())
@@ -832,7 +855,7 @@ struct SitesWriter(Movable):
         put_u64(pre, self.offset)
         put_u64(pre, header_at)
         put_u64(pre, header_size)
-        put_u64(pre, header_at + header_size)
+        put_u64(pre, index_at)
         put_u64(pre, index_size)
         put_u64(pre, Int(fnv1a(Span(pre))))
         self.file.put(Span(pre), 0)
@@ -873,22 +896,17 @@ def _map(path: String) raises -> MappedFile:
         raise e^
 
 
+@fieldwise_init
 struct _Parsed(Movable):
     var props: List[Tuple[String, String]]
     var contigs: List[ContigEntry]
-    var arrays: List[List[Int]]
-    var sizes: List[Int]
-
-    def __init__(out self):
-        self.props = List[Tuple[String, String]]()
-        self.contigs = List[ContigEntry]()
-        self.arrays = List[List[Int]]()
-        self.sizes = List[Int]()
+    var blocks_end: Int
+    """Where the blocks end: the first contig's index."""
 
 
 def _read(path: String, file: MappedFile) raises -> _Parsed:
-    """A catalog's preamble checked, its header and index read: `file` is borrowed for the whole call, so it stays
-    mapped on every path, raising ones included."""
+    """A catalog's preamble checked and its header read: `file` is borrowed for the whole call, so it stays mapped on
+    every path, raising ones included."""
     var p = file.ptr
     var n = file.size
     var magic = MAGIC.as_bytes()
@@ -918,10 +936,15 @@ def _read(path: String, file: MappedFile) raises -> _Parsed:
     var header_size = u64_at(p, 32)
     var index_at = u64_at(p, 40)
     var index_size = u64_at(p, 48)
-    for r in [(header_at, header_size), (index_at, index_size)]:
-        if r[0] < PREAMBLE or r[1] <= 0 or r[0] + r[1] > n:
-            raise Error(t"{path}: damaged (its preamble points outside the file)")
-    var parsed = _Parsed()
+    if (
+        index_at < PREAMBLE
+        or index_size < 0
+        or index_at + index_size > header_at
+        or header_at < PREAMBLE
+        or header_size <= 0
+        or header_at + header_size > n
+    ):
+        raise Error(t"{path}: damaged (its preamble points outside the file)")
     var z = Decompressor()
     var h = Reader(
         z.frame(Span(unsafe_ptr=p.unsafe_offset(header_at), length=header_size), path + ": its header"),
@@ -929,73 +952,67 @@ def _read(path: String, file: MappedFile) raises -> _Parsed:
     )
     if h.u64() != VERSION:
         raise Error(t"{path}: damaged (its header's version differs from its preamble's)")
-    parsed.props = List[Tuple[String, String]]()
+    var props = List[Tuple[String, String]]()
     for _ in range(h.u64()):
         var key = h.string()
-        parsed.props.append((key, h.string()))
-    parsed.contigs = List[ContigEntry]()
+        props.append((key, h.string()))
+    var contigs = List[ContigEntry]()
     for _ in range(h.u64()):
         var name = h.string()
         var chrom = h.string()
         var length = h.u64()
         var md5 = h.bytes(16)
-        var first = h.u64()
         var blocks = h.u64()
         var records = h.u64()
+        var at = h.u64()
+        var frame = h.u64()
+        if at < index_at or frame <= 0 or at + frame > index_at + index_size:
+            raise Error(t"{path}: damaged (contig {name}'s index lies outside the index)")
         var regions = List[Tuple[Int, Int]]()
         for _ in range(h.u64()):
             var a = h.u64()
             regions.append((a, h.u64()))
-        parsed.contigs.append(ContigEntry(name, chrom, length, md5^, regions^, first, blocks, records))
-    var x = Reader(
-        z.frame(Span(unsafe_ptr=p.unsafe_offset(index_at), length=index_size), path + ": its index"),
-        path + ": its index",
-    )
-    var count = x.u64()
-    if x.u64() != COLUMNS or len(x.data) != 16 + 8 * count * (INDEX_ARRAYS + 2 * COLUMNS):
-        raise Error(t"{path}: damaged (its index has the wrong size)")
-    parsed.arrays = List[List[Int]]()
-    for _ in range(INDEX_ARRAYS):
-        var a = List[Int](capacity=count)
-        for _ in range(count):
-            a.append(x.u64())
-        parsed.arrays.append(a^)
-    parsed.sizes = List[Int](length=2 * COLUMNS * count, fill=0)
-    for which in range(2):
-        for b in range(count):
-            for col in range(COLUMNS):
-                parsed.sizes[b * 2 * COLUMNS + 2 * col + which] = x.u64()
-    var blocks_seen = 0
-    for ref c in parsed.contigs:
-        if c.first_block != blocks_seen or c.first_block + c.blocks > count:
-            raise Error(t"{path}: damaged (its contigs' blocks)")
-        blocks_seen += c.blocks
-    if blocks_seen != count:
-        raise Error(t"{path}: damaged (its contigs' blocks)")
-    for b in range(count):
-        var total = 0
-        for col in range(COLUMNS):
-            var cs = parsed.sizes[b * 2 * COLUMNS + 2 * col]
-            var rs = parsed.sizes[b * 2 * COLUMNS + 2 * col + 1]
-            if (cs == 0) != (rs == 0) or cs > rs:
-                raise Error(t"{path}: damaged (block {b}'s column sizes)")
-            total += cs
-        var at = parsed.arrays[4][b]
-        if at < PREAMBLE or at + total > header_at:
-            raise Error(t"{path}: damaged (block {b} lies outside the blocks)")
-    return parsed^
+        contigs.append(ContigEntry(name, chrom, length, md5^, regions^, blocks, records, at, frame))
+    if h.at != len(h.data):
+        raise Error(t"{path}: damaged (its header has bytes left over)")
+    return _Parsed(props^, contigs^, index_at)
+
+
+struct ContigIndex(Movable):
+    """A contig's index, read: per block, the INDEX_ARRAYS arrays, and each column's compressed and raw sizes."""
+
+    var arrays: List[List[Int]]
+    var sizes: List[Int]
+    """Per block, per column: compressed, raw."""
+    var loaded: Bool
+
+    def __init__(out self):
+        self.arrays = List[List[Int]]()
+        self.sizes = List[Int]()
+        self.loaded = False
+
+
+def _u64s(data: List[UInt8], at: Int, n: Int) -> List[Int]:
+    """`n` little-endian u64s at byte `at`, read at once."""
+    var out = List[Int](unsafe_uninit_length=n)
+    comptime if Endian.native() == .little:
+        unsafe_memcpy(dest=out.unsafe_ptr().unsafe_bitcast[UInt8](), src=data.unsafe_ptr().unsafe_offset(at), count=8 * n)
+    else:
+        for i in range(n):
+            out[i] = u64_at(data.unsafe_ptr(), at + 8 * i)
+    return out^
 
 
 struct Sites(Movable):
-    """A catalog mapped into memory: its preamble checked, its header and index read."""
+    """A catalog mapped into memory: its preamble checked and its header read; a contig's index read when `load`
+    asks for it (a query of one contig reads that contig's alone)."""
 
     var path: String
     var file: MappedFile
     var props: List[Tuple[String, String]]
     var contigs: List[ContigEntry]
-    var arrays: List[List[Int]]
-    var sizes: List[Int]
-    """Per block, per column: compressed, raw."""
+    var index: List[ContigIndex]
+    var blocks_end: Int
 
     def __init__(out self, path: String) raises:
         self.path = path
@@ -1004,51 +1021,88 @@ struct Sites(Movable):
         self.file = file^
         self.props = List[Tuple[String, String]]()
         self.contigs = List[ContigEntry]()
-        self.arrays = List[List[Int]]()
-        self.sizes = List[Int]()
         swap(self.props, parsed.props)
         swap(self.contigs, parsed.contigs)
-        swap(self.arrays, parsed.arrays)
-        swap(self.sizes, parsed.sizes)
+        self.blocks_end = parsed.blocks_end
+        self.index = List[ContigIndex]()
+        for _ in range(len(self.contigs)):
+            self.index.append(ContigIndex())
+
+    def load(mut self, k: Int) raises:
+        """Reads contig `k`'s index, if not yet read, and checks it."""
+        if self.index[k].loaded:
+            return
+        ref c = self.contigs[k]
+        var z = Decompressor()
+        var what = String(t"{self.path}: {c.name}'s index")
+        var data = z.frame(Span(unsafe_ptr=self.file.ptr.unsafe_offset(c.index_offset), length=c.index_size), what)
+        var n = c.blocks
+        if len(data) != 16 + 8 * n * (INDEX_ARRAYS + 2 * COLUMNS) or u64_at(data.unsafe_ptr(), 0) != n:
+            raise Error(t"{what}: damaged (the wrong size)")
+        if u64_at(data.unsafe_ptr(), 8) != COLUMNS:
+            raise Error(t"{what}: damaged (the wrong number of columns)")
+        var x = ContigIndex()
+        for a in range(INDEX_ARRAYS):
+            x.arrays.append(_u64s(data, 16 + 8 * n * a, n))
+        var sizes = _u64s(data, 16 + 8 * n * INDEX_ARRAYS, 2 * COLUMNS * n)
+        # Stored as all compressed sizes, then all raw sizes; kept as each column's pair.
+        x.sizes = List[Int](unsafe_uninit_length=2 * COLUMNS * n)
+        for b in range(n):
+            var total = 0
+            for col in range(COLUMNS):
+                var cs = sizes[b * COLUMNS + col]
+                var rs = sizes[n * COLUMNS + b * COLUMNS + col]
+                if cs < 0 or rs < 0 or (cs == 0) != (rs == 0) or cs > rs:
+                    raise Error(t"{what}: damaged (block {b}'s column sizes)")
+                x.sizes[b * 2 * COLUMNS + 2 * col] = cs
+                x.sizes[b * 2 * COLUMNS + 2 * col + 1] = rs
+                total += cs
+            var at = x.arrays[4][b]
+            if at < PREAMBLE or total > self.blocks_end - at:
+                raise Error(t"{what}: damaged (block {b} lies outside the blocks)")
+            if b > 0 and (x.arrays[0][b] < x.arrays[0][b - 1] or x.arrays[3][b] < x.arrays[3][b - 1]):
+                raise Error(t"{what}: damaged (its blocks are out of order)")
+        x.loaded = True
+        self.index[k] = x^
+
+    def load_all(mut self) raises:
+        for k in range(len(self.contigs)):
+            self.load(k)
 
     @always_inline
-    def blocks(self) -> Int:
-        return len(self.arrays[0])
+    def first_pos(self, k: Int, b: Int) -> Int:
+        return self.index[k].arrays[0][b]
 
     @always_inline
-    def first_pos(self, b: Int) -> Int:
-        return self.arrays[0][b]
+    def max_end(self, k: Int, b: Int) -> Int:
+        return self.index[k].arrays[2][b]
 
     @always_inline
-    def max_end(self, b: Int) -> Int:
-        return self.arrays[2][b]
+    def reach(self, k: Int, b: Int) -> Int:
+        return self.index[k].arrays[3][b]
 
     @always_inline
-    def reach(self, b: Int) -> Int:
-        return self.arrays[3][b]
+    def offset(self, k: Int, b: Int) -> Int:
+        return self.index[k].arrays[4][b]
 
     @always_inline
-    def offset(self, b: Int) -> Int:
-        return self.arrays[4][b]
+    def records(self, k: Int, b: Int) -> Int:
+        return self.index[k].arrays[5][b]
 
     @always_inline
-    def records(self, b: Int) -> Int:
-        return self.arrays[5][b]
+    def crc(self, k: Int, b: Int) -> Int:
+        return self.index[k].arrays[8][b]
 
-    @always_inline
-    def crc(self, b: Int) -> Int:
-        return self.arrays[8][b]
-
-    def compressed(self, b: Int) -> Int:
+    def compressed(self, k: Int, b: Int) -> Int:
         var n = 0
         for col in range(COLUMNS):
-            n += self.sizes[b * 2 * COLUMNS + 2 * col]
+            n += self.index[k].sizes[b * 2 * COLUMNS + 2 * col]
         return n
 
-    def raw(self, b: Int) -> Int:
+    def raw(self, k: Int, b: Int) -> Int:
         var n = 0
         for col in range(COLUMNS):
-            n += self.sizes[b * 2 * COLUMNS + 2 * col + 1]
+            n += self.index[k].sizes[b * 2 * COLUMNS + 2 * col + 1]
         return n
 
     def prop(self, key: String) -> Optional[String]:
@@ -1065,16 +1119,15 @@ struct Sites(Movable):
         return None
 
     def overlapping(self, k: Int, beg: Int, end: Int) -> Tuple[Int, Int]:
-        """Contig `k`'s blocks that can hold records overlapping [beg, end]: those from the first whose reach (the
-        largest max_end so far) is at least `beg` to the last whose first_pos is at most `end`, by binary search;
-        each must still have max_end >= beg."""
-        var lo = self.contigs[k].first_block
-        var hi = lo + self.contigs[k].blocks
-        var a = lo
+        """Contig `k`'s blocks (it must be loaded) that can hold records overlapping [beg, end]: those from the first
+        whose reach (the largest max_end so far) is at least `beg` to the last whose first_pos is at most `end`, by
+        binary search; each must still have max_end >= beg."""
+        var hi = self.contigs[k].blocks
+        var a = 0
         var b = hi
         while a < b:
             var m = (a + b) // 2
-            if self.reach(m) < beg:
+            if self.reach(k, m) < beg:
                 a = m + 1
             else:
                 b = m
@@ -1083,23 +1136,26 @@ struct Sites(Movable):
         b = hi
         while a < b:
             var m = (a + b) // 2
-            if self.first_pos(m) <= end:
+            if self.first_pos(k, m) <= end:
                 a = m + 1
             else:
                 b = m
         return (first, a)
 
-    def columns(self, b: Int, wanted: Int, z: Decompressor, mut out: List[List[UInt8]], check: Bool = True) raises:
-        """Block `b`'s columns in the `wanted` mask (bit c for column c) into `out` (COLUMNS lists); the others
-        left empty. With `check`, the block's CRC is checked first."""
-        var base = self.file.ptr.unsafe_offset(self.offset(b))
+    def columns(
+        self, k: Int, b: Int, wanted: Int, z: Decompressor, mut out: List[List[UInt8]], check: Bool = True
+    ) raises:
+        """Block `b` of contig `k`: its columns in the `wanted` mask (bit c for column c) into `out` (COLUMNS lists);
+        the others left empty. With `check`, the block's CRC is checked first."""
+        var base = self.file.ptr.unsafe_offset(self.offset(k, b))
         if check:
-            if Int(crc32(z.deflate, Span(unsafe_ptr=base, length=self.compressed(b)))) != self.crc(b):
-                raise Error(t"{self.path}: damaged (block {b}'s CRC differs)")
+            if Int(crc32(z.deflate, Span(unsafe_ptr=base, length=self.compressed(k, b)))) != self.crc(k, b):
+                raise Error(t"{self.path}: damaged ({self.contigs[k].name}'s block {b}: its CRC differs)")
         var at = 0
+        ref sizes = self.index[k].sizes
         for col in range(COLUMNS):
-            var cs = self.sizes[b * 2 * COLUMNS + 2 * col]
-            var rs = self.sizes[b * 2 * COLUMNS + 2 * col + 1]
+            var cs = sizes[b * 2 * COLUMNS + 2 * col]
+            var rs = sizes[b * 2 * COLUMNS + 2 * col + 1]
             ref dst = out[col]
             dst.clear()
             if (wanted >> col) & 1 == 1 and rs > 0:
@@ -1107,7 +1163,9 @@ struct Sites(Movable):
                 if cs == rs:
                     unsafe_memcpy(dest=dst.unsafe_ptr(), src=base.unsafe_offset(at), count=rs)
                 elif not z.into(Span(unsafe_ptr=base.unsafe_offset(at), length=cs), dst.unsafe_ptr(), rs):
-                    raise Error(t"{self.path}: damaged (block {b}'s {column_name(col)} column)")
+                    raise Error(
+                        t"{self.path}: damaged ({self.contigs[k].name}'s block {b}: its {column_name(col)} column)"
+                    )
             at += cs
 
 
@@ -1166,15 +1224,14 @@ struct NodeTable(Movable):
         self.letters.resize(unsafe_uninit_length=total + 4)
         var o = self.letters.unsafe_ptr()
         var s = seq.unsafe_ptr()
-        comptime ACGT = SIMD[DType.uint8, 4](65, 67, 71, 84)
-        var i = 0
-        while i < total:
-            var x = s[unsafe_offset=i >> 2]
-            o[unsafe_offset=i] = ACGT[Int(x & 3)]
-            o[unsafe_offset=i + 1] = ACGT[Int((x >> 2) & 3)]
-            o[unsafe_offset=i + 2] = ACGT[Int((x >> 4) & 3)]
-            o[unsafe_offset=i + 3] = ACGT[Int(x >> 6)]
-            i += 4
+        # A byte's four letters at once, from a table of the 256 bytes.
+        var four = List[UInt32](unsafe_uninit_length=256)
+        var acgt: List[UInt32] = [65, 67, 71, 84]
+        for x in range(256):
+            four[x] = acgt[x & 3] | acgt[(x >> 2) & 3] << 8 | acgt[(x >> 4) & 3] << 16 | acgt[x >> 6] << 24
+        var o32 = o.unsafe_bitcast[UInt32]()
+        for i in range((total + 3) // 4):
+            o32.unsafe_store[alignment=1](i, four[Int(s[unsafe_offset=i])])
         self.letters.resize(unsafe_uninit_length=total)
         var exc = Cursor(cols[EXC])
         var at = 0
@@ -1317,17 +1374,19 @@ def _put_text(mut out: List[UInt8], s: StaticString):
 
 
 def block_text(
-    s: Sites, b: Int, chrom: String, beg: Int, end: Int, z: Decompressor, mut cols: List[List[UInt8]],
+    s: Sites, k: Int, b: Int, beg: Int, end: Int, z: Decompressor, mut cols: List[List[UInt8]],
     mut table: NodeTable, mut out: List[UInt8], fd: Int32,
 ) raises:
-    """Block `b`'s records overlapping [beg, end] (POS ..= POS + len(REF) - 1, a REF of no bases as one), as
-    pgcatalog view prints them, appended to `out`; with `fd` >= 0, written there whenever `out` grows past
+    """Contig `k`'s block `b`: its records overlapping [beg, end] (POS ..= POS + len(REF) - 1, a REF of no bases as
+    one), as pgcatalog view prints them, appended to `out`; with `fd` >= 0, written there whenever `out` grows past
     STREAM_TEXT."""
-    s.columns(b, (1 << COLUMNS) - 1, z, cols)
+    s.columns(k, b, (1 << COLUMNS) - 1, z, cols)
     table.read(cols, True)
-    var r = Block(cols, s.first_pos(b), table.count())
+    var r = Block(cols, s.first_pos(k, b), table.count())
     var lt = table.letters.unsafe_ptr()
-    for _ in range(s.records(b)):
+    ref chrom = s.contigs[k].chrom
+    out.reserve(len(out) + min(4 * s.raw(k, b), STREAM_TEXT) + 4096)
+    for _ in range(s.records(k, b)):
         r.next(True)
         if r.walks() < 1:
             raise _damaged("a record without walks")
@@ -1356,7 +1415,11 @@ def block_text(
                 var a = table.starts[node]
                 var n = table.starts[node + 1] - a
                 var dst = _reserve_end(out, n)
-                put_oriented(dst, Span(unsafe_ptr=lt.unsafe_offset(a), length=n), v & 1 == 1)
+                if v & 1 == 1:
+                    put_oriented(dst, Span(unsafe_ptr=lt.unsafe_offset(a), length=n), True)
+                else:
+                    # Stored in capitals: forward letters as they are.
+                    unsafe_memcpy(dest=dst, src=lt.unsafe_offset(a), count=n)
                 if fd >= 0 and len(out) > STREAM_TEXT:
                     write_all(fd, out.unsafe_ptr(), len(out))
                     out.clear()
@@ -1397,12 +1460,12 @@ def block_text(
 
 @fieldwise_init
 struct _ViewTask(ParallelTask):
-    """Block `order[first + index]`'s lines overlapping [beg, end], into `texts[index]`."""
+    """Contig `k`'s block `order[first + index]`: its lines overlapping [beg, end], into `texts[index]`."""
 
     var sites: ImmPointer[Sites, ImmUntrackedOrigin]
     var order: ImmPointer[Int, ImmUntrackedOrigin]
     var first: Int
-    var chrom: ImmPointer[String, ImmUntrackedOrigin]
+    var k: Int
     var beg: Int
     var end: Int
     var texts: MutPointer[List[UInt8], MutUntrackedOrigin]
@@ -1415,39 +1478,42 @@ struct _ViewTask(ParallelTask):
             var cols = List[List[UInt8]](length=COLUMNS, fill=List[UInt8]())
             var table = NodeTable()
             block_text(
-                self.sites[], b, self.chrom[], self.beg, self.end, z, cols, table, self.texts[unsafe_offset=index], -1
+                self.sites[], self.k, b, self.beg, self.end, z, cols, table, self.texts[unsafe_offset=index], -1
             )
         except e:
             self.error[] = String(e)
 
 
 def records(s: Sites, k: Int, beg: Int, end: Int, threads: Int, fd: Int32, mut kept: List[UInt8]) raises:
-    """Contig `k`'s records overlapping [beg, end] (1-based, inclusive), in order, as tabix would return them from the
-    VCF: written to `fd`, or (`fd` -1) appended to `kept`. Blocks are decoded in parallel, up to VIEW_BYTES of
-    columns at a time; one with more than STREAM_TEXT of columns alone, on this thread, its text written as made."""
-    var chrom = s.contigs[k].chrom
+    """Contig `k`'s records (its index loaded) overlapping [beg, end] (1-based, inclusive), in order, as tabix would
+    return them from the VCF: written to `fd`, or (`fd` -1) appended to `kept`. Blocks are decoded in parallel, up to
+    VIEW_BYTES of columns at a time; one with more than STREAM_TEXT of columns alone, on this thread, its text written
+    as made. A single block is decoded on this thread."""
     var span = s.overlapping(k, beg, end)
     var order = List[Int]()
     for b in range(span[0], span[1]):
-        if s.max_end(b) >= beg:
+        if s.max_end(k, b) >= beg:
             order.append(b)
     var first = 0
     while first < len(order):
-        if s.raw(order[first]) > STREAM_TEXT and fd >= 0:
+        if (s.raw(k, order[first]) > STREAM_TEXT and fd >= 0) or len(order) == 1:
             var z = Decompressor()
             var cols = List[List[UInt8]](length=COLUMNS, fill=List[UInt8]())
             var table = NodeTable()
             var out = List[UInt8]()
-            block_text(s, order[first], chrom, beg, end, z, cols, table, out, fd)
-            write_all(fd, out.unsafe_ptr(), len(out))
+            block_text(s, k, order[first], beg, end, z, cols, table, out, fd)
+            if fd >= 0:
+                write_all(fd, out.unsafe_ptr(), len(out))
+            else:
+                kept.extend(Span(out))
             first += 1
             continue
         var last = first
         var bytes = 0
-        while last < len(order) and (last == first or bytes + s.raw(order[last]) <= VIEW_BYTES):
-            if s.raw(order[last]) > STREAM_TEXT and fd >= 0:
+        while last < len(order) and (last == first or bytes + s.raw(k, order[last]) <= VIEW_BYTES):
+            if s.raw(k, order[last]) > STREAM_TEXT and fd >= 0:
                 break
-            bytes += s.raw(order[last])
+            bytes += s.raw(k, order[last])
             last += 1
         var texts = List[List[UInt8]](length=last - first, fill=List[UInt8]())
         var error = String()
@@ -1455,7 +1521,7 @@ def records(s: Sites, k: Int, beg: Int, end: Int, threads: Int, fd: Int32, mut k
             untracked(Pointer(to=s)),
             imm_untracked(order.unsafe_ptr()),
             first,
-            untracked(Pointer(to=chrom)),
+            k,
             beg,
             end,
             mut_untracked(texts.unsafe_ptr()),
@@ -1463,7 +1529,7 @@ def records(s: Sites, k: Int, beg: Int, end: Int, threads: Int, fd: Int32, mut k
         )
         parallel_for(task, last - first, threads)
         # The tasks reach these through untracked pointers: reads after them keep them alive until they are done.
-        _ = len(order) + chrom.byte_length()
+        _ = len(order)
         if error:
             raise Error(error)
         for t in texts:
@@ -1496,6 +1562,7 @@ def view(path: String, region: Optional[String], threads: Int) raises:
     header has a ##contig line for each, then each contig's records in turn."""
     var s = Sites(path)
     if not region:
+        s.load_all()
         var contigs = List[Tuple[String, Int]]()
         for ref c in s.contigs:
             contigs.append((c.chrom, c.length))
@@ -1524,6 +1591,7 @@ def view(path: String, region: Optional[String], threads: Int) raises:
         for ref c in s.contigs:
             names.append(c.name)
         raise Error(t"{path} has no contig {name} (it has {', '.join(names)})")
+    s.load(k.value())
     ref c = s.contigs[k.value()]
     var contigs: List[Tuple[String, Int]] = [(c.chrom, c.length)]
     var h = vcf_header(contigs)
@@ -1541,9 +1609,11 @@ def info(path: String) raises:
     for p in s.props:
         out += String(t"{p[0]}\t{p[1]}\n")
     var total = 0
+    var blocks = 0
     for ref c in s.contigs:
         total += c.records
-    out += String(t"contigs\t{len(s.contigs)}\nblocks\t{s.blocks()}\nrecords\t{total}\n")
+        blocks += c.blocks
+    out += String(t"contigs\t{len(s.contigs)}\nblocks\t{blocks}\nrecords\t{total}\n")
     out += "#contig\tCHROM\tlength\tM5\trecords\tblocks\tregions\n"
     for ref c in s.contigs:
         var regions = String("whole")
@@ -1586,11 +1656,10 @@ def load_windows(s: Sites, k: Int, contig: Contig, map: RefMap) raises -> List[W
     var all = List[Window]()
     var z = Decompressor()
     var cols = List[List[UInt8]](length=COLUMNS, fill=List[UInt8]())
-    ref c = s.contigs[k]
-    for b in range(c.first_block, c.first_block + c.blocks):
-        s.columns(b, (1 << FLAGS) | (1 << BOUND) | (1 << POS) | (1 << PAD), z, cols)
-        var r = Block(cols, s.first_pos(b), 0)
-        for _ in range(s.records(b)):
+    for b in range(s.contigs[k].blocks):
+        s.columns(k, b, (1 << FLAGS) | (1 << BOUND) | (1 << POS) | (1 << PAD), z, cols)
+        var r = Block(cols, s.first_pos(k, b), 0)
+        for _ in range(s.records(k, b)):
             r.next(False)
             _window(contig, map, Int(r.id_start() >> 1), Int(r.id_end() >> 1), all)
 
@@ -1644,7 +1713,7 @@ struct _LoadWindows[map_origin: ImmOrigin, ref_origin: ImmOrigin](ParallelTask):
 
 
 def load_all_windows(
-    s: Sites, names: List[String], reference: Reference, map: RefMap, threads: Int
+    mut s: Sites, names: List[String], reference: Reference, map: RefMap, threads: Int
 ) raises -> List[List[Window]]:
     """Each contig's windows (`names[i]` for the reference's contig i), contigs read at once. Every contig must be
     in the catalog."""
@@ -1653,6 +1722,7 @@ def load_all_windows(
         var k = s.contig(n)
         if not k:
             raise Error(t"the catalog {s.path} has no contig {n}")
+        s.load(k.value())
         which.append(k.value())
     var out = List[List[Window]](length=len(names), fill=List[Window]())
     var error = String()

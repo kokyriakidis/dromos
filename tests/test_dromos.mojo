@@ -1137,8 +1137,8 @@ def _synthetic_catalog(path: String, firsts: List[Int], ends: List[Int], split: 
     """A catalog of empty blocks (no records), two contigs: the first `split` blocks the first contig's."""
     var props: List[Tuple[String, String]] = [("graph.fingerprint", "size=1 fnv1a=0"), ("x", "y")]
     var entries = List[ContigEntry]()
-    entries.append(ContigEntry("chrA", "S#0#chrA", 0, List[UInt8](), List[Tuple[Int, Int]](), 0, 0, 0))
-    entries.append(ContigEntry("chrB", "S#0#chrB", 0, List[UInt8](), [(5, 9)], 0, 0, 0))
+    entries.append(ContigEntry("chrA", "S#0#chrA", 0, List[UInt8](), List[Tuple[Int, Int]](), 0, 0, 0, 0))
+    entries.append(ContigEntry("chrB", "S#0#chrB", 0, List[UInt8](), [(5, 9)], 0, 0, 0, 0))
     var w = SitesWriter(path, props^, entries^)
     var md5 = List[UInt8](length=16, fill=7)
     for k in [1, 0]:
@@ -1169,6 +1169,7 @@ def test_site_index_search() raises:
         ends.append(pos + (250_000 if b == 40 else Int(random_ui64(0, 5000))))
     _synthetic_catalog(path, firsts, ends, 120)
     var s = Sites(path)
+    s.load_all()
     assert_equal(len(s.contigs), 2)
     assert_equal(s.contigs[0].name, "chrA")
     assert_equal(s.contigs[1].regions[0][1], 9)
@@ -1185,8 +1186,8 @@ def test_site_index_search() raises:
             var got = List[Int]()
             var span = s.overlapping(k, a, e)
             for b in range(span[0], span[1]):
-                if s.max_end(b) >= a:
-                    got.append(b)
+                if s.max_end(k, b) >= a:
+                    got.append(lo + b)
             var want = List[Int]()
             for b in range(lo, hi):
                 if firsts[b] <= e and ends[b] >= a:
@@ -1197,7 +1198,8 @@ def test_site_index_search() raises:
 def _expect_refused(path: String, words: String) raises:
     var failed = False
     try:
-        _ = Sites(path)
+        var s = Sites(path)
+        s.load_all()
     except e:
         failed = String(e).find(words) >= 0
         if not failed:
@@ -1242,6 +1244,7 @@ def test_site_catalog_refused_when_damaged() raises:
 def _view_of(path: String, contig: String, beg: Int = 1, end: Int = Int.MAX) raises -> String:
     var s = Sites(path)
     var k = s.contig(contig).value()
+    s.load(k)
     var c: List[Tuple[String, Int]] = [(s.contigs[k].chrom, s.contigs[k].length)]
     var out = List[UInt8](vcf_header(c).as_bytes())
     records(s, k, beg, end, 2, -1, out)
@@ -1255,7 +1258,7 @@ def _small_catalog(path: String, contigs: List[String], regions: List[Tuple[Int,
     var md = graph.parts.metadata()
     var entries = List[ContigEntry]()
     for c in contigs:
-        entries.append(ContigEntry(c, "CHM13#0#" + c, 0, List[UInt8](), regions.copy(), 0, 0, 0))
+        entries.append(ContigEntry(c, "CHM13#0#" + c, 0, List[UInt8](), regions.copy(), 0, 0, 0, 0))
     var props: List[Tuple[String, String]] = [("graph.fingerprint", fingerprint(GBZ))]
     var w = SitesWriter(path, props^, entries^)
     var pool = OwnedPointer(Pool(threads))
@@ -1288,7 +1291,8 @@ def test_catalogs_of_the_small_graph() raises:
     assert_true(_read_all(_tmp("dromos_test_small_1.sites")) == _read_all(_tmp("dromos_test_small_3.sites")))
     # A region's catalog: the records the whole one returns for it.
     var whole = Sites(_tmp("dromos_test_small_1.sites"))
-    var beg = whole.first_pos(0) + 2000
+    whole.load(0)
+    var beg = whole.first_pos(0, 0) + 2000
     var end = beg + 5000
     var regions: List[Tuple[Int, Int]] = [(beg, end)]
     var chr6: List[String] = ["chr6"]
@@ -1340,7 +1344,7 @@ def test_giant_record() raises:
     block.records = 1
     var path = String(_tmp("dromos_test_giant.sites"))
     var entries: List[ContigEntry] = [
-        ContigEntry("chrG", "S#0#chrG", 0, List[UInt8](), List[Tuple[Int, Int]](), 0, 0, 0)
+        ContigEntry("chrG", "S#0#chrG", 0, List[UInt8](), List[Tuple[Int, Int]](), 0, 0, 0, 0)
     ]
     var w = SitesWriter(path, List[Tuple[String, String]](), entries^)
     var blocks = List[EncodedBlock]()

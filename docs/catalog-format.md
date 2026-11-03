@@ -27,9 +27,9 @@ A reader must refuse a file whose version is not one it implements. dromos reads
 
 ```
 offset 0                    preamble (64 bytes)
-offset 64                   blocks, one after another, in index order
-header_offset               header (one zstd frame)
-index_offset                index (one zstd frame), ending the file
+offset 64                   blocks, one after another
+index_offset                each contig's index (one zstd frame each), in contig order
+header_offset               header (one zstd frame), ending the file
 ```
 
 ### Preamble
@@ -42,14 +42,14 @@ index_offset                index (one zstd frame), ending the file
 | 16 | 8 | the file's size in bytes |
 | 24 | 8 | header offset |
 | 32 | 8 | header frame size |
-| 40 | 8 | index offset |
-| 48 | 8 | index frame size |
+| 40 | 8 | index offset: where the contigs' index frames start |
+| 48 | 8 | the index frames' total size |
 | 56 | 8 | FNV-1a 64 of bytes 0 to 55 (offset basis 0xCBF29CE484222325, prime 0x100000001B3, a byte at a time) |
 
 A reader checks, in order: the magic (a file starting `PGSITES` is pgcatalog's per-contig format, not this one); the
-file has 64 bytes; the version; the hash; the recorded size against the file's (smaller: truncated); that the header
-and index lie inside the file, after the preamble. The header and index frames carry zstd's content checksum, which
-decompression checks.
+file has 64 bytes; the version; the hash; the recorded size against the file's (smaller: truncated); that the index
+frames lie after the preamble and before the header, and the header inside the file. The header and index frames
+carry zstd's content checksum, which decompression checks.
 
 ### Header
 
@@ -63,15 +63,15 @@ u64        C, then C contigs:
              string   CHROM          CHM13#0#chr20: the records' CHROM, <sample>#0#<name>
              u64      length         the contig's length (one past its last reference base)
              16 bytes MD5            of the contig's reference sequence (below)
-             u64      first block    index of its first block in the index
-             u64      blocks         how many (its blocks are first block ..< first block + blocks)
+             u64      blocks         how many blocks it has (B below)
              u64      records
+             u64      index offset   where its index frame is
+             u64      index size     the frame's size (inside the index region the preamble gives)
              u64      R, then R regions: u64 start, u64 end (1-based, inclusive; R = 0: the whole contig)
 ```
 
-Contigs are in natural order (`chr1 < chr2 < … < chr10 < … < chrX`: runs of digits compared as numbers), and their
-blocks follow one another in that order: contig k's first block is the sum of the block counts before it, and the
-counts add up to the index's.
+Contigs are in natural order (`chr1 < chr2 < … < chr10 < … < chrX`: runs of digits compared as numbers); a reader
+looks a contig up by name (`chr20`, or `CHM13#0#chr20` when the sample matches) and reads that contig's index alone.
 
 A contig with regions holds only the records overlapping at least one of them (the records a query of the whole
 contig's catalog returns for that region).
@@ -96,19 +96,19 @@ Properties (all values are text; a reader should ignore keys it does not know):
 | `snarls.orientation` | how snarls are oriented (vg snarls' orientation either way) |
 | `build.block_bp`, `build.block_bytes`, `build.own_block_bytes`, `build.level` | the block rules and zstd level |
 
-### Index
+### A contig's index
 
-The index frame decompresses to:
+Each contig's index frame decompresses to exactly `16 + 8 * B * (9 + 2K)` bytes:
 
 ```
-u64        B, the number of blocks
+u64        B, the number of its blocks (equal to the header's)
 u64        K, the number of columns (13)
 9 arrays of B u64, in this order:
   first_pos    POS of the block's first record
   last_pos     POS of its last record
   max_end      the largest POS + max(len(REF), 1) - 1 of its records (the span tabix gives a VCF record)
   reach        the largest max_end of the contig's blocks up to this one (non-decreasing within a contig)
-  offset       the block's offset in the file
+  offset       the block's offset in the file (its bytes lie before the index region)
   records      how many records it holds
   min_allele   the fewest bases any allele of its records spans (the padding base not counted)
   max_walk     the most visits any walk of its records has (the boundary visits counted)
@@ -117,10 +117,10 @@ B * K u64      the compressed size of each block's columns (block-major: block b
 B * K u64      their raw sizes
 ```
 
-Blocks of a contig are in position order: first_pos never decreases. The records overlapping [beg, end] are in the
-blocks from the first whose `reach` ≥ beg to the last whose `first_pos` ≤ end (two binary searches in the contig's
-block range), among those whose own `max_end` ≥ beg; a reader keeps each such block's records with
-`POS ≤ end` and `POS + max(len(REF), 1) - 1 ≥ beg`.
+A contig's blocks are in position order: first_pos and reach never decrease. The records overlapping [beg, end] are
+in the blocks from the first whose `reach` ≥ beg to the last whose `first_pos` ≤ end (two binary searches), among
+those whose own `max_end` ≥ beg; a reader keeps each such block's records with `POS ≤ end` and
+`POS + max(len(REF), 1) - 1 ≥ beg`.
 
 pgphase's first pass may also skip a block whose `min_allele` exceeds the largest allele span it handles, and size
 its buffers by `max_walk`.
