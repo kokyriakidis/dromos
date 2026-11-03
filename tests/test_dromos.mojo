@@ -4,7 +4,7 @@ pgcat places alignments, and tabix bins as htslib numbers them."""
 from std.memory import bitcast
 from std.testing import TestSuite, assert_equal, assert_true
 
-from dromos.gam import Alignment, Framer, frame, gaf_line, varint
+from dromos.gam import Alignment, Framer, frame, gaf_line, slim_line, varint
 from dromos.nodes import NodeTable
 from dromos.refmap import AMBIGUOUS, INCONSISTENT, MISSING_NODE, NO_ANCHOR, Anchor, Placed, RefMap
 from dromos.tabix import N_BINS, bin_level, bin_parent, reg2bin
@@ -162,10 +162,19 @@ def test_gaf_line_as_vg_writes_it() raises:
     var want = _text("r1\t13\t0\t13\t+\t>1>2>3\t16\t0\t13\t12\t13\t60\tAS:i:9\tbq:Z:?????????????")
     want.extend(Span(_text("\tcs:Z::4*AT:8\tdv:f:0.0124\n")))
     assert_true(out == want)
-    # --slim: the 12 columns alone.
+    # --slim: the 12 columns alone, from the full decode and from the slim one, with the walk and path span.
     var slim = List[UInt8]()
     gaf_line[False](msg.unsafe_ptr(), a, nodes, slim)
     assert_true(slim == _text("r1\t13\t0\t13\t+\t>1>2>3\t16\t0\t13\t12\t13\t60\n"))
+    var b = Alignment()
+    b.decode[slim=True](msg.unsafe_ptr(), 0, len(msg))
+    var fast = List[UInt8]()
+    var walk = List[Int]()
+    var span = slim_line(msg.unsafe_ptr(), b, nodes, fast, walk)
+    assert_true(fast == slim)
+    assert_equal(len(walk), 3)
+    assert_equal(walk[2], 3 << 1)
+    assert_true(span[0] == 0 and span[1] == 13)
 
 
 def test_unaligned_line() raises:

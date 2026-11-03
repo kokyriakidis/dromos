@@ -241,7 +241,7 @@ struct IndexSink(MessageSink, Movable):
         st[].recs.clear()
         var placed = Placed(0, 0, 0)
         for m in range(first, last):
-            st[].alignment.decode(data, messages[unsafe_offset=2 * m], messages[unsafe_offset=2 * m + 1])
+            st[].alignment.decode[slim=True](data, messages[unsafe_offset=2 * m], messages[unsafe_offset=2 * m + 1])
             # The line goes straight after room for its record header, kept if it is placed.
             var at = len(st[].recs)
             st[].recs.resize(unsafe_uninit_length=at + HEADER)
@@ -306,7 +306,7 @@ struct IndexSink(MessageSink, Movable):
             var c = data[unsafe_offset=a.name_at]
             if c == UInt8(ord("#")) or c == UInt8(ord("@")):
                 return _SKIP
-        if not a.has_path or len(a.mappings) == 0:
+        if not a.has_path or len(a.maps) == 0:
             return _UNMAPPED
         var ts = path[0]
         var te = path[1]
@@ -454,68 +454,125 @@ struct IndexSink(MessageSink, Movable):
         for r in range(n):
             header += String(t"#max_span\t{self.map.contigs[self.by_rank[r]]}\t{max_span[r]}\n")
         w.header(header)
+        # Windows of buckets, three deep: each step inflates and sorts window j, lays out window j - 1, deflates the
+        # whole blocks of window j - 2 and writes window j - 3, all at once. Two slot sets, text buffers and output
+        # sets take turns.
         var window = 4 * threads
-        var slots = List[_Slot]()
-        for _ in range(window):
-            slots.append(_Slot())
+        var windows = (len(order) + window - 1) // window
+        var slots = List[List[_Slot]]()
+        for _ in range(2):
+            var group = List[_Slot]()
+            for _ in range(window):
+                group.append(_Slot())
+            slots.append(group^)
+        # Each window's first stream offset (its lines'), then the end of the last; each window's buckets; how many
+        # outputs each output set holds.
+        var win_start = List[Int](length=windows + 1, fill=0)
+        var win_count = List[Int](length=windows, fill=0)
+        var deflated = List[Int](length=2, fill=0)
         var bad = List[Int](length=1, fill=0)
-        var gather_ns = 0
-        var layout_ns = 0
-        var index_ns = 0
+        var end = len(w.texts[0])
+        var step_ns = 0
         var serial_ns = 0
-        var start = 0
-        while start < len(order):
-            var count = min(window, len(order) - start)
-            for k in range(count):
-                slots[k].rank = order[start + k][0]
-                slots[k].bucket = order[start + k][1]
-            var gather = _WindowTask(
-                0,
+        var t_loop = Int(perf_counter_ns())
+        for j in range(windows + 3):
+            var s0 = Int(perf_counter_ns())
+            # Window j's buckets, to inflate and sort.
+            var gathers = 0
+            if j < windows:
+                gathers = min(window, len(order) - j * window)
+                win_count[j] = gathers
+                for k in range(gathers):
+                    slots[j % 2][k].rank = order[j * window + k][0]
+                    slots[j % 2][k].bucket = order[j * window + k][1]
+            # Window j - 1, sorted, laid out after what window j - 2 leaves of its last block.
+            var lay = j - 1
+            var layouts = 0
+            if lay >= 0 and lay < windows:
+                layouts = win_count[lay]
+                var x = lay % 2
+                var start = end
+                var base = (start // BLOCK) * BLOCK
+                var at = start - base
+                for k in range(layouts):
+                    slots[x][k].at = at
+                    at += slots[x][k].text_len
+                w.texts[x].resize(unsafe_uninit_length=at)
+                if lay > 0 and start > base:
+                    var y = 1 - x
+                    unsafe_memcpy(
+                        dest=mut_untracked(w.texts[x].unsafe_ptr()),
+                        src=imm_untracked(w.texts[y].unsafe_ptr()).unsafe_offset(base - w.text_base[y]),
+                        count=start - base,
+                    )
+                w.text_base[x] = base
+                win_start[lay] = start
+                end = base + at
+                win_start[lay + 1] = end
+            # Window j - 2's whole blocks, to deflate.
+            var dw = j - 2
+            var deflates = 0
+            var deflate_len = 0
+            if dw >= 0 and dw < windows:
+                var x = dw % 2
+                deflate_len = (win_start[dw + 1] // BLOCK) * BLOCK - w.text_base[x]
+                var blocks = deflate_len // BLOCK
+                deflates = (blocks + BLOCKS_PER_TASK - 1) // BLOCKS_PER_TASK
+                while len(w.outs[x]) < deflates:
+                    w.outs[x].append(List[UInt8]())
+                deflated[x] = deflates
+            # Window j - 3's blocks, to write.
+            var wr = j - 3
+            var writes = 1 if wr >= 0 and wr < windows else 0
+            var task = _FinishTask(
                 mut_untracked(Pointer(to=self)),
-                mut_untracked(slots.unsafe_ptr()),
-                mut_untracked(Pointer(to=w)),
+                Pointer(to=lib).as_imm(),
+                level,
+                writes,
+                mut_untracked(Pointer(to=w.file)),
+                mut_untracked(w.outs[(j + 1) % 2].unsafe_ptr()),
+                deflated[(j + 1) % 2] if writes == 1 else 0,
+                gathers,
+                mut_untracked(slots[j % 2].unsafe_ptr()),
+                layouts,
+                mut_untracked(slots[(j + 1) % 2].unsafe_ptr()),
+                mut_untracked(w.texts[(j + 1) % 2].unsafe_ptr()),
+                deflates,
+                imm_untracked(w.texts[j % 2].unsafe_ptr()),
+                deflate_len,
+                mut_untracked(w.outs[j % 2].unsafe_ptr()),
                 mut_untracked(bad.unsafe_ptr()),
             )
-            var g0 = Int(perf_counter_ns())
-            parallel_for(gather, count, threads)
-            var g1 = Int(perf_counter_ns())
-            gather_ns += g1 - g0
-            if bad[0] != 0:
+            var s1 = Int(perf_counter_ns())
+            parallel_for(task, writes + gathers + layouts + deflates, threads)
+            var s2 = Int(perf_counter_ns())
+            if bad[0] == 1:
                 raise Error("a bucket's lines did not inflate")
-            # Where each bucket's text goes, after what the last window left of its last block.
-            var at = len(w.buf)
-            for k in range(count):
-                slots[k].at = at
-                at += slots[k].text_len
-            w.buf.resize(unsafe_uninit_length=at)
-            var lay_out = _WindowTask(
-                1,
-                mut_untracked(Pointer(to=self)),
-                mut_untracked(slots.unsafe_ptr()),
-                mut_untracked(Pointer(to=w)),
-                mut_untracked(bad.unsafe_ptr()),
-            )
-            var l0 = Int(perf_counter_ns())
-            parallel_for(lay_out, count, threads)
-            var l1 = Int(perf_counter_ns())
-            layout_ns += l1 - l0
-            for k in range(count):
-                var contig = self.by_rank[slots[k].rank]
-                var end = w.base + slots[k].at
-                for rec in slots[k].recs:
-                    end += rec.out_len
-                    w.pending.append(_Tab(contig, rec.start, rec.end, end))
-                slots[k].raw = List[UInt8]()
-                slots[k].recs = List[_Rec]()
-            var i0 = Int(perf_counter_ns())
-            w.write_blocks(lib, len(w.buf) // BLOCK, threads)
-            var i1 = Int(perf_counter_ns())
-            w.index_written(self.map.contigs)
-            index_ns += Int(perf_counter_ns()) - i1
-            serial_ns += i0 - l1
-            start += count
-        w.write_blocks(lib, (len(w.buf) + BLOCK - 1) // BLOCK, threads)
+            if bad[0] == 2:
+                raise Error("BGZF: a block did not deflate")
+            # Window j - 1's lines wait for their blocks; window j - 2's blocks have their addresses, and the lines
+            # ending in them are indexed.
+            if layouts > 0:
+                var x = lay % 2
+                for k in range(layouts):
+                    var contig = self.by_rank[slots[x][k].rank]
+                    var stream_end = w.text_base[x] + slots[x][k].at
+                    for rec in slots[x][k].recs:
+                        stream_end += rec.out_len
+                        w.pending.append(_Tab(contig, rec.start, rec.end, stream_end))
+                    slots[x][k].raw = List[UInt8]()
+                    slots[x][k].recs = List[_Rec]()
+            if deflates > 0:
+                w.addressed(dw % 2, deflates, w.text_base[dw % 2] + deflate_len)
+                w.index_written(self.map.contigs)
+            step_ns += s2 - s1
+            serial_ns += (s1 - s0) + (Int(perf_counter_ns()) - s2)
+        # The last window's partial block (or the header alone), then the end.
+        var last = (windows - 1) % 2 if windows > 0 else 0
+        var t_tail = Int(perf_counter_ns())
+        w.finish_tail(lib, last, end)
         w.index_written(self.map.contigs)
+        var t_close = Int(perf_counter_ns())
         w.close(lib)
         var t1 = Int(perf_counter_ns())
         print(
@@ -528,9 +585,9 @@ struct IndexSink(MessageSink, Movable):
         if Bool(getenv("DROMOS_TIMING")):
             print(
                 (
-                    t"dromos timing (s): inflate+sort {Float64(gather_ns) * 1e-9}, lay out {Float64(layout_ns) * 1e-9},"
-                    t" deflate {Float64(w.deflate_ns) * 1e-9}, write {Float64(w.write_ns) * 1e-9}, tabix"
-                    t" {Float64(index_ns) * 1e-9}, between {Float64(serial_ns) * 1e-9}"
+                    t"dromos timing (s): before {Float64(t_loop - t0) * 1e-9}, sort and write steps"
+                    t" {Float64(step_ns) * 1e-9}, between {Float64(serial_ns) * 1e-9}, tail"
+                    t" {Float64(t_close - t_tail) * 1e-9}, close {Float64(t1 - t_close) * 1e-9}"
                 ),
                 file=stderr,
             )
@@ -628,104 +685,87 @@ struct _Tab(TrivialRegisterPassable):
 struct _Writer(Movable):
     """The BGZF output, cut into blocks of exactly BLOCK bytes, so the virtual offset of any byte follows from its
     stream offset and the blocks' addresses (pgcat's IndexedWriter): lines are indexed once the block holding their
-    end is written."""
+    end has its address."""
 
     var path: String
     var tmp: String
     var file: FileHandle
     var level: Int
-    var buf: List[UInt8]
+    var texts: List[List[UInt8]]
+    """Two windows' text, taking turns: the one being laid out, the one being deflated."""
+    var text_base: List[Int]
+    """The stream offset of each text's first byte, a block boundary."""
+    var outs: List[List[List[UInt8]]]
+    """Two windows' deflated blocks, taking turns: the ones being deflated, the ones being written."""
     var base: Int
-    """The stream offset of buf[0], a block boundary."""
+    """The stream bytes in blocks with addresses."""
     var written: Int
-    """Compressed bytes written: the address of the next block."""
+    """The compressed bytes of those blocks: the address of the next block."""
     var addrs: List[Int]
     """Every block's address, by block number."""
     var pending: List[_Tab]
     var head: Int
     var index: TbiBuilder
-    var outs: List[List[UInt8]]
-    var deflate_ns: Int
-    var write_ns: Int
 
     def __init__(out self, path: String, level: Int) raises:
         self.path = path
         self.tmp = path + ".tmp"
         self.file = open(self.tmp, "w")
         self.level = level
-        self.buf = List[UInt8]()
+        self.texts = List[List[UInt8]](length=2, fill=List[UInt8]())
+        self.text_base = List[Int](length=2, fill=0)
+        self.outs = List[List[List[UInt8]]](length=2, fill=List[List[UInt8]]())
         self.base = 0
         self.written = 0
         self.addrs = List[Int]()
         self.pending = List[_Tab]()
         self.head = 0
         self.index = TbiBuilder()
-        self.outs = List[List[UInt8]]()
-        self.deflate_ns = 0
-        self.write_ns = 0
 
     def header(mut self, text: String) raises:
         """Header lines (each starting with '#', with its newline), before any line: tabix skips them, and the index
         starts after them."""
-        self.buf.extend(text.as_bytes())
-        if len(self.buf) >= BLOCK:
+        self.texts[0].extend(text.as_bytes())
+        if len(self.texts[0]) >= BLOCK:
             raise Error("header longer than a BGZF block")
         # Block 0 starts at address 0: the first line starts at (0, length).
-        self.index.set_first_offset(len(self.buf))
+        self.index.set_first_offset(len(self.texts[0]))
 
-    def write_blocks(mut self, lib: OwnedDLHandle, blocks: Int, threads: Int) raises:
-        """Deflates and writes the first `blocks` blocks of buf (the last may be partial, when finishing), keeping
-        the rest."""
-        if blocks == 0:
-            return
-        var take = min(blocks * BLOCK, len(self.buf))
-        var tasks = (blocks + BLOCKS_PER_TASK - 1) // BLOCKS_PER_TASK
-        while len(self.outs) < tasks:
-            self.outs.append(List[UInt8]())
-        var failed = List[Int](length=1, fill=0)
-        var task = _DeflateTask(
-            Pointer(to=lib).as_imm(),
-            self.level,
-            imm_untracked(self.buf.unsafe_ptr()),
-            take,
-            mut_untracked(self.outs.unsafe_ptr()),
-            mut_untracked(failed.unsafe_ptr()),
-        )
-        var d0 = Int(perf_counter_ns())
-        parallel_for(task, tasks, threads)
-        var d1 = Int(perf_counter_ns())
-        self.deflate_ns += d1 - d0
-        if failed[0] != 0:
-            raise Error("BGZF: a block did not deflate")
-        for t in range(tasks):
-            var p = self.outs[t].unsafe_ptr().as_imm()
+    def addressed(mut self, x: Int, outputs: Int, through: Int):
+        """The blocks in output set `x`'s first `outputs` outputs, deflated from the stream up to `through`, get
+        their addresses."""
+        for t in range(outputs):
+            var p = self.outs[x][t].unsafe_ptr().as_imm()
             var at = 0
-            while at < len(self.outs[t]):
+            while at < len(self.outs[x][t]):
                 self.addrs.append(self.written)
                 var size = (Int(p[unsafe_offset=at + 16]) | Int(p[unsafe_offset=at + 17]) << 8) + 1
                 self.written += size
                 at += size
-            self.file.write_bytes(Span(self.outs[t]))
-        var rest = len(self.buf) - take
-        if rest > 0:
-            unsafe_memmove(
-                dest=mut_untracked(self.buf.unsafe_ptr()),
-                src=imm_untracked(self.buf.unsafe_ptr()).unsafe_offset(take),
-                count=rest,
-            )
-        self.buf.resize(unsafe_uninit_length=rest)
-        self.base += take
-        self.write_ns += Int(perf_counter_ns()) - d1
+        self.base = through
+
+    def finish_tail(mut self, lib: OwnedDLHandle, x: Int, end: Int) raises:
+        """Deflates and writes what text `x` holds past the last whole block, up to stream offset `end`."""
+        var rest = end - self.base
+        if rest <= 0:
+            return
+        self.outs[x].clear()
+        self.outs[x].append(List[UInt8]())
+        var d = Deflater(lib, self.level)
+        d.block(lib, self.texts[x].unsafe_ptr().unsafe_offset(self.base - self.text_base[x]), rest, self.outs[x][0])
+        d.free(lib)
+        self.file.write_bytes(Span(self.outs[x][0]))
+        self.addressed(x, 1, end)
 
     def _voffset(self, s: Int) -> Int:
-        """The virtual offset of stream offset `s`, in a written block or at the start of the next: a block's end
-        reads as the start of the next block, as htslib reports it after reading a line."""
+        """The virtual offset of stream offset `s`, in a block with an address or at the start of the next: a
+        block's end reads as the start of the next block, as htslib reports it after reading a line."""
         if s == self.base:
             return self.written << 16
         return self.addrs[s // BLOCK] << 16 | (s % BLOCK)
 
     def index_written(mut self, contigs: List[String]) raises:
-        """Indexes the lines whose ends are written."""
+        """Indexes the lines whose ends lie in blocks with addresses."""
         while self.head < len(self.pending):
             var t = self.pending[self.head]
             if t.stream_end > self.base:
@@ -760,47 +800,57 @@ def _rename(src: String, dst: String) raises:
 
 
 @fieldwise_init
-struct _DeflateTask[lib_origin: ImmOrigin](ParallelTask):
-    """Task t deflates blocks t * BLOCKS_PER_TASK onward of `data[:length]` into outs[t]."""
+struct _FinishTask[lib_origin: ImmOrigin](ParallelTask):
+    """One step of the final phase: `writes` (0 or 1) writes a window's deflated blocks in order, `gathers` inflate
+    and sort a window's buckets, `layouts` lay out the window before it, and `deflates` deflate the whole blocks of
+    the window before that, BLOCKS_PER_TASK blocks each."""
 
+    var sink: MutPointer[IndexSink, MutUntrackedOrigin]
     var lib: ImmPointer[OwnedDLHandle, Self.lib_origin]
     var level: Int
-    var data: ImmPointer[UInt8, ImmUntrackedOrigin]
-    var length: Int
-    var outs: MutPointer[List[UInt8], MutUntrackedOrigin]
-    var failed: MutPointer[Int, MutUntrackedOrigin]
-
-    def run(self, index: Int):
-        ref out = self.outs[unsafe_offset=index]
-        out.clear()
-        try:
-            var d = Deflater(self.lib[], self.level)
-            var at = index * BLOCKS_PER_TASK * BLOCK
-            var end = min(self.length, at + BLOCKS_PER_TASK * BLOCK)
-            while at < end:
-                var n = min(BLOCK, end - at)
-                d.block(self.lib[], self.data.unsafe_offset(at), n, out)
-                at += n
-            d.free(self.lib[])
-        except:
-            self.failed[] = 1
-
-
-@fieldwise_init
-struct _WindowTask(ParallelTask):
-    """Stage 0: slot k's bucket inflated and sorted; stage 1: its lines laid out in the writer's buffer."""
-
-    var stage: Int
-    var sink: MutPointer[IndexSink, MutUntrackedOrigin]
-    var slots: MutPointer[_Slot, MutUntrackedOrigin]
-    var writer: MutPointer[_Writer, MutUntrackedOrigin]
+    var writes: Int
+    var file: MutPointer[FileHandle, MutUntrackedOrigin]
+    var write_outs: MutPointer[List[UInt8], MutUntrackedOrigin]
+    var write_count: Int
+    var gathers: Int
+    var gather_slots: MutPointer[_Slot, MutUntrackedOrigin]
+    var layouts: Int
+    var layout_slots: MutPointer[_Slot, MutUntrackedOrigin]
+    var layout_dst: MutPointer[UInt8, MutUntrackedOrigin]
+    var deflates: Int
+    var deflate_src: ImmPointer[UInt8, ImmUntrackedOrigin]
+    var deflate_len: Int
+    var deflate_outs: MutPointer[List[UInt8], MutUntrackedOrigin]
     var bad: MutPointer[Int, MutUntrackedOrigin]
 
     def run(self, index: Int):
-        if self.stage == 0:
+        var i = index
+        if i < self.writes:
+            for t in range(self.write_count):
+                self.file[].write_bytes(Span(self.write_outs[unsafe_offset=t]))
+            return
+        i -= self.writes
+        if i < self.gathers:
             try:
-                self.sink[].gather(self.slots[unsafe_offset=index])
+                self.sink[].gather(self.gather_slots[unsafe_offset=i])
             except:
                 self.bad[] = 1
             return
-        self.sink[].lay_out(self.slots[unsafe_offset=index], self.writer[].buf.unsafe_ptr())
+        i -= self.gathers
+        if i < self.layouts:
+            self.sink[].lay_out(self.layout_slots[unsafe_offset=i], self.layout_dst)
+            return
+        i -= self.layouts
+        ref out = self.deflate_outs[unsafe_offset=i]
+        out.clear()
+        try:
+            var d = Deflater(self.lib[], self.level)
+            var at = i * BLOCKS_PER_TASK * BLOCK
+            var stop = min(self.deflate_len, at + BLOCKS_PER_TASK * BLOCK)
+            while at < stop:
+                var n = min(BLOCK, stop - at)
+                d.block(self.lib[], self.deflate_src.unsafe_offset(at), n, out)
+                at += n
+            d.free(self.lib[])
+        except:
+            self.bad[] = 2

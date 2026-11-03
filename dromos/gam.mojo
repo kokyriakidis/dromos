@@ -86,6 +86,20 @@ struct Mapping(TrivialRegisterPassable):
     var edit_count: Int
 
 
+@fieldwise_init
+struct MapSummary(TrivialRegisterPassable):
+    """A mapping as a slim GAF line needs it: its position, and its edits summed (the bases they take of the node and
+    of the read, the bases matched) with whether it is one insertion alone."""
+
+    var node: Int
+    var offset: Int
+    var reverse: Bool
+    var from_total: Int
+    var to_total: Int
+    var matches: Int
+    var lone_insertion: Bool
+
+
 struct Alignment(Movable):
     """One decoded `vg.Alignment`: its fields as spans of the message, and its path's mappings and edits."""
 
@@ -101,6 +115,8 @@ struct Alignment(Movable):
     var has_path: Bool
     var mappings: List[Mapping]
     var edits: List[Edit]
+    var maps: List[MapSummary]
+    """The path's mappings summed, when decoded `slim` (mappings and edits are then empty)."""
 
     def __init__(out self):
         self.name_at = 0
@@ -115,6 +131,7 @@ struct Alignment(Movable):
         self.has_path = False
         self.mappings = List[Mapping]()
         self.edits = List[Edit]()
+        self.maps = List[MapSummary]()
 
     def reset(mut self):
         """Empties every field, keeping the lists' memory."""
@@ -130,9 +147,11 @@ struct Alignment(Movable):
         self.has_path = False
         self.mappings.clear()
         self.edits.clear()
+        self.maps.clear()
 
-    def decode(mut self, p: ImmPointer[UInt8, _], start: Int, end: Int) raises:
-        """Reads the message at `p[start:end]`, reusing this alignment's lists."""
+    def decode[slim: Bool = False](mut self, p: ImmPointer[UInt8, _], start: Int, end: Int) raises:
+        """Reads the message at `p[start:end]`, reusing this alignment's lists; with `slim`, the path as `maps`, all
+        `slim_line` needs (and no mappings or edits, which `gaf_line` needs)."""
         self.reset()
         var at = start
         while at < end:
@@ -148,7 +167,10 @@ struct Alignment(Movable):
                     self.sequence_length = n
                 elif field == 2:
                     self.has_path = True
-                    self._path(p, at, at + n)
+                    comptime if slim:
+                        self._path_slim(p, at, at + n)
+                    else:
+                        self._path(p, at, at + n)
                 elif field == 3:
                     self.name_at = at
                     self.name_length = n
@@ -181,6 +203,66 @@ struct Alignment(Movable):
                 at += n
             else:
                 skip(p, at, end, key & 7)
+
+    def _path_slim(mut self, p: ImmPointer[UInt8, _], start: Int, end: Int) raises:
+        var at = start
+        while at < end:
+            var key = Int(varint(p, at, end))
+            if key == (2 << 3) | 2:
+                var n = Int(varint(p, at, end))
+                self._mapping_slim(p, at, at + n)
+                at += n
+            else:
+                skip(p, at, end, key & 7)
+
+    def _mapping_slim(mut self, p: ImmPointer[UInt8, _], start: Int, end: Int) raises:
+        """`_mapping`, its edits summed as they are read."""
+        var m = MapSummary(0, 0, False, 0, 0, 0, False)
+        var edits = 0
+        var last_insertion = False
+        var at = start
+        while at < end:
+            var key = Int(varint(p, at, end))
+            if key == (1 << 3) | 2:
+                var n = Int(varint(p, at, end))
+                var stop = at + n
+                while at < stop:
+                    var k = Int(varint(p, at, stop))
+                    if k == (1 << 3) | 0:
+                        m.node = Int(varint(p, at, stop))
+                    elif k == (2 << 3) | 0:
+                        m.offset = Int(varint(p, at, stop))
+                    elif k == (4 << 3) | 0:
+                        m.reverse = varint(p, at, stop) != 0
+                    else:
+                        skip(p, at, stop, k & 7)
+            elif key == (2 << 3) | 2:
+                var n = Int(varint(p, at, end))
+                var stop = at + n
+                var from_length = 0
+                var to_length = 0
+                var sequence_length = 0
+                while at < stop:
+                    var k = Int(varint(p, at, stop))
+                    if k == (1 << 3) | 0:
+                        from_length = int32_of(varint(p, at, stop))
+                    elif k == (2 << 3) | 0:
+                        to_length = int32_of(varint(p, at, stop))
+                    elif k == (3 << 3) | 2:
+                        sequence_length = Int(varint(p, at, stop))
+                        at += sequence_length
+                    else:
+                        skip(p, at, stop, k & 7)
+                m.from_total += from_length
+                m.to_total += to_length
+                if from_length == to_length and sequence_length == 0:
+                    m.matches += from_length
+                last_insertion = from_length == 0 and to_length > 0 and sequence_length > 0
+                edits += 1
+            else:
+                skip(p, at, end, key & 7)
+        m.lone_insertion = edits == 1 and last_insertion
+        self.maps.append(m)
 
     def _mapping(mut self, p: ImmPointer[UInt8, _], start: Int, end: Int) raises:
         var m = Mapping(0, 0, False, len(self.edits), 0)
@@ -330,9 +412,84 @@ def gaf_line[
 def slim_line[
     N: Nodes, //
 ](p: ImmPointer[UInt8, _], a: Alignment, nodes: N, mut out: List[UInt8], mut walk: List[Int]) raises -> Tuple[Int, Int]:
-    """`gaf_line` without tags, also giving the line's walk (its steps `node << 1 | reverse`, column 6) and its path
-    start and end (columns 8 and 9; (0, 0) for an unaligned read, whose columns are `*`)."""
-    return _gaf_line[False, True](p, a, nodes, out, walk)
+    """`gaf_line` without tags, for an alignment decoded `slim`, also giving the line's walk (its steps
+    `node << 1 | reverse`, column 6) and its path start and end (columns 8 and 9; (0, 0) for an unaligned read, whose
+    columns are `*`). The same steps as `_gaf_line`, each mapping's edits taken summed."""
+    walk.clear()
+    put_bytes(out, p, a.name_at, a.name_length)
+    if not a.has_path or len(a.maps) == 0:
+        # Unaligned: the read as one insertion, no place.
+        out.append(UInt8(ord("\t")))
+        put_int(out, a.sequence_length)
+        put_text(out, "\t0\t")
+        put_int(out, a.sequence_length)
+        put_text(out, "\t*\t*\t*\t*\t*\t*\t*\t")
+        put_int(out, a.mapping_quality)
+        out.append(UInt8(ord("\n")))
+        return (0, 0)
+    var n_maps = len(a.maps)
+    var final_mapping = n_maps - 1
+    if final_mapping > 0 and a.maps[final_mapping].lone_insertion:
+        final_mapping -= 1
+    var query_length = a.sequence_length
+    if query_length == 0:
+        for m in a.maps:
+            query_length += m.to_total
+    out.append(UInt8(ord("\t")))
+    put_int(out, query_length)
+    put_text(out, "\t0\t")
+    put_int(out, query_length)
+    put_text(out, "\t+\t")
+    var path_length = 0
+    var path_start = 0
+    var path_end = 0
+    var matches = 0
+    var prev_offset = 0
+    for i in range(n_maps):
+        var m = a.maps[i]
+        var start = m.offset
+        var node_length = nodes.length(m.node)
+        var skip_step = False
+        if i > 0 and start > 0:
+            var pm = a.maps[i - 1]
+            if start == prev_offset and m.node == pm.node and m.reverse == pm.reverse:
+                skip_step = True
+        matches += m.matches
+        var offset = start + m.from_total
+        if i == 0:
+            path_start = start
+        elif i > final_mapping:
+            # giraffe's empty mapping for a softclip at the end.
+            skip_step = True
+        if i < n_maps - 1 and offset != node_length:
+            var nm = a.maps[i + 1]
+            if m.node == nm.node and m.reverse == nm.reverse:
+                # A duplicate mapping of the same node: no step of its own.
+                skip_step = True
+        if not skip_step:
+            path_length += node_length
+            if i == 0:
+                path_start = start
+            out.append(UInt8(ord("<")) if m.reverse else UInt8(ord(">")))
+            put_int(out, m.node)
+            walk.append(m.node << 1 | Int(m.reverse))
+        if i == final_mapping:
+            path_end = path_length - (node_length - offset)
+        prev_offset = offset
+    out.append(UInt8(ord("\t")))
+    put_int(out, path_length)
+    out.append(UInt8(ord("\t")))
+    put_int(out, path_start)
+    out.append(UInt8(ord("\t")))
+    put_int(out, path_end)
+    out.append(UInt8(ord("\t")))
+    put_int(out, matches)
+    out.append(UInt8(ord("\t")))
+    put_int(out, max(path_end - path_start, query_length))
+    out.append(UInt8(ord("\t")))
+    put_int(out, a.mapping_quality)
+    out.append(UInt8(ord("\n")))
+    return (path_start, path_end)
 
 
 def _gaf_line[
