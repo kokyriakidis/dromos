@@ -50,6 +50,11 @@ struct OutFile(Movable):
     var fd: Int32
     var path: String
 
+    def __init__(out self):
+        """No file (fd -1), until one is made in its place."""
+        self.fd = -1
+        self.path = String()
+
     def __init__(out self, path: String, mappable: Bool = False) raises:
         """With `mappable`, opened for reading too, as a mapping for writing needs."""
         var c_path = List[UInt8](path.as_bytes())

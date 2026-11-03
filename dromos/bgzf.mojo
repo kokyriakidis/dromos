@@ -273,6 +273,31 @@ def zstd_compress(lib: OwnedDLHandle, data: ImmPointer[UInt8, _], length: Int, l
     return frame^
 
 
+def zstd_compress_with(
+    lib: OwnedDLHandle, cctx: Int, data: ImmPointer[UInt8, _], length: Int, level: Int
+) raises -> List[UInt8]:
+    """`data[:length]` as one zstd frame, made with compression context `cctx` (ZSTD_createCCtx), reused across
+    calls: a context made for every frame costs as much as compressing a small one."""
+    var bound = lib.get_function[Int]("ZSTD_compressBound")(length)
+    var out = List[UInt8](unsafe_uninit_length=bound)
+    var n = lib.get_function[Int]("ZSTD_compressCCtx")(cctx, out.unsafe_ptr(), bound, data, length, Int32(level))
+    if lib.get_function[UInt32]("ZSTD_isError")(n) != 0:
+        raise Error("zstd: compression failed")
+    var frame = List[UInt8](unsafe_uninit_length=n)
+    unsafe_memcpy(dest=frame.unsafe_ptr(), src=out.unsafe_ptr(), count=n)
+    return frame^
+
+
+def zstd_decompress_with(
+    lib: OwnedDLHandle, dctx: Int, frame: Span[UInt8, _], dst: MutPointer[UInt8, _], length: Int
+) raises:
+    """Inflates `frame` into `dst` with decompression context `dctx` (ZSTD_createDCtx); it must fill `dst` exactly
+    (`length` bytes)."""
+    var n = lib.get_function[Int]("ZSTD_decompressDCtx")(dctx, dst, length, frame.unsafe_ptr(), len(frame))
+    if lib.get_function[UInt32]("ZSTD_isError")(n) != 0 or n != length:
+        raise Error("zstd: a frame did not decompress")
+
+
 def zstd_decompress(lib: OwnedDLHandle, frame: Span[UInt8, _], dst: MutPointer[UInt8, _], length: Int) raises:
     """Inflates `frame` into `dst`, which it must fill exactly (`length` bytes)."""
     var n = lib.get_function[Int]("ZSTD_decompress")(dst, length, frame.unsafe_ptr(), len(frame))
