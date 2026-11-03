@@ -128,6 +128,8 @@ def load_windows(path: String, contig: Contig, map: RefMap) raises -> List[Windo
             if end > at:
                 _snarl(contig, map, q, at, end, all)
             at = end + 1
+    # The file is read through `p`, untracked: it stays mapped until here.
+    _ = file^
 
     # By start, the widest first; repeats dropped; then windows inside the one before (but for an empty one at its
     # end) dropped.
