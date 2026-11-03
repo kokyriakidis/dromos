@@ -4,14 +4,17 @@
 
 dromos reads [vg](https://github.com/vgteam/vg)'s graph alignments, GAM or GAF, and turns them into what downstream
 tools need, in one pass over the file, on every core. It reads the GBZ pangenome graph itself, through the
-[gbz](https://github.com/jltsiren/gbwt-rs) crate. It is written in [Mojo](https://www.modular.com/mojo) and is the
-indexing engine behind [pgphase](https://github.com/kokyriakidis/pgphase) (`pgphase index`).
+[gbz](https://github.com/jltsiren/gbwt-rs) crate, and makes the rest of pgphase's inputs from it: the site catalogs
+and the graph files. It is written in [Mojo](https://www.modular.com/mojo) and is the indexing engine behind
+[pgphase](https://github.com/kokyriakidis/pgphase) (`pgphase index`).
 
 | Command | What it writes |
 |---|---|
 | `dromos index` | the alignments placed on the reference, sorted, bgzipped and tabix-indexed: the index pgphase reads |
 | `dromos gam-to-gaf` | a GAM as the GAF lines `vg convert -G` writes, in the GAM's order |
 | `dromos surject` | the alignments on one reference contig as SAM: the records `pgcatalog surject` writes |
+| `dromos catalog` | a GBZ graph's site catalogs, one per reference contig: the `.pgsites` files `pgcatalog build` writes |
+| `dromos view` | a catalog as VCF, whole or a region of it, as `pgcatalog view` prints it |
 | `dromos ref-map` | a GBZ graph's reference map, where each node lies on the reference: `pgcatalog ref-map`'s file |
 | `dromos node-table` | a GBZ graph's node lengths and letters, the file `pgcatalog node-table` writes |
 | `dromos reference-samples` | the reference samples a GBZ graph declares |
@@ -39,6 +42,23 @@ slice of that GAM (487,571 reads; SAM to /dev/null, 10 threads):
 | default | 200 s, 11.5 GB | **77 s**, 4.8 GB |
 | `--graph-placement` | 46 s, 10.5 GB | **19 s**, 3.7 GB |
 | `--catalog chr10.pgsites` | 329 s, 14.1 GB | **178 s**, 5.8 GB |
+
+`dromos catalog` against `pgcatalog build` (which loads the 6 GB graph whole first), from the same cached snarls,
+10 threads, writing to a hard disk:
+
+| HPRC v2.1, CHM13 | `pgcatalog build` | **`dromos catalog`** |
+|---|---|---|
+| every contig (25 catalogs, 1.5 GB) | 499 s, 17.8 GB | **282 s**, 25.1 GB |
+| chr1 | 67 s, 13.6 GB | **24.5 s**, 13.8 GB |
+| chr6 (the MHC) | 48 s, 11.6 GB | **14.0 s**, 9.9 GB |
+| chr20 | 35 s, 11.7 GB | **13.1 s**, 9.7 GB |
+| chrY | 30 s, 10.3 GB | **7.2 s**, 8.3 GB |
+| chr20:10,000,000-12,000,000 | 25.5 s, 9.7 GB | **4.7 s**, 6.5 GB |
+
+The whole genome takes 2,177 CPU seconds against pgcatalog's 2,588: the gbz crate's GBWT search is 41% of them,
+zstd's long-distance matching 19% (the catalog's own compression, which dromos must match byte for byte), dromos
+28%. `dromos view` prints chr20's catalog (3 GB of VCF) in 0.7 s and chr2's (16 GB) in 6.6 s, against 3.6 s and
+20.1 s.
 
 ## Install
 
@@ -80,6 +100,28 @@ dromos node-table --graph graph.gbz --out graph.nodes        # --no-letters: len
 
 On the HPRC graph a reference map takes 7 s and a node table 6 s, in under 8 GB of memory; pgcatalog takes 42 s and
 32 s, in 14 GB and 10 GB.
+
+### `dromos catalog` and `dromos view`
+
+```sh
+dromos catalog --graph graph.gbz --reference-sample CHM13 --out graph.catalog       # every reference contig
+dromos catalog --graph graph.gbz --reference-sample CHM13 --region chr20 --region chr6:28,000,000-34,000,000
+dromos view graph.catalog/chr20.pgsites chr20:10,000,000-12,000,000 | bgzip > sites.vcf.gz
+```
+
+- **What it writes.** For each reference contig, `<contig>.pgsites`: every snarl the reference path passes through,
+  at every nesting level, with all its alleles, as `vg deconstruct -a` reports them without what needs haplotype
+  names (genotypes, AC/AF/AN/NS), in zstd blocks by position. These are the files `pgcatalog build` writes, byte for
+  byte; pgphase reads them. A region (`--region chr20:START-END`, 1-based, inclusive) writes
+  `<contig>_<start>-<end>.pgsites`, the records a query of the whole contig's catalog returns.
+- **Snarls.** Each contig's snarls come from vg (`vg chunk -C` for its component, then `vg snarls`) the first time,
+  and are kept in `--snarls-cache` (`DIR/snarls`), which records the graph it belongs to; later runs read them from
+  there, and need no vg. A cache made by `pgcatalog build` serves as well.
+- **Options.** pgcatalog build's: `--graph`, `--out` (`GRAPH.catalog`), `--reference-sample`, `--region`
+  (repeatable), `-t`/`--threads`, `--snarls-jobs` (vg snarls runs at a time, 6), `--snarls-cache`, `--vg`, `--level`
+  (zstd, 6).
+- **`dromos view FILE.pgsites [CONTIG[:START-END]]`** prints the header, then every record, or those overlapping a
+  region as tabix would return them: what `pgcatalog view` prints.
 
 ### `dromos index`
 
@@ -151,6 +193,12 @@ dromos surject --contig chr20 --sam-contig chr20 graph.refmap graph.nodes reads.
 - **Surjection in batches.** A read's alignment to the reference costs from nothing to a second. Each step's
   slices gather the reads that touch the contig, as GAF lines; a few hundred MB of them are then aligned by one
   worker a thread taking pieces in turn, so threads wait at the end of a batch, not of every chunk.
+- **Catalogs on every core.** The graph's GBWT is loaded by the crate and node letters unpacked a page of ids at a
+  time, as needed. Snarls are built in pgcatalog's batches, each step building one batch while the previous one's
+  lines are written straight into their blocks and compressed; threads with nothing left build the next batches.
+  Snarls spanning megabases are searched ahead by helper threads, their haplotypes split into parts; records with
+  lines of gigabytes are made a window of alleles at a time on every thread and compressed by zstd's own threads.
+  The next contig is prepared, and the previous one finished, while one is built.
 - **Sorted without spilling.** Placed alignments gather by megabase of the reference, compressed with zstd as they
   arrive. At the end, windows of buckets are sorted, laid out, deflated and written in a three-deep pipeline, with
   the tabix index built as each block's address becomes known.
@@ -168,6 +216,10 @@ dromos is checked byte for byte against the tools it replaces, on HG002 HiFi ali
   GAM on chr20 (48,706) and chr6 across the MHC (47,027).
 - `ref-map` and `node-table` write the same files as `pgcatalog ref-map` and `node-table`, byte for byte, on the HPRC
   graph and a small one, for each reference sample; `reference-samples` prints the same lines.
+- `catalog` writes the same `.pgsites` files as `pgcatalog build` (pgcatalog 0.2.0), byte for byte, from the same
+  snarls: all 25 CHM13 contigs of the HPRC graph (43,494,146 records, 152 GB of VCF text, the largest record a 6.6 GB
+  line on chr2), regions of them, and the small graph's catalogs pgphase's tests commit, whatever the threads; `view`
+  prints what `pgcatalog view` prints.
 - `tests/integration/edges.sh` covers odd and damaged inputs: empty files, multi-member gzip, lines across chunk
   boundaries, any thread count, stdin, and truncated or corrupt files, which fail instead of leaving a partial
   index.

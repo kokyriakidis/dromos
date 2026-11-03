@@ -3,8 +3,8 @@
 Pangenome graph alignments in Mojo: vg's GAM read as fast as the disk delivers it, written as pgphase's index (the
 file `pgcat index-gaf --slim` writes), as the GAF lines `vg convert -G` writes, or as SAM on one reference contig
 (`pgcatalog surject`'s records) (github.com/kokyriakidis/pgphase). It reads the GBZ graph itself, through the gbz
-crate, and makes the graph files pgphase's pgcatalog made (`ref-map`, `node-table`): dromos alone turns a graph and
-its alignments into pgphase's inputs.
+crate, and makes the files pgphase's pgcatalog made: the site catalogs (`catalog`, `view`) and the graph files
+(`ref-map`, `node-table`). dromos alone turns a graph and its alignments into pgphase's inputs.
 
 ## Mojo skills
 
@@ -21,17 +21,24 @@ habits:
 
 ## Layout
 
-- `cli/dromos_cli.mojo`: the commands, `index`, `gam-to-gaf`, `surject`, `ref-map`, `node-table` and
-  `reference-samples`, each with its own options and `-h`.
+- `cli/dromos_cli.mojo`: the commands, `index`, `gam-to-gaf`, `surject`, `catalog`, `view`, `ref-map`, `node-table`
+  and `reference-samples`, each with its own options and `-h`.
 - `gbz-ffi/`: the gbz crate (=0.6.2, with simple-sds =0.4.2) behind a C interface, a Rust cdylib
   (`libdromos_gbz`, built by `pixi run build` beside build/dromos; dromos finds it there, then at $DROMOS_GBZ_LIB).
-  A thin layer: the whole graph (`dgbz_load`), header-only reads (tags, metadata), and the parts a reference map or
-  node table needs (`dgbz_parts_*`: the GBWT and the node letters' pieces, read at once, letters unpacked by range).
+  A thin layer: the whole graph (`dgbz_load`), header-only reads (tags, metadata), and the parts the graph files and
+  catalogs need (`dgbz_parts_*`: the GBWT and the node letters' pieces, read at once, letters unpacked by range; edges
+  and the bidirectional search for many visits or states a call, as the crate's GBZ gives them).
   `ABI` in lib.rs and graph.mojo must agree; raise both on any change to the interface.
 - `dromos/graph.mojo`: the interface in Mojo (`GbzGraph`, `GbzParts`, `Metadata`, `SearchState`), and pgcatalog's
   graph.rs ported (reference samples and paths, `resolve_reference_sample`, `fingerprint`).
   `dromos/graph_files.mojo`: `ref-map` and `node-table` (pgcatalog's refmap.rs and nodetable.rs ported), and the
   files kept beside a graph given in their place (`G.gbz.SAMPLE.refmap`, `G.gbz.nodes`).
+- `dromos/snarls.mojo`: vg snarls files (plain, gzip, BGZF), pgcatalog's snarls.rs. `dromos/catalog.mojo`: one
+  contig's catalog (pgcatalog's catalog.rs, record.rs and reference.rs): node letters a page at a time, the reference
+  path and its traversals, the haplotype walk search, records and their lines, and the steps that build, write and
+  compress them. `dromos/build.mojo`: the `catalog` command (build.rs: regions, the snarls cache, vg chunk and vg
+  snarls when a contig's snarls are not cached). `dromos/pgsites.mojo`: the `.pgsites` format: the writer, the reader,
+  `view`, and surject's snarl windows.
 - `dromos/stream.mojo`: the pipeline every command runs on: reads (O_DIRECT), decoding (BGZF, plain, gzip), GAM
   told from GAF by the first bytes (`looks_like_gaf`), framing (GAM messages or GAF lines), and a `MessageSink`
   taking slices of each chunk.
@@ -42,8 +49,8 @@ habits:
   (`dromos/tabix.mojo`).
 - `dromos/surject.mojo`: the `surject` sink (reads rebuilt from GAF lines, batches aligned by side tasks);
   `dromos/linearize.mojo`: its alignment to the reference (banded affine gaps, chaining, clipping);
-  `dromos/contig.mojo`: the contig's letters and once-visited nodes from the ref map and node table;
-  `dromos/pgsites.mojo`: a catalog's snarl windows. They port pgcatalog's surject.rs, reference.rs and pileup.rs.
+  `dromos/contig.mojo`: the contig's letters and once-visited nodes from the ref map and node table; with
+  `load_windows` in pgsites.mojo they port pgcatalog's surject.rs, reference.rs and pileup.rs.
 - `dromos/bgzf.mojo`: files, BGZF blocks, libdeflate, zstd and zlib. `dromos/nodes.mojo`: the node table.
   `dromos/output.mojo`, `dromos/parallel.mojo`: writing, integers, threads.
 
@@ -71,6 +78,11 @@ habits:
   ff2b4b2; refmap.mojo and tabix.mojo port its gaf.rs and tabix.rs): at `-l 0` the same file byte for byte, and the
   same .tbi decompressed (the check does this). At other levels only the deflate differs: compare decompressed content
   and tabix queries.
+- `dromos catalog` must write pgcatalog build's `.pgsites` byte for byte (the same records, blocks, zstd frames and
+  index; zstd 1.5.7, pgcatalog's, with its parameters per frame), and `dromos view` print pgcatalog view's text, for
+  any threads: check any change with `pixi run check` (its catalog and view cases; `--full` for the whole genome)
+  and tests/integration/edges.sh. Haplotype walks may be found in any order (they are sorted); a heavy snarl's
+  haplotypes are searched in parts whose walks and counts add up.
 - `dromos surject` must write the SAM records `pgcatalog surject` writes (pgphase's tools/pgcatalog), byte for byte,
   from a GAM and from its GAF: check any change with `pixi run check` (its surject cases; `--full` for the slice).
   Float ties in `chain` use libm's log2, as Rust does.
