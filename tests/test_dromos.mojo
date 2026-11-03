@@ -4,7 +4,7 @@ pgcat places alignments, and tabix bins as htslib numbers them."""
 from std.memory import bitcast
 from std.testing import TestSuite, assert_equal, assert_true
 
-from dromos.gam import Alignment, frame, gaf_line, varint
+from dromos.gam import Alignment, Framer, frame, gaf_line, varint
 from dromos.nodes import NodeTable
 from dromos.refmap import AMBIGUOUS, INCONSISTENT, MISSING_NODE, NO_ANCHOR, Anchor, Placed, RefMap
 from dromos.tabix import N_BINS, bin_level, bin_parent, reg2bin
@@ -86,8 +86,9 @@ def test_varint() raises:
     assert_equal(Int(varint(b.unsafe_ptr(), at, len(b))), 5)
 
 
-def test_frame_keeps_whole_groups() raises:
-    # Two groups: 2 messages, then 1; the second cut short is left for the next read.
+def test_frame_resumes_inside_a_group() raises:
+    # Two groups: 2 messages, then 1. Cut inside the first group's second message, the first message is handed out
+    # and the rest read again with more data, the framer still inside the group.
     var stream = List[UInt8]()
     for count in [2, 1]:
         _varint(stream, count + 1)
@@ -99,12 +100,18 @@ def test_frame_keeps_whole_groups() raises:
     var messages = List[Int]()
     assert_equal(frame(Span(stream), messages), len(stream))
     assert_equal(len(messages), 6)
-    var cut = stream.copy()
-    _ = cut.pop()
+    var f = Framer()
     messages.clear()
-    var first = 2 + 3 + 2 * 4
-    assert_equal(frame(Span(cut), messages), first)
+    var cut = 2 + 3 + 4 + 2
+    var used = f.frame(Span(stream)[:cut], messages)
+    assert_equal(used, 2 + 3 + 4)
+    assert_equal(len(messages), 2)
+    var rest = List[UInt8](Span(stream)[used:])
+    messages.clear()
+    assert_equal(f.frame(Span(rest), messages), len(rest))
     assert_equal(len(messages), 4)
+    assert_equal(messages[0], 1)
+    assert_equal(f.remaining, 0)
 
 
 def test_frame_skips_other_tags_and_reads_untagged_groups() raises:

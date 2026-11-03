@@ -19,7 +19,7 @@ from std.sys import stderr
 from std.time import perf_counter_ns
 
 from dromos.bgzf import BLOCK, Deflater, eof_block, load_libdeflate, load_zstd, zstd_compress, zstd_decompress
-from dromos.gam import Alignment, gaf_line
+from dromos.gam import Alignment, slim_line
 from dromos.output import put_padded
 from dromos.parallel import ParallelTask, parallel_for
 from dromos.refmap import NO_ANCHOR, Anchor, Placed, RefMap, reason_name
@@ -68,9 +68,9 @@ def _get64(p: ImmPointer[UInt8, _], at: Int) -> Int:
 
 
 @always_inline
-def _put(mut out: List[UInt8], v: Int, bytes: Int):
+def _store(p: MutPointer[UInt8, _], v: Int, bytes: Int):
     for k in range(bytes):
-        out.append(UInt8((v >> (8 * k)) & 0xFF))
+        p[unsafe_offset=k] = UInt8((v >> (8 * k)) & 0xFF)
 
 
 def _parse_u64(p: ImmPointer[UInt8, _], at: Int, end: Int) -> Int:
@@ -111,22 +111,23 @@ def _parse_walk(p: ImmPointer[UInt8, _], at: Int, end: Int, mut walk: List[Int])
 
 
 struct _Slice(Movable):
-    """A slice's own state: its scratch, what it placed this step, and its counts over the whole GAM."""
+    """A slice's own state: its scratch, what it placed this step and the last (being gathered into buckets), and
+    its counts over the whole GAM."""
 
     var alignment: Alignment
-    var line: List[UInt8]
     var walk: List[Int]
     var anchors: List[Anchor]
     var recs: List[UInt8]
+    var prev: List[UInt8]
     var counts: List[Int]
     var span: List[Int]
 
     def __init__(out self, contigs: Int):
         self.alignment = Alignment()
-        self.line = List[UInt8]()
         self.walk = List[Int]()
         self.anchors = List[Anchor]()
         self.recs = List[UInt8]()
+        self.prev = List[UInt8]()
         self.counts = List[Int](length=N_COUNTS, fill=0)
         self.span = List[Int](length=contigs, fill=0)
 
@@ -145,23 +146,6 @@ struct _Bucket(Copyable, Movable):
         self.sizes = List[Int]()
         self.pending = List[UInt8]()
         self.records = 0
-
-
-struct _Job(Movable):
-    """A FRAME of a bucket's lines, to compress."""
-
-    var rank: Int
-    var bucket: Int
-    var raw: List[UInt8]
-    var size: Int
-    var frame: List[UInt8]
-
-    def __init__(out self, rank: Int, bucket: Int, var raw: List[UInt8]):
-        self.rank = rank
-        self.bucket = bucket
-        self.size = len(raw)
-        self.raw = raw^
-        self.frame = List[UInt8]()
 
 
 @fieldwise_init
@@ -215,10 +199,10 @@ struct IndexSink(MessageSink, Movable):
     var states: List[_Slice]
     var buckets: List[List[_Bucket]]
     """By contig rank, then bucket."""
-    var compressing: List[_Job]
-    """Frames the running step compresses, beside its slices."""
-    var queued: List[_Job]
-    """Frames for the step after it."""
+    var gatherers: Int
+    """Side tasks gathering the last step's lines into buckets, each its share of the buckets."""
+    var gathering: Bool
+    """Whether the last step placed lines, for the next to gather."""
 
     def __init__(out self, var map: RefMap, threads: Int) raises:
         var n = len(map.contigs)
@@ -239,8 +223,8 @@ struct IndexSink(MessageSink, Movable):
         for _ in range(4 * threads):
             self.states.append(_Slice(n))
         self.buckets = List[List[_Bucket]](length=n, fill=List[_Bucket]())
-        self.compressing = List[_Job]()
-        self.queued = List[_Job]()
+        self.gatherers = threads
+        self.gathering = False
 
     def slices(self) -> Int:
         return len(self.states)
@@ -258,32 +242,85 @@ struct IndexSink(MessageSink, Movable):
         var placed = Placed(0, 0, 0)
         for m in range(first, last):
             st[].alignment.decode(data, messages[unsafe_offset=2 * m], messages[unsafe_offset=2 * m + 1])
-            st[].line.clear()
-            gaf_line[False](data, st[].alignment, self.map, st[].line)
-            var p = st[].line.unsafe_ptr().as_imm()
-            var n = len(st[].line) - 1
+            # The line goes straight after room for its record header, kept if it is placed.
+            var at = len(st[].recs)
+            st[].recs.resize(unsafe_uninit_length=at + HEADER)
+            var path = slim_line(data, st[].alignment, self.map, st[].recs, st[].walk)
+            var n = len(st[].recs) - at - HEADER - 1
             var why = 0
             var aligned = 0
-            var kind = self._classify(p, n, st[].walk, st[].anchors, placed, why, aligned)
+            var kind = self._place(
+                data,
+                st[].alignment,
+                st[].recs.unsafe_ptr().as_imm().unsafe_offset(at + HEADER),
+                n,
+                path,
+                st[],
+                placed,
+                why,
+                aligned,
+            )
+            if kind == _PLACED:
+                var r = self.rank[placed.contig]
+                st[].counts[C_LINES] += 1
+                st[].counts[C_PLACED] += 1
+                st[].span[r] = max(st[].span[r], aligned)
+                var h = st[].recs.unsafe_ptr().unsafe_offset(at)
+                _store(h, r, 4)
+                _store(h.unsafe_offset(4), placed.start, 8)
+                _store(h.unsafe_offset(12), placed.end, 8)
+                _store(h.unsafe_offset(20), n, 4)
+                st[].recs.resize(unsafe_uninit_length=at + HEADER + n)
+                continue
+            st[].recs.resize(unsafe_uninit_length=at)
             if kind == _SKIP:
                 continue
             st[].counts[C_LINES] += 1
-            if kind == _PLACED:
-                st[].counts[C_PLACED] += 1
-                var r = self.rank[placed.contig]
-                st[].span[r] = max(st[].span[r], aligned)
-                _put(st[].recs, r, 4)
-                _put(st[].recs, placed.start, 8)
-                _put(st[].recs, placed.end, 8)
-                _put(st[].recs, n, 4)
-                st[].recs.extend(Span(unsafe_ptr=p, length=n))
-            elif kind == _UNMAPPED:
+            if kind == _UNMAPPED:
                 st[].counts[C_UNMAPPED] += 1
             elif kind == _UNPLACED:
                 st[].counts[C_UNPLACED] += 1
                 st[].counts[C_WHY + why - NO_ANCHOR] += 1
             else:
                 st[].counts[C_MALFORMED] += 1
+
+    def _place(
+        self,
+        data: ImmPointer[UInt8, _],
+        a: Alignment,
+        p: ImmPointer[UInt8, _],
+        n: Int,
+        path: Tuple[Int, Int],
+        mut st: _Slice,
+        mut placed: Placed,
+        mut why: Int,
+        mut aligned: Int,
+    ) -> Int:
+        """pgcat's classify of the GAF line `p[:n]` (no newline) slim_line wrote for alignment `a`, from what it
+        gave (the walk, the path start and end) rather than by reading the line again. A name with a tab in it moves
+        the line's columns: that line is read as text, as pgcat reads it."""
+        for k in range(a.name_length):
+            if data[unsafe_offset=a.name_at + k] == UInt8(ord("\t")):
+                return self._classify(p, n, st.walk, st.anchors, placed, why, aligned)
+        if a.name_length > 0:
+            var c = data[unsafe_offset=a.name_at]
+            if c == UInt8(ord("#")) or c == UInt8(ord("@")):
+                return _SKIP
+        if not a.has_path or len(a.mappings) == 0:
+            return _UNMAPPED
+        var ts = path[0]
+        var te = path[1]
+        # A negative number is no number to pgcat.
+        if te < 0:
+            return _MALFORMED
+        for step in st.walk:
+            if step < 0:
+                return _MALFORMED
+        why = self.map.project(st.walk, ts, te, st.anchors, placed)
+        if why != 0:
+            return _UNPLACED
+        aligned = te - ts
+        return _PLACED
 
     def _classify(
         self,
@@ -334,42 +371,50 @@ struct IndexSink(MessageSink, Movable):
         return _PLACED
 
     def side_tasks(self) -> Int:
-        return len(self.compressing)
+        return self.gatherers if self.gathering else 0
 
     def side_task(mut self, index: Int) raises:
-        var job = mut_untracked(Pointer(to=self.compressing[index]))
-        job[].frame = zstd_compress(self.zstd, job[].raw.unsafe_ptr(), len(job[].raw), ZSTD_LEVEL)
-        job[].raw = List[UInt8]()
-
-    def after_step(mut self, slices: Int) raises:
-        while len(self.compressing) > 0:
-            var job = self.compressing.pop()
-            var rank = job.rank
-            var b = job.bucket
-            var size = job.size
-            var frame = List[UInt8]()
-            swap(frame, job.frame)
-            self.buckets[rank][b].frames.append(frame^)
-            self.buckets[rank][b].sizes.append(size)
-        for s in range(slices):
-            var recs = imm_untracked(self.states[s].recs.unsafe_ptr())
-            var total = len(self.states[s].recs)
+        """Gathers the last step's lines of this task's buckets (bucket b of rank r: (r << 12 | b) mod gatherers),
+        compressing a bucket's lines as a frame once FRAME bytes of them gather."""
+        for s in range(len(self.states)):
+            var recs = imm_untracked(self.states[s].prev.unsafe_ptr())
+            var total = len(self.states[s].prev)
             var at = 0
             while at < total:
                 var r = _get32(recs, at)
                 var b = _get64(recs, at + 4) >> BUCKET_SHIFT
                 var length = _get32(recs, at + 20)
+                if (r << 12 | b) % self.gatherers == index:
+                    var bucket = mut_untracked(Pointer(to=self.buckets[r][b]))
+                    bucket[].pending.extend(Span(unsafe_ptr=recs.unsafe_offset(at + 4), length=HEADER - 4 + length))
+                    bucket[].records += 1
+                    if len(bucket[].pending) >= FRAME:
+                        bucket[].frames.append(
+                            zstd_compress(self.zstd, bucket[].pending.unsafe_ptr(), len(bucket[].pending), ZSTD_LEVEL)
+                        )
+                        bucket[].sizes.append(len(bucket[].pending))
+                        bucket[].pending = List[UInt8]()
+                at += HEADER + length
+
+    def after_step(mut self, slices: Int) raises:
+        """The step's lines become the next step's to gather; the buckets they need are made here, on one thread."""
+        self.gathering = False
+        for s in range(len(self.states)):
+            self.states[s].prev.clear()
+            if s < slices:
+                swap(self.states[s].recs, self.states[s].prev)
+            else:
+                self.states[s].recs.clear()
+            var recs = imm_untracked(self.states[s].prev.unsafe_ptr())
+            var total = len(self.states[s].prev)
+            self.gathering = self.gathering or total > 0
+            var at = 0
+            while at < total:
+                var r = _get32(recs, at)
+                var b = _get64(recs, at + 4) >> BUCKET_SHIFT
                 if len(self.buckets[r]) <= b:
                     self.buckets[r].resize(b + 1, _Bucket())
-                ref bucket = self.buckets[r][b]
-                bucket.pending.extend(Span(unsafe_ptr=recs.unsafe_offset(at + 4), length=HEADER - 4 + length))
-                bucket.records += 1
-                if len(bucket.pending) >= FRAME:
-                    var raw = List[UInt8]()
-                    swap(raw, bucket.pending)
-                    self.queued.append(_Job(r, b, raw^))
-                at += HEADER + length
-        swap(self.compressing, self.queued)
+                at += HEADER + _get32(recs, at + 20)
 
     def finish(mut self, out_path: String, level: Int, threads: Int) raises:
         """Writes the index: `out_path` and `out_path`.tbi, each through a temporary name."""

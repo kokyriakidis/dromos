@@ -24,7 +24,8 @@ comptime USAGE = """dromos gam-to-gaf [-t THREADS] [--slim] NODES GAM
 dromos index [-t THREADS] [-l LEVEL] REFMAP GAM OUT
   GAM placed on the reference, sorted, bgzipped and tabix-indexed as pgphase reads it: OUT and OUT.tbi, the files
   pgcat index-gaf --slim writes from its GAF (REFMAP: the graph's reference map, pgcat ref-map)
-  -l LEVEL   BGZF compression level, 0-12 [6]
+  -l LEVEL   BGZF compression level, 0-12 [1]: 1 is about 3 times as fast as 6, 40% larger (as large as pgcat's
+             zlib at 6); 6 for a file to keep
 """
 
 
@@ -41,7 +42,7 @@ def main():
     var args = argv()
     var threads = default_threads()
     var slim = False
-    var level = 6
+    var level = 1
     var positional = List[String]()
     var i = 1
     while i < len(args):

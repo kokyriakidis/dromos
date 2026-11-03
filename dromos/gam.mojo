@@ -10,7 +10,7 @@ from std.math import floor
 from std.memory import bitcast
 
 from dromos.nodes import Nodes
-from dromos.output import InlineDigits
+from dromos.output import InlineDigits, put_padded
 
 comptime TAG = "GAM"
 """The type tag of a GAM group of alignments."""
@@ -21,6 +21,16 @@ comptime MAX_TAG_LENGTH = 32
 @always_inline
 def varint(p: ImmPointer[UInt8, _], mut at: Int, end: Int) raises -> UInt64:
     """The varint at `at`, which moves past it."""
+    if at < end:
+        var c = p[unsafe_offset=at]
+        if c < 0x80:
+            at += 1
+            return UInt64(c)
+    return _varint_long(p, at, end)
+
+
+def _varint_long(p: ImmPointer[UInt8, _], mut at: Int, end: Int) raises -> UInt64:
+    """`varint`, for one of more than a byte (or none)."""
     var x: UInt64 = 0
     var shift: UInt64 = 0
     while True:
@@ -36,6 +46,7 @@ def varint(p: ImmPointer[UInt8, _], mut at: Int, end: Int) raises -> UInt64:
             raise Error("GAM: varint too long")
 
 
+@always_inline
 def skip(p: ImmPointer[UInt8, _], mut at: Int, end: Int, wire: Int) raises:
     """Moves `at` past a field's value of wire type `wire`."""
     if wire == 0:
@@ -233,8 +244,15 @@ def _is_deletion(e: Edit) -> Bool:
     return e.from_length > 0 and e.to_length == 0
 
 
+@always_inline
 def put_int(mut out: List[UInt8], value: Int):
     """`value` in decimal."""
+    if value >= 0:
+        var at = len(out)
+        if out.capacity() < at + 20:
+            out.reserve(max(at + 20, 2 * out.capacity()))
+        out.resize(unsafe_uninit_length=at + put_padded(out.unsafe_ptr().unsafe_offset(at), value, 0))
+        return
     var digits = InlineDigits(value)
     for i in range(digits.count):
         out.append(digits.bytes[digits.count - 1 - i])
@@ -305,6 +323,23 @@ def gaf_line[
 ](p: ImmPointer[UInt8, _], a: Alignment, nodes: N, mut out: List[UInt8]) raises:
     """Appends the GAF line (with its newline) vg convert writes for alignment `a` of the message at `p`; with
     `tags` false, its 12 columns alone (no cs, bq, AS or dv, and no node letters needed)."""
+    var walk = List[Int]()
+    _ = _gaf_line[tags, False](p, a, nodes, out, walk)
+
+
+def slim_line[
+    N: Nodes, //
+](p: ImmPointer[UInt8, _], a: Alignment, nodes: N, mut out: List[UInt8], mut walk: List[Int]) raises -> Tuple[Int, Int]:
+    """`gaf_line` without tags, also giving the line's walk (its steps `node << 1 | reverse`, column 6) and its path
+    start and end (columns 8 and 9; (0, 0) for an unaligned read, whose columns are `*`)."""
+    return _gaf_line[False, True](p, a, nodes, out, walk)
+
+
+def _gaf_line[
+    N: Nodes, //, tags: Bool, steps: Bool
+](p: ImmPointer[UInt8, _], a: Alignment, nodes: N, mut out: List[UInt8], mut walk: List[Int]) raises -> Tuple[Int, Int]:
+    comptime if steps:
+        walk.clear()
     put_bytes(out, p, a.name_at, a.name_length)
     if not a.has_path or len(a.mappings) == 0:
         # Unaligned: the read as one insertion, no place.
@@ -318,7 +353,7 @@ def gaf_line[
             put_text(out, "\tcs:Z:+")
             put_bytes(out, p, a.sequence_at, a.sequence_length)
         out.append(UInt8(ord("\n")))
-        return
+        return (0, 0)
     if tags and not nodes.has_letters():
         raise Error("GAM: the node table has no letters, which cs needs")
     var n_maps = len(a.mappings)
@@ -327,13 +362,20 @@ def gaf_line[
         ref last = a.mappings[final_mapping]
         if last.edit_count == 1 and _is_insertion(a.edits[last.first_edit]):
             final_mapping -= 1
+    var query_length = a.sequence_length
+    if query_length == 0:
+        for e in a.edits:
+            query_length += e.to_length
+    out.append(UInt8(ord("\t")))
+    put_int(out, query_length)
+    put_text(out, "\t0\t")
+    put_int(out, query_length)
+    put_text(out, "\t+\t")
     var cs = _Cs()
-    var path = List[UInt8]()
     var path_length = 0
     var path_start = 0
     var path_end = 0
     var matches = 0
-    var total_to = 0
     var prev_offset = 0
     for i in range(n_maps):
         ref m = a.mappings[i]
@@ -378,7 +420,6 @@ def gaf_line[
                     put_bytes(cs.text, p, e.sequence_at, e.sequence_length)
                     cs.deleting = False
             offset += e.from_length
-            total_to += e.to_length
         if i == 0:
             path_start = start
         elif i > final_mapping:
@@ -400,21 +441,14 @@ def gaf_line[
             path_length += node_length
             if i == 0:
                 path_start = start
-            path.append(UInt8(ord("<")) if m.reverse else UInt8(ord(">")))
-            put_int(path, m.node)
+            out.append(UInt8(ord("<")) if m.reverse else UInt8(ord(">")))
+            put_int(out, m.node)
+            comptime if steps:
+                walk.append(m.node << 1 | Int(m.reverse))
         if i == final_mapping:
             path_end = path_length - (node_length - offset)
         prev_offset = offset
     cs.flush()
-    var query_length = a.sequence_length
-    if query_length == 0 and total_to > 0:
-        query_length = total_to
-    out.append(UInt8(ord("\t")))
-    put_int(out, query_length)
-    put_text(out, "\t0\t")
-    put_int(out, query_length)
-    put_text(out, "\t+\t")
-    out.extend(Span(path))
     out.append(UInt8(ord("\t")))
     put_int(out, path_length)
     out.append(UInt8(ord("\t")))
@@ -429,7 +463,7 @@ def gaf_line[
     put_int(out, a.mapping_quality)
     comptime if not tags:
         out.append(UInt8(ord("\n")))
-        return
+        return (path_start, path_end)
     # The optional fields in key order (gafkluge writes its std::map): AS, bq, cs, dv.
     if a.score > 0:
         put_text(out, "\tAS:i:")
@@ -444,6 +478,7 @@ def gaf_line[
         put_text(out, "\tdv:f:")
         _put_divergence(out, a.identity)
     out.append(UInt8(ord("\n")))
+    return (path_start, path_end)
 
 
 @always_inline
@@ -466,57 +501,76 @@ def _varint_in(p: ImmPointer[UInt8, _], mut at: Int, n: Int, mut x: Int) raises 
     return False
 
 
-def frame(data: Span[UInt8, _], mut messages: List[Int]) raises -> Int:
-    """Appends (start, end) of each message in the whole groups at the front of `data`; returns the bytes those
-    groups take, the rest an unfinished group to read again with more data."""
-    var p = data.unsafe_ptr()
-    var n = len(data)
-    var tag = TAG.as_bytes()
-    var done = 0
-    while done < n:
-        var at = done
-        var kept = len(messages)
-        var count = 0
-        var tag_length = 0
-        if not _varint_in(p, at, n, count) or (count > 0 and not _varint_in(p, at, n, tag_length)):
-            return done
-        if count == 0:
-            done = at
-            continue
-        if at + tag_length > n:
-            return done
-        # The first item is a type tag when it looks like one (libvgio's registry tags: short, capitals, digits, _);
-        # a GAM group's messages are alignments, another tag's (giraffe's PARAMS) are skipped, and an untagged
-        # group (an older GAM) is alignments from its first item.
-        var looks_like_tag = tag_length > 0 and tag_length <= MAX_TAG_LENGTH
-        for k in range(tag_length if looks_like_tag else 0):
-            var c = p[unsafe_offset=at + k]
-            looks_like_tag = looks_like_tag and (
-                (c >= UInt8(ord("A")) and c <= UInt8(ord("Z")))
-                or (c >= UInt8(ord("0")) and c <= UInt8(ord("9")))
-                or c == UInt8(ord("_"))
-            )
-        var is_gam = looks_like_tag and tag_length == len(tag)
-        for k in range(tag_length if is_gam else 0):
-            is_gam = is_gam and p[unsafe_offset=at + k] == tag[k]
-        var items = count - 1
-        if not looks_like_tag:
-            # No tag: the first item was a message's length, so the group holds `count` messages.
-            at = done
-            _ = _varint_in(p, at, n, count)
-            items = count
-            is_gam = True
-        else:
-            at += tag_length
-        for _ in range(items):
-            var length = 0
-            if not _varint_in(p, at, n, length) or at + length > n:
-                # The group runs past the data: drop what was read of it.
-                messages.resize(unsafe_uninit_length=kept)
+struct Framer(Movable):
+    """Finds the messages of a GAM read a piece at a time, a group's messages handed out as soon as each is whole:
+    what is left of a piece is at most an unfinished message or group header, read again with more data."""
+
+    var remaining: Int
+    """The items of the group being read still to come."""
+    var is_gam: Bool
+    """Whether they are alignments (a GAM group's, or an untagged group's) or another tag's, skipped."""
+
+    def __init__(out self):
+        self.remaining = 0
+        self.is_gam = False
+
+    def frame(mut self, data: Span[UInt8, _], mut messages: List[Int]) raises -> Int:
+        """Appends (start, end) of each whole message at the front of `data`; returns the bytes they (and their
+        groups' headers) take."""
+        var p = data.unsafe_ptr()
+        var n = len(data)
+        var tag = TAG.as_bytes()
+        var done = 0
+        while done < n:
+            var at = done
+            if self.remaining > 0:
+                var length = 0
+                if not _varint_in(p, at, n, length) or at + length > n:
+                    return done
+                if self.is_gam:
+                    messages.append(at)
+                    messages.append(at + length)
+                self.remaining -= 1
+                done = at + length
+                continue
+            var count = 0
+            var tag_length = 0
+            if not _varint_in(p, at, n, count) or (count > 0 and not _varint_in(p, at, n, tag_length)):
                 return done
-            if is_gam:
-                messages.append(at)
-                messages.append(at + length)
-            at += length
-        done = at
-    return done
+            if count == 0:
+                done = at
+                continue
+            if at + tag_length > n:
+                return done
+            # The first item is a type tag when it looks like one (libvgio's registry tags: short, capitals, digits,
+            # _); a GAM group's messages are alignments, another tag's (giraffe's PARAMS) are skipped, and an untagged
+            # group (an older GAM) is alignments from its first item.
+            var looks_like_tag = tag_length > 0 and tag_length <= MAX_TAG_LENGTH
+            for k in range(tag_length if looks_like_tag else 0):
+                var c = p[unsafe_offset=at + k]
+                looks_like_tag = looks_like_tag and (
+                    (c >= UInt8(ord("A")) and c <= UInt8(ord("Z")))
+                    or (c >= UInt8(ord("0")) and c <= UInt8(ord("9")))
+                    or c == UInt8(ord("_"))
+                )
+            var is_gam = looks_like_tag and tag_length == len(tag)
+            for k in range(tag_length if is_gam else 0):
+                is_gam = is_gam and p[unsafe_offset=at + k] == tag[k]
+            if not looks_like_tag:
+                # No tag: the first item was a message's length, so the group holds `count` messages.
+                at = done
+                _ = _varint_in(p, at, n, count)
+                self.remaining = count
+                self.is_gam = True
+            else:
+                at += tag_length
+                self.remaining = count - 1
+                self.is_gam = is_gam
+            done = at
+        return done
+
+
+def frame(data: Span[UInt8, _], mut messages: List[Int]) raises -> Int:
+    """`Framer.frame` from the start of a GAM."""
+    var f = Framer()
+    return f.frame(data, messages)

@@ -37,5 +37,6 @@ On HG002 HiFi alignments to the HPRC v2.1 Minigraph-Cactus graph (vg 1.70.0):
 
 - `gam-to-gaf`: the same lines as `vg convert -G`.
 - `index`: at level 0 (stored blocks) the same file as `pgcat index-gaf --slim --ref-map --level 0` byte for byte, and
-  a .tbi of the same content; at the default level 6 the same decompressed content and the same tabix queries
-  (libdeflate makes the file about 30% smaller than pgcat's zlib).
+  a .tbi of the same content; at other levels the same decompressed content and the same tabix queries. The default,
+  level 1, deflates about 3 times as fast as level 6 into a file the size of pgcat's (zlib at 6); at `-l 6`
+  libdeflate makes it about 30% smaller than pgcat's.

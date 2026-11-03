@@ -3,7 +3,7 @@ of blocks inflated by libdeflate with every block's CRC32 checked (after sporos'
 
 from std.ffi import OwnedDLHandle, external_call
 from std.memory import unsafe_memcpy
-from std.os import getenv
+from std.os import getenv, stat
 from std.sys.info import CompilationTarget
 
 
@@ -31,29 +31,45 @@ def load_libdeflate() raises -> OwnedDLHandle:
 
 
 comptime O_RDONLY: Int32 = 0
+comptime O_DIRECT: Int32 = 0o40000
+"""Linux's O_DIRECT (x86-64 and aarch64): reads straight from the device into the caller's memory."""
+comptime DIRECT_ALIGN = 4096
+"""What O_DIRECT reads' memory, offsets and lengths are aligned to."""
 comptime POSIX_FADV_WILLNEED: Int32 = 3
 
 
 struct RawFile(Movable):
-    """A file read with pread, its next bytes fetched ahead by the kernel on Linux (posix_fadvise WILLNEED)."""
+    """A file read with pread. With `direct` on Linux it is opened O_DIRECT where the file system allows it: reads go
+    from the device into the caller's memory, past the page cache (whose copying and reclaiming hold a buffered read
+    of a file larger than memory to a fraction of an NVMe's speed). Otherwise the kernel reads ahead of `prefetch`."""
 
     var fd: Int32
     var path: String
+    var size: Int
+    var direct: Bool
 
-    def __init__(out self, path: String) raises:
+    def __init__(out self, path: String, direct: Bool = False) raises:
         var c_path = List[UInt8](path.as_bytes())
         c_path.append(0)
-        self.fd = external_call["open64" if CompilationTarget.is_linux() else "open", Int32](
-            c_path.unsafe_ptr(), O_RDONLY, Int32(0)
-        )
+        comptime open_name = "open64" if CompilationTarget.is_linux() else "open"
+        self.direct = False
+        self.fd = -1
+        comptime if CompilationTarget.is_linux():
+            if direct:
+                self.fd = external_call[open_name, Int32](c_path.unsafe_ptr(), O_RDONLY | O_DIRECT, Int32(0))
+                self.direct = self.fd >= 0
+        if self.fd < 0:
+            self.fd = external_call[open_name, Int32](c_path.unsafe_ptr(), O_RDONLY, Int32(0))
         if self.fd < 0:
             raise Error(t"cannot open {path}")
         self.path = path
+        self.size = Int(stat(path).st_size)
 
     def read(self, dst: MutPointer[UInt8, _], count: Int, offset: Int) -> Int:
-        """Up to `count` bytes from `offset` into `dst`: fewer only at the end of the file; -1 on an error."""
+        """Up to `count` bytes from `offset` into `dst`: fewer only at the end of the file; -1 on an error. A direct
+        file's `dst`, `count` and `offset` are multiples of DIRECT_ALIGN."""
         var got = 0
-        while got < count:
+        while got < count and offset + got < self.size:
             var n = external_call["pread", Int](self.fd, dst.unsafe_offset(got), count - got, offset + got)
             if n < 0:
                 return -1
@@ -63,6 +79,8 @@ struct RawFile(Movable):
         return got
 
     def prefetch(self, offset: Int, count: Int):
+        if self.direct:
+            return
         comptime if CompilationTarget.is_linux():
             _ = external_call["posix_fadvise", Int32](self.fd, offset, count, POSIX_FADV_WILLNEED)
 
@@ -259,3 +277,30 @@ def zstd_decompress(lib: OwnedDLHandle, frame: Span[UInt8, _], dst: MutPointer[U
     var n = lib.get_function[Int]("ZSTD_decompress")(dst, length, frame.unsafe_ptr(), len(frame))
     if lib.get_function[UInt32]("ZSTD_isError")(n) != 0 or n != length:
         raise Error("zstd: a frame did not decompress")
+
+
+comptime PROT_READ: Int32 = 1
+comptime MAP_PRIVATE: Int32 = 2
+comptime MADV_WILLNEED: Int32 = 3
+
+
+struct MappedFile(Movable):
+    """A file mapped read-only into memory: its pages are read when first touched, by whichever thread touches them,
+    and the kernel is asked to read the whole file ahead."""
+
+    var ptr: ImmPointer[UInt8, ImmUntrackedOrigin]
+    var size: Int
+
+    def __init__(out self, path: String) raises:
+        var file = RawFile(path)
+        self.size = Int(stat(path).st_size)
+        if self.size == 0:
+            raise Error(t"{path}: empty")
+        var addr = external_call["mmap", Int](Int(0), self.size, PROT_READ, MAP_PRIVATE, file.fd, Int(0))
+        if addr == -1:
+            raise Error(t"cannot map {path}")
+        self.ptr = ImmPointer[UInt8, ImmUntrackedOrigin](unsafe_from_address=addr)
+        _ = external_call["madvise", Int32](addr, self.size, MADV_WILLNEED)
+
+    def __deinit__(deinit self):
+        _ = external_call["munmap", Int32](self.ptr, self.size)

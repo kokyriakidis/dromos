@@ -16,7 +16,8 @@ The map (`pgcat ref-map` writes it once per graph) is little-endian:
     u64 c, then c times u64 n, n bytes the contigs' names
 """
 
-from dromos.nodes import Nodes, read_file
+from dromos.bgzf import MappedFile
+from dromos.nodes import Nodes
 
 comptime MAGIC = "PGCATRM1"
 comptime NONE = 0xFFFF_FFFF
@@ -90,9 +91,9 @@ def _u64(p: ImmPointer[UInt8, _], at: Int) -> Int:
 
 
 struct RefMap(Movable, Nodes):
-    """A pgcat reference map read whole into memory: node lengths and placements are read in place."""
+    """A pgcat reference map, mapped into memory: node lengths and placements are read in place."""
 
-    var data: List[UInt8]
+    var file: MappedFile
     var sample: String
     var size: Int
     var node_len_at: Int
@@ -101,7 +102,7 @@ struct RefMap(Movable, Nodes):
     var more_nodes: List[Int]
     """The nodes with further placements, in id order."""
     var more_at: List[Int]
-    """Where each one's list of further placements starts in `data`."""
+    """Where each one's list of further placements starts in the file."""
     var more_count: List[Int]
     """How many further placements each one has."""
     var has_more: List[UInt64]
@@ -110,14 +111,14 @@ struct RefMap(Movable, Nodes):
     var contigs: List[String]
 
     def __init__(out self, path: String) raises:
-        self.data = read_file(path)
-        var n = len(self.data)
-        var p = self.data.unsafe_ptr()
+        self.file = MappedFile(path)
+        var n = self.file.size
+        var p = self.file.ptr
         var bad = String(t"{path}: not a pgcat ref map (pgcat ref-map writes one)")
         var ok = n >= 16
         var magic = MAGIC.as_bytes()
         for i in range(8):
-            ok = ok and self.data[i] == magic[i]
+            ok = ok and p[unsafe_offset=i] == magic[i]
         if not ok:
             raise Error(bad)
         var at = 8
@@ -125,7 +126,7 @@ struct RefMap(Movable, Nodes):
         at += 8
         if length > n - at:
             raise Error(bad)
-        self.sample = String(StringSlice(unsafe_from_utf8=Span(self.data)[at : at + length]))
+        self.sample = String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=p.unsafe_offset(at), length=length)))
         at += length
         if at + 8 > n:
             raise Error(bad)
@@ -161,6 +162,8 @@ struct RefMap(Movable, Nodes):
             self.more_count.append(m)
             self.has_more[node >> 6] |= UInt64(1) << UInt64(node & 63)
             at += 4 * m
+            if at > n:
+                raise Error(bad)
         if at + 8 > n:
             raise Error(bad)
         var paths = _u64(p, at)
@@ -181,15 +184,17 @@ struct RefMap(Movable, Nodes):
             at += 8
             if name_length > n - at:
                 raise Error(bad)
-            self.contigs.append(String(StringSlice(unsafe_from_utf8=Span(self.data)[at : at + name_length])))
+            self.contigs.append(
+                String(StringSlice(unsafe_from_utf8=Span(unsafe_ptr=p.unsafe_offset(at), length=name_length)))
+            )
             at += name_length
         for i in range(paths):
             if self.path_contig[i] >= c:
                 raise Error(bad)
 
     @always_inline
-    def _ptr(self) -> ImmPointer[UInt8, origin_of(self.data)]:
-        return self.data.unsafe_ptr().as_imm()
+    def _ptr(self) -> ImmPointer[UInt8, ImmUntrackedOrigin]:
+        return self.file.ptr
 
     @always_inline
     def length(self, node: Int) -> Int:
@@ -218,7 +223,7 @@ struct RefMap(Movable, Nodes):
 
     @always_inline
     def _more(self, node: Int) -> Tuple[Int, Int]:
-        """Where node `node`'s further placements are listed in `data`, and how many there are (0 for none)."""
+        """Where node `node`'s further placements are listed in the file, and how many there are (0 for none)."""
         if (self.has_more[node >> 6] >> UInt64(node & 63)) & 1 == 0:
             return (0, 0)
         var lo = 0

@@ -10,8 +10,8 @@ from std.os import getenv
 from std.sys import stderr
 from std.time import perf_counter_ns
 
-from dromos.bgzf import CHUNK, RawFile, inflate_blocks, load_libdeflate, scan_blocks
-from dromos.gam import frame
+from dromos.bgzf import CHUNK, DIRECT_ALIGN, RawFile, inflate_blocks, load_libdeflate, scan_blocks
+from dromos.gam import Framer
 from dromos.parallel import ParallelTask, parallel_for
 
 
@@ -49,7 +49,7 @@ trait MessageSink:
 
 @fieldwise_init
 struct _StepTask[S: MessageSink, file_origin: ImmOrigin, lib_origin: ImmOrigin, blocks_origin: ImmOrigin](ParallelTask):
-    """One step: `reads` reads, then `inflates` inflates, then `formats` slices, then `sides` side tasks. The file,
+    """One step: `reads` reads, then `inflates` inflates, then `sides` side tasks, then `formats` slices. The file,
     libdeflate and the block list are reached through tracked pointers, which keep them alive while the step runs; the
     chunk buffers and the sink, used after every step, through untracked ones."""
 
@@ -78,10 +78,12 @@ struct _StepTask[S: MessageSink, file_origin: ImmOrigin, lib_origin: ImmOrigin, 
     def run(self, index: Int):
         var i = index
         if i < self.reads:
-            var got = self.file[].read(self.read_dst, self.read_count, self.read_offset)
-            self.read_got[] = got
-            if got > 0:
-                self.file[].prefetch(self.read_offset + got, CHUNK)
+            # Read k of the chunk's READS, a share of it each, for the device to have several at once.
+            var share = self.read_count // self.reads
+            var got = self.file[].read(self.read_dst.unsafe_offset(i * share), share, self.read_offset + i * share)
+            self.read_got[unsafe_offset=i] = got
+            if got > 0 and i == self.reads - 1:
+                self.file[].prefetch(self.read_offset + self.read_count, CHUNK)
             return
         i -= self.reads
         if i < self.inflates:
@@ -97,23 +99,46 @@ struct _StepTask[S: MessageSink, file_origin: ImmOrigin, lib_origin: ImmOrigin, 
                 self.failed[] = 1
             return
         i -= self.inflates
-        if i < self.formats:
+        if i < self.sides:
             try:
-                self.sink[].take(
-                    i,
-                    self.data,
-                    self.messages,
-                    i * self.messages_per,
-                    min(self.message_count, (i + 1) * self.messages_per),
-                )
+                self.sink[].side_task(i)
             except:
-                self.failed[] = 2
+                self.failed[] = 3
             return
-        i -= self.formats
+        i -= self.sides
         try:
-            self.sink[].side_task(i)
+            self.sink[].take(
+                i,
+                self.data,
+                self.messages,
+                i * self.messages_per,
+                min(self.message_count, (i + 1) * self.messages_per),
+            )
         except:
-            self.failed[] = 3
+            self.failed[] = 2
+
+
+comptime READS = 4
+"""The reads a chunk is read in, at once."""
+comptime CARRY_ROOM = 1 << 16
+"""Room before a chunk for the last one's cut block (a BGZF block is at most 64 KiB)."""
+
+
+struct _Raw(Movable):
+    """A chunk of the GAM as read: room for the last chunk's cut block, then the chunk, at an address aligned for
+    O_DIRECT. Its bytes are buf[lo:hi]."""
+
+    var buf: List[UInt8]
+    var start: Int
+    var lo: Int
+    var hi: Int
+
+    def __init__(out self):
+        self.buf = List[UInt8](unsafe_uninit_length=DIRECT_ALIGN + CARRY_ROOM + CHUNK)
+        var addr = Int(self.buf.unsafe_ptr())
+        self.start = CARRY_ROOM + (DIRECT_ALIGN - addr % DIRECT_ALIGN) % DIRECT_ALIGN
+        self.lo = self.start
+        self.hi = self.start
 
 
 @always_inline
@@ -128,30 +153,32 @@ def mut_untracked[T: AnyType](p: MutPointer[T, _]) -> MutPointer[T, MutUntracked
 
 def stream_gam[S: MessageSink](gam_path: String, threads: Int, mut sink: S) raises:
     """Hands every message of the GAM at `gam_path`, in order, to `sink`."""
-    var file = RawFile(gam_path)
+    var file = RawFile(gam_path, direct=True)
     var lib = load_libdeflate()
     var timing = Bool(getenv("DROMOS_TIMING"))
     var step_ns = 0
     var serial_ns = 0
     var sink_ns = 0
-    # Two of each buffer, swapping roles each step: raws[r] the next chunk's compressed bytes, bufs[c] the current
-    # chunk's letters (an unfinished group first).
-    var raws = List[List[UInt8]](length=2, fill=List[UInt8]())
+    # Two of each buffer, swapping roles each step: raws[r] the next chunk's compressed bytes (the cut block before
+    # them), bufs[c] the current chunk's letters (an unfinished message first).
+    var raws = List[_Raw]()
+    raws.append(_Raw())
+    raws.append(_Raw())
     var bufs = List[List[UInt8]](length=2, fill=List[UInt8]())
     var slices = sink.slices()
     var failed = List[Int](length=1, fill=0)
-    var got = List[Int](length=1, fill=0)
+    var got = List[Int](length=READS, fill=0)
     var r = 0
     var c = 0
     # The first chunk is read before the pipeline starts.
-    raws[r].resize(unsafe_uninit_length=CHUNK)
-    var n0 = file.read(mut_untracked(raws[r].unsafe_ptr()), CHUNK, 0)
+    var n0 = file.read(mut_untracked(raws[r].buf.unsafe_ptr().unsafe_offset(raws[r].start)), CHUNK, 0)
     if n0 < 0:
         raise Error(t"cannot read {gam_path}")
-    raws[r].resize(unsafe_uninit_length=n0)
+    raws[r].hi = raws[r].start + n0
     var offset = n0
     var at_end = n0 < CHUNK
     var messages = List[Int]()
+    var framer = Framer()
     var used = 0
     var first = True
     while True:
@@ -159,19 +186,20 @@ def stream_gam[S: MessageSink](gam_path: String, threads: Int, mut sink: S) rais
         # The next chunk's whole blocks; the cut block's bytes carry to the chunk after it.
         var blocks = List[Int]()
         var leftover = len(bufs[c]) - used
-        var scanned = scan_blocks(Span(raws[r]), leftover, blocks, gam_path)
+        var scanned = scan_blocks(Span(raws[r].buf)[raws[r].lo : raws[r].hi], leftover, blocks, gam_path)
         var consumed = scanned[0]
         var total = scanned[1]
         var nb = 1 - c
         bufs[nb].resize(unsafe_uninit_length=leftover + total)
         var nr = 1 - r
-        var carry = len(raws[r]) - consumed
-        var reads = 0 if at_end else 1
-        raws[nr].resize(unsafe_uninit_length=carry + (CHUNK if reads == 1 else 0))
+        var carry = raws[r].hi - raws[r].lo - consumed
+        var reads = 0 if at_end else READS
+        raws[nr].lo = raws[nr].start - carry
+        raws[nr].hi = raws[nr].start
         if carry > 0:
             unsafe_memcpy(
-                dest=mut_untracked(raws[nr].unsafe_ptr()),
-                src=imm_untracked(raws[r].unsafe_ptr()).unsafe_offset(consumed),
+                dest=mut_untracked(raws[nr].buf.unsafe_ptr()).unsafe_offset(raws[nr].lo),
+                src=imm_untracked(raws[r].buf.unsafe_ptr()).unsafe_offset(raws[r].lo + consumed),
                 count=carry,
             )
         var block_count = len(blocks) // 4
@@ -181,17 +209,18 @@ def stream_gam[S: MessageSink](gam_path: String, threads: Int, mut sink: S) rais
         var messages_per = max(1, ceildiv(message_count, slices))
         var formats = ceildiv(message_count, messages_per)
         var sides = sink.side_tasks()
-        got[0] = 0
+        for k in range(READS):
+            got[k] = 0
         var t1 = Int(perf_counter_ns())
         var task = _StepTask(
             Pointer(to=file).as_imm(),
             reads,
-            mut_untracked(raws[nr].unsafe_ptr().unsafe_offset(carry)),
+            mut_untracked(raws[nr].buf.unsafe_ptr()).unsafe_offset(raws[nr].start),
             CHUNK,
             offset,
             mut_untracked(got.unsafe_ptr()),
             Pointer(to=lib).as_imm(),
-            imm_untracked(raws[r].unsafe_ptr()),
+            imm_untracked(raws[r].buf.unsafe_ptr()).unsafe_offset(raws[r].lo),
             blocks.unsafe_ptr().as_imm(),
             mut_untracked(bufs[nb].unsafe_ptr()),
             block_count,
@@ -214,11 +243,17 @@ def stream_gam[S: MessageSink](gam_path: String, threads: Int, mut sink: S) rais
             raise Error(t"{gam_path}: a GAM message could not be read")
         if failed[0] == 3:
             raise Error(t"{gam_path}: a side task failed")
-        if got[0] < 0:
-            raise Error(t"cannot read {gam_path}")
+        # The chunk's bytes: its reads' shares, up to the first short one (the end of the file).
+        var read_total = 0
+        for k in range(reads):
+            if got[k] < 0:
+                raise Error(t"cannot read {gam_path}")
+            read_total += got[k]
+            if got[k] < CHUNK // READS:
+                break
         sink.after_step(formats)
         var t3 = Int(perf_counter_ns())
-        # The current chunk's unfinished group goes in front of the next chunk's letters, then the next is framed.
+        # The current chunk's unfinished message goes in front of the next chunk's letters, then the next is framed.
         if leftover > 0:
             unsafe_memcpy(
                 dest=mut_untracked(bufs[nb].unsafe_ptr()),
@@ -226,13 +261,13 @@ def stream_gam[S: MessageSink](gam_path: String, threads: Int, mut sink: S) rais
                 count=leftover,
             )
         messages.clear()
-        used = frame(Span(bufs[nb]), messages)
+        used = framer.frame(Span(bufs[nb]), messages)
         c = nb
         r = nr
-        if reads == 1:
-            raws[r].resize(unsafe_uninit_length=carry + got[0])
-            offset += got[0]
-            at_end = got[0] < CHUNK
+        if reads > 0:
+            raws[r].hi = raws[r].start + read_total
+            offset += read_total
+            at_end = read_total < CHUNK
         var done = block_count == 0 and len(messages) == 0 and not first and sink.side_tasks() == 0
         first = False
         var t4 = Int(perf_counter_ns())
@@ -249,7 +284,7 @@ def stream_gam[S: MessageSink](gam_path: String, threads: Int, mut sink: S) rais
             ),
             file=stderr,
         )
-    if len(raws[r]) > 0:
+    if raws[r].hi > raws[r].lo:
         raise Error(t"{gam_path}: ends inside a BGZF block")
-    if len(bufs[c]) - used > 0:
+    if len(bufs[c]) - used > 0 or framer.remaining > 0:
         raise Error(t"{gam_path}: ends inside a GAM group")
