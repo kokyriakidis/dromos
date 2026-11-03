@@ -14,7 +14,7 @@ from std.sys.info import CompilationTarget
 
 from dromos.bgzf import RawFile
 
-comptime ABI = 2
+comptime ABI = 3
 """The C interface's version (gbz-ffi's `ABI`)."""
 comptime LIBRARY = "libdromos_gbz" + (".dylib" if CompilationTarget.is_macos() else ".so")
 comptime MAGIC = "GBZ "
@@ -415,6 +415,16 @@ struct GbzParts(Movable, NodeSource):
     def max_node(self) raises -> Int:
         return self.lib.lib.get_function[Int]("dgbz_parts_max_node")(self.ptr)
 
+    def node_range(self) raises -> Tuple[Int, Int, Int]:
+        """The graph's nodes: how many, the smallest id and the largest (0, 0, 0 for none)."""
+        var count = 0
+        var lo = 0
+        var hi = 0
+        self.lib.lib.get_function[NoneType]("dgbz_parts_node_range")(
+            self.ptr, Pointer(to=count), Pointer(to=lo), Pointer(to=hi)
+        )
+        return (count, lo, hi)
+
     def find_nodes(self, threads: Int) raises:
         """Finds which node ids the graph has (a scan of the GBWT's records) on `threads` threads, if not found yet:
         `lengths` and `letters` do it first otherwise, on every core."""
@@ -430,6 +440,10 @@ struct GbzParts(Movable, NodeSource):
             self.lib.lib.get_function[Int32]("dgbz_parts_path")(self.ptr, id, Int32(reverse), Pointer(to=buf))
         )
         return self.lib.take_u64s(buf)
+
+    def path_first(self, id: Int) raises -> UInt64:
+        """Path `id`'s first visit (0 when it has none), without walking the rest of it."""
+        return self.lib.lib.get_function[UInt64]("dgbz_parts_path_first")(self.ptr, id)
 
     def lengths(self, first: Int, count: Int, dst: MutPointer[UInt64, _]) raises:
         """The lengths of nodes `first ..< first + count` into `dst`; NO_LENGTH for an id the graph lacks."""
@@ -548,6 +562,31 @@ def gbwt_tag(path: String, key: String) raises -> Optional[String]:
         return None
     var bytes = lib.take_bytes(buf)
     return String(StringSlice(unsafe_from_utf8=Span(bytes)))
+
+
+def graph_tags(path: String) raises -> List[Tuple[String, String, String]]:
+    """The GBZ's tags and its GBWT's, read from the start of the file: ("gbz" or "gbwt", key, value), each kind's
+    keys in byte order."""
+    var lib = GbzLib()
+    var buf = _Buffer(0, 0)
+    lib.check(lib.lib.get_function[Int32]("dgbz_file_tags")(path.unsafe_ptr(), path.byte_length(), Pointer(to=buf)))
+    var bytes = lib.take_bytes(buf)
+    var out = List[Tuple[String, String, String]]()
+    var at = 0
+
+    def u32(b: List[UInt8], at: Int) -> Int:
+        return Int(b[at]) | Int(b[at + 1]) << 8 | Int(b[at + 2]) << 16 | Int(b[at + 3]) << 24
+
+    while at < len(bytes):
+        var kind = String("gbz") if bytes[at] == 0 else String("gbwt")
+        var kl = u32(bytes, at + 1)
+        var key = String(unsafe_from_utf8=Span(bytes)[at + 5 : at + 5 + kl])
+        at += 5 + kl
+        var vl = u32(bytes, at)
+        var value = String(unsafe_from_utf8=Span(bytes)[at + 4 : at + 4 + vl])
+        at += 4 + vl
+        out.append((kind, key, value))
+    return out^
 
 
 def read_metadata(path: String) raises -> Metadata:

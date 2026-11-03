@@ -26,7 +26,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 
 /// The interface's version: dromos checks it, so a library left from another build is not used by mistake.
-pub const ABI: u32 = 2;
+pub const ABI: u32 = 3;
 
 #[no_mangle]
 pub extern "C" fn dgbz_abi() -> u32 {
@@ -156,6 +156,37 @@ pub unsafe extern "C" fn dgbz_file_gbwt_tag(
             *out = DgbzBytes { ptr, len };
             *found = 1;
         }
+        Ok(())
+    })
+}
+
+/// The GBZ's tags and its GBWT's, read from the start of the file, into `out`: each one as a kind byte (0 the GBZ's,
+/// 1 the GBWT's), the key's length (u32, little-endian) and bytes, then the value's; the GBZ's first, each kind's
+/// keys in byte order.
+#[no_mangle]
+pub unsafe extern "C" fn dgbz_file_tags(path: *const u8, path_len: usize, out: *mut DgbzBytes) -> i32 {
+    guarded(|| {
+        let path = text(path, path_len)?;
+        let mut r = open(path)?;
+        let err = |what: &str, e: std::io::Error| format!("{path}: {what}: {e}");
+        Header::<GBZPayload>::load(&mut r).map_err(|e| err("not a GBZ file", e))?;
+        let gbz = Tags::load(&mut r).map_err(|e| err("GBZ tags", e))?;
+        Header::<GBWTPayload>::load(&mut r).map_err(|e| err("GBWT header", e))?;
+        let gbwt = Tags::load(&mut r).map_err(|e| err("GBWT tags", e))?;
+        let mut bytes = Vec::new();
+        for (kind, tags) in [(0u8, &gbz), (1u8, &gbwt)] {
+            let mut pairs: Vec<(&String, &String)> = tags.iter().collect();
+            pairs.sort();
+            for (k, v) in pairs {
+                bytes.push(kind);
+                bytes.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(k.as_bytes());
+                bytes.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(v.as_bytes());
+            }
+        }
+        let (ptr, len) = give(bytes);
+        *out = DgbzBytes { ptr, len };
         Ok(())
     })
 }
@@ -766,6 +797,26 @@ pub unsafe extern "C" fn dgbz_parts_max_node(p: *const Parts) -> usize {
     (*p).max_node()
 }
 
+/// The graph's nodes: how many, and the smallest and largest id (0 for each when it has none).
+#[no_mangle]
+pub unsafe extern "C" fn dgbz_parts_node_range(p: *const Parts, count: *mut usize, min: *mut usize, max: *mut usize) {
+    let p = &*p;
+    let real = p.real();
+    let (mut n, mut lo, mut hi) = (0usize, usize::MAX, 0usize);
+    for (w, &word) in real.iter().enumerate() {
+        if word == 0 {
+            continue;
+        }
+        n += word.count_ones() as usize;
+        lo = lo.min(w * 64 + word.trailing_zeros() as usize);
+        hi = hi.max(w * 64 + 63 - word.leading_zeros() as usize);
+    }
+    *count = n;
+    // Bit s is node sequence s, node min_node + s.
+    *min = if n > 0 { p.min_node() + lo } else { 0 };
+    *max = if n > 0 { p.min_node() + hi } else { 0 };
+}
+
 /// Finds the real nodes (a scan of the GBWT's records) on `threads` threads, if not found yet: a call that needs
 /// them otherwise does it first, on every core.
 #[no_mangle]
@@ -789,6 +840,13 @@ pub unsafe extern "C" fn dgbz_parts_path(p: *const Parts, id: usize, reverse: i3
         *out = DgbzU64s { ptr, len };
         Ok(())
     })
+}
+
+/// The first visit of path `id` (0 when it has none), read without walking the rest of it.
+#[no_mangle]
+pub unsafe extern "C" fn dgbz_parts_path_first(p: *const Parts, id: usize) -> u64 {
+    let g = &(*p).gbwt;
+    g.sequence(gbz::support::encode_path(id, Orientation::Forward)).and_then(|mut it| it.next()).map_or(0, |x| x as u64)
 }
 
 /// As `dgbz_sequence_lengths`.
