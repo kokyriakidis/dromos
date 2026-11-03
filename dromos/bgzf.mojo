@@ -11,23 +11,29 @@ comptime CHUNK = 64 << 20
 """Compressed bytes read at a time."""
 
 
-def load_libdeflate() raises -> OwnedDLHandle:
-    """libdeflate, from the environment pixi sets up or the system's."""
+def load_library(stem: String, macos: String, linux: String, also: String = "") raises -> OwnedDLHandle:
+    """A shared library by its versioned name (`linux`, or `macos` there), its plain one (`stem`.so or .dylib), then
+    in the environment pixi sets up ($CONDA_PREFIX/lib) and at `also`."""
     comptime suffix = ".dylib" if CompilationTarget.is_macos() else ".so"
-    var names: List[String] = [
-        "@rpath/libdeflate.0.dylib" if CompilationTarget.is_macos() else "libdeflate.so.0",
-        String("libdeflate") + suffix,
-        "/opt/homebrew/lib/libdeflate.dylib",
-    ]
+    var names: List[String] = [macos if CompilationTarget.is_macos() else linux, stem + suffix]
     var prefix = getenv("CONDA_PREFIX")
     if prefix:
-        names.append(prefix + "/lib/libdeflate" + suffix)
+        names.append(prefix + "/lib/" + stem + suffix)
+    if also:
+        names.append(also)
     for name in names:
         try:
             return OwnedDLHandle(name)
         except:
             pass
-    raise Error("libdeflate not found (run under pixi, or install it)")
+    raise Error(t"{stem} not found (run under pixi, or install it)")
+
+
+def load_libdeflate() raises -> OwnedDLHandle:
+    """libdeflate, from the environment pixi sets up or the system's."""
+    return load_library(
+        "libdeflate", "@rpath/libdeflate.0.dylib", "libdeflate.so.0", "/opt/homebrew/lib/libdeflate.dylib"
+    )
 
 
 comptime O_RDONLY: Int32 = 0
@@ -251,21 +257,7 @@ def bgzf_block(lib: OwnedDLHandle, level: Int, data: ImmPointer[UInt8, _], lengt
 
 def load_zstd() raises -> OwnedDLHandle:
     """libzstd, from the environment pixi sets up or the system's."""
-    comptime suffix = ".dylib" if CompilationTarget.is_macos() else ".so"
-    var names: List[String] = [
-        "@rpath/libzstd.1.dylib" if CompilationTarget.is_macos() else "libzstd.so.1",
-        String("libzstd") + suffix,
-        "/opt/homebrew/lib/libzstd.dylib",
-    ]
-    var prefix = getenv("CONDA_PREFIX")
-    if prefix:
-        names.append(prefix + "/lib/libzstd" + suffix)
-    for name in names:
-        try:
-            return OwnedDLHandle(name)
-        except:
-            pass
-    raise Error("libzstd not found (run under pixi, or install it)")
+    return load_library("libzstd", "@rpath/libzstd.1.dylib", "libzstd.so.1", "/opt/homebrew/lib/libzstd.dylib")
 
 
 def zstd_compress(lib: OwnedDLHandle, data: ImmPointer[UInt8, _], length: Int, level: Int) raises -> List[UInt8]:
@@ -317,20 +309,7 @@ struct MappedFile(Movable):
 
 def load_zlib() raises -> OwnedDLHandle:
     """zlib, from the environment pixi sets up or the system's (every Linux has libz.so.1)."""
-    comptime suffix = ".dylib" if CompilationTarget.is_macos() else ".so"
-    var names: List[String] = [
-        "libz.1.dylib" if CompilationTarget.is_macos() else "libz.so.1",
-        String("libz") + suffix,
-    ]
-    var prefix = getenv("CONDA_PREFIX")
-    if prefix:
-        names.append(prefix + "/lib/libz" + suffix)
-    for name in names:
-        try:
-            return OwnedDLHandle(name)
-        except:
-            pass
-    raise Error("zlib not found")
+    return load_library("libz", "libz.1.dylib", "libz.so.1")
 
 
 comptime Z_STREAM_BYTES = 112

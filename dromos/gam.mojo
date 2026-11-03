@@ -400,21 +400,12 @@ struct _Cs:
         self.deleting = True
 
 
-def gaf_line[
-    N: Nodes, //, tags: Bool = True
-](p: ImmPointer[UInt8, _], a: Alignment, nodes: N, mut out: List[UInt8]) raises:
-    """Appends the GAF line (with its newline) vg convert writes for alignment `a` of the message at `p`; with
-    `tags` false, its 12 columns alone (no cs, bq, AS or dv, and no node letters needed)."""
-    var walk = List[Int]()
-    _ = _gaf_line[tags, False](p, a, nodes, out, walk)
-
-
 def slim_line[
     N: Nodes, //
 ](p: ImmPointer[UInt8, _], a: Alignment, nodes: N, mut out: List[UInt8], mut walk: List[Int]) raises -> Tuple[Int, Int]:
     """`gaf_line` without tags, for an alignment decoded `slim`, also giving the line's walk (its steps
     `node << 1 | reverse`, column 6) and its path start and end (columns 8 and 9; (0, 0) for an unaligned read, whose
-    columns are `*`). The same steps as `_gaf_line`, each mapping's edits taken summed."""
+    columns are `*`). The same steps as `gaf_line`, each mapping's edits taken summed."""
     walk.clear()
     put_bytes(out, p, a.name_at, a.name_length)
     if not a.has_path or len(a.maps) == 0:
@@ -492,11 +483,12 @@ def slim_line[
     return (path_start, path_end)
 
 
-def _gaf_line[
-    N: Nodes, //, tags: Bool, steps: Bool
-](p: ImmPointer[UInt8, _], a: Alignment, nodes: N, mut out: List[UInt8], mut walk: List[Int]) raises -> Tuple[Int, Int]:
-    comptime if steps:
-        walk.clear()
+def gaf_line[
+    N: Nodes, //, tags: Bool = True
+](p: ImmPointer[UInt8, _], a: Alignment, nodes: N, mut out: List[UInt8]) raises:
+    """Appends the GAF line (with its newline) vg convert writes for alignment `a` of the message at `p` (decoded in
+    full); with `tags` false, its 12 columns alone (no cs, bq, AS or dv, and no node letters needed). `slim_line`
+    writes those 12 from a slim decode, faster."""
     put_bytes(out, p, a.name_at, a.name_length)
     if not a.has_path or len(a.mappings) == 0:
         # Unaligned: the read as one insertion, no place.
@@ -510,7 +502,7 @@ def _gaf_line[
             put_text(out, "\tcs:Z:+")
             put_bytes(out, p, a.sequence_at, a.sequence_length)
         out.append(UInt8(ord("\n")))
-        return (0, 0)
+        return
     if tags and not nodes.has_letters():
         raise Error("GAM: the node table has no letters, which cs needs")
     var n_maps = len(a.mappings)
@@ -600,8 +592,6 @@ def _gaf_line[
                 path_start = start
             out.append(UInt8(ord("<")) if m.reverse else UInt8(ord(">")))
             put_int(out, m.node)
-            comptime if steps:
-                walk.append(m.node << 1 | Int(m.reverse))
         if i == final_mapping:
             path_end = path_length - (node_length - offset)
         prev_offset = offset
@@ -620,7 +610,7 @@ def _gaf_line[
     put_int(out, a.mapping_quality)
     comptime if not tags:
         out.append(UInt8(ord("\n")))
-        return (path_start, path_end)
+        return
     # The optional fields in key order (gafkluge writes its std::map): AS, bq, cs, dv.
     if a.score > 0:
         put_text(out, "\tAS:i:")
@@ -640,7 +630,6 @@ def _gaf_line[
         put_text(out, "\tdv:f:")
         _put_divergence(out, a.identity)
     out.append(UInt8(ord("\n")))
-    return (path_start, path_end)
 
 
 @always_inline

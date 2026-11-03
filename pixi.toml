@@ -19,6 +19,7 @@ prepare = "mkdir -p build"
 build = { cmd = "mojo build -I . cli/dromos_cli.mojo -o build/dromos", depends-on = ["prepare"] }
 build-tests = { cmd = "mojo build -I . tests/test_dromos.mojo -o build/test_dromos", depends-on = ["prepare"] }
 test = { cmd = "./build/test_dromos", depends-on = ["build-tests"] }
+check = { cmd = "tests/integration/check.sh", depends-on = ["build"] }
 format = "mojo format -l 120 dromos cli tests"
 # Pulls the latest Mojo skills from github.com/modular/skills into .claude/skills for coding agents.
 sync-skills = "bash .claude/sync-skills.sh"

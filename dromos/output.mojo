@@ -1,77 +1,9 @@
-"""Buffered byte output to a file descriptor with fast integer formatting."""
+"""Output: whole writes to a file descriptor, and fast integer formatting."""
 
 from std.bit import count_leading_zeros
 from std.ffi import external_call
 from std.sys import exit, stderr
 from std.sys.info import CompilationTarget
-
-comptime _FLUSH_AT = 1 << 20
-
-
-struct OutputBuffer(Movable):
-    """Accumulates bytes and writes them to `fd` in large blocks; with
-    `fd = -1` it only accumulates (read them from `buf`)."""
-
-    var buf: List[UInt8]
-    var fd: Int32
-
-    def __init__(out self, fd: Int32 = 1):
-        self.buf = List[UInt8](capacity=_FLUSH_AT + 4096)
-        self.fd = fd
-
-    def write(mut self, text: StringSlice):
-        self.write_bytes(text.as_bytes())
-
-    def write_bytes(mut self, bytes: Span[UInt8, _]):
-        if self.fd >= 0 and len(bytes) >= _FLUSH_AT:
-            # Large blocks go out directly, without a copy into the buffer.
-            self.flush()
-            write_all(self.fd, bytes.unsafe_ptr(), len(bytes))
-            return
-        self.buf.extend(bytes)
-        if len(self.buf) >= _FLUSH_AT and self.fd >= 0:
-            self.flush()
-
-    @inline(.always)
-    def write_byte(mut self, b: Int):
-        self.buf.append(UInt8(b))
-
-    def write_int(mut self, value: Int, width: Int = 0, left: Bool = False):
-        """Writes `value` in decimal, padded with spaces to `width`."""
-        if value >= 0 and not left:
-            # Two digits per step, straight into the buffer.
-            var at = len(self.buf)
-            var need = at + max(width, 20)
-            if self.buf.capacity() < need:
-                self.buf.reserve(max(need, 2 * self.buf.capacity()))
-            self.buf.resize(unsafe_uninit_length=at + put_padded(self.buf.unsafe_ptr().unsafe_offset(at), value, width))
-            if len(self.buf) >= _FLUSH_AT and self.fd >= 0:
-                self.flush()
-            return
-        var digits = InlineDigits(value)
-        var pad = max(0, width - digits.count)
-        if not left:
-            for _ in range(pad):
-                self.buf.append(UInt8(ord(" ")))
-        for i in range(digits.count):
-            self.buf.append(digits.bytes[digits.count - 1 - i])
-        if left:
-            for _ in range(pad):
-                self.buf.append(UInt8(ord(" ")))
-        if len(self.buf) >= _FLUSH_AT and self.fd >= 0:
-            self.flush()
-
-    def take(mut self) -> List[UInt8]:
-        """The accumulated bytes (for `fd = -1`), leaving the buffer empty."""
-        var bytes = self.buf^
-        self.buf = List[UInt8]()
-        return bytes^
-
-    def flush(mut self):
-        if self.fd < 0:
-            return
-        write_all(self.fd, self.buf.unsafe_ptr(), len(self.buf))
-        self.buf.clear()
 
 
 def write_all(fd: Int32, data: ImmPointer[UInt8, _], length: Int):

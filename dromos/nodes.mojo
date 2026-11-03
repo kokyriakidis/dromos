@@ -12,8 +12,6 @@ The table is one file, little-endian, every section starting at a multiple of 8 
 `pgcat node-table` writes it from a GBZ graph.
 """
 
-from std.os import stat
-
 from dromos.bgzf import MappedFile
 
 comptime MAGIC = "DROMOSN1"
@@ -121,17 +119,3 @@ def complement(c: UInt8) -> UInt8:
     if c == UInt8(ord("t")):
         return UInt8(ord("a"))
     return c
-
-
-def read_file(path: String) raises -> List[UInt8]:
-    """Every byte of a regular file, in reads of at most 1 GiB (one read() cannot return 2 GiB on macOS)."""
-    var size = Int(stat(path).st_size)
-    var out = List[UInt8](unsafe_uninit_length=size)
-    var done = 0
-    with open(path, "r") as f:
-        while done < size:
-            var got = f.read(Span(out)[done : min(size, done + (1 << 30))])
-            if got <= 0:
-                raise Error(t"cannot read {path}")
-            done += Int(got)
-    return out^
