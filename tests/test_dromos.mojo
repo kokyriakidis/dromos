@@ -1,10 +1,13 @@
-"""Tests: protobuf varints, GAM group framing, and GAF lines against hand-worked ones."""
+"""Tests: protobuf varints, GAM group framing, GAF lines against hand-worked ones, placement on the reference as
+pgcat places alignments, and tabix bins as htslib numbers them."""
 
 from std.memory import bitcast
 from std.testing import TestSuite, assert_equal, assert_true
 
 from dromos.gam import Alignment, frame, gaf_line, varint
 from dromos.nodes import NodeTable
+from dromos.refmap import AMBIGUOUS, INCONSISTENT, MISSING_NODE, NO_ANCHOR, Anchor, Placed, RefMap
+from dromos.tabix import N_BINS, bin_level, bin_parent, reg2bin
 
 
 def _varint(mut out: List[UInt8], value: Int):
@@ -168,6 +171,103 @@ def test_unaligned_line() raises:
     var out = List[UInt8]()
     gaf_line(msg.unsafe_ptr(), a, nodes, out)
     assert_true(out == _text("u\t3\t0\t3\t*\t*\t*\t*\t*\t*\t*\t0\tcs:Z:+ACG\n"))
+
+
+def _le(mut out: List[UInt8], v: Int, bytes: Int):
+    for k in range(bytes):
+        out.append(UInt8((v >> (8 * k)) & 0xFF))
+
+
+def _refmap_file(twice: Bool) raises -> String:
+    """pgcat's test map: reference path >1 >2 >3 (lengths 10, 5, 10) at 100 on chrA; node 4 (5 bp) off the reference;
+    node 0 absent. With `twice`, node 2 is also on a second path, at 500 of chrB."""
+    var path = String(t"/tmp/dromos_test_refmap_{Int(twice)}.bin")
+    var t = _text("PGCATRM1")
+    _le(t, 5, 8)
+    t.extend(Span(_text("CHM13")))
+    _le(t, 5, 8)
+    for n in [0xFFFFFFFF, 10, 5, 10, 5]:
+        _le(t, n, 4)
+    for f in [0xFFFFFFFF, 0, 1, 2, 0xFFFFFFFF]:
+        _le(t, f, 4)
+    var placements: List[List[Int]] = [[0, 0, 100, 0], [0, 1, 110, 0], [0, 2, 115, 0]]
+    if twice:
+        placements.append([1, 0, 500, 0])
+    _le(t, len(placements), 8)
+    for pl in placements:
+        _le(t, pl[0], 4)
+        _le(t, pl[1], 4)
+        _le(t, pl[2], 8)
+        _le(t, pl[3], 1)
+    _le(t, 1 if twice else 0, 8)
+    if twice:
+        _le(t, 2, 8)
+        _le(t, 1, 8)
+        _le(t, 3, 4)
+    _le(t, 2, 8)
+    _le(t, 0, 4)
+    _le(t, 1, 4)
+    _le(t, 2, 8)
+    _le(t, 4, 8)
+    t.extend(Span(_text("chrA")))
+    _le(t, 4, 8)
+    t.extend(Span(_text("chrB")))
+    with open(path, "w") as f:
+        f.write_bytes(Span(t))
+    return path
+
+
+def _project(m: RefMap, walk: List[Int], ts: Int, te: Int) -> Tuple[Int, Int, Int, Int]:
+    """Why (0 placed), contig, start, end."""
+    var anchors = List[Anchor]()
+    var p = Placed(-1, -1, -1)
+    var why = m.project(walk, ts, te, anchors, p)
+    return (why, p.contig, p.start, p.end)
+
+
+def _step(node: Int, reverse: Bool) -> Int:
+    return node << 1 | Int(reverse)
+
+
+def test_projection_as_pgcat() raises:
+    var m = RefMap(_refmap_file(False))
+    assert_equal(m.sample, "CHM13")
+    assert_equal(m.length(2), 5)
+    assert_equal(m.length(0), 0)
+    # Forward, all three nodes, aligned from base 3 to 22 of the walk.
+    var r = _project(m, [_step(1, False), _step(2, False), _step(3, False)], 3, 22)
+    assert_true(r[0] == 0 and r[1] == 0 and r[2] == 103 and r[3] == 122)
+    # Reverse walk <3 <2 <1: the same bases, read backwards.
+    r = _project(m, [_step(3, True), _step(2, True), _step(1, True)], 3, 22)
+    assert_true(r[0] == 0 and r[1] == 0 and r[2] == 103 and r[3] == 122)
+    # An off-reference node between anchors is skipped.
+    r = _project(m, [_step(1, False), _step(4, False), _step(3, False)], 0, 25)
+    assert_true(r[0] == 0 and r[2] == 100 and r[3] == 125)
+    # Steps going backwards along a forward walk, or the orientation flipping part way: no place.
+    assert_equal(_project(m, [_step(3, False), _step(1, False)], 0, 20)[0], INCONSISTENT)
+    assert_equal(_project(m, [_step(1, False), _step(3, True)], 0, 20)[0], INCONSISTENT)
+    # A node missing from the graph, or only off-reference nodes: no place.
+    assert_equal(_project(m, [_step(1, False), _step(9, False)], 0, 12)[0], MISSING_NODE)
+    assert_equal(_project(m, [_step(4, False)], 0, 5)[0], NO_ANCHOR)
+
+
+def test_ambiguous_placements() raises:
+    var m = RefMap(_refmap_file(True))
+    # Node 2 alone has two places; with node 1 before it, only path 0 fits.
+    assert_equal(_project(m, [_step(2, False)], 0, 5)[0], AMBIGUOUS)
+    var r = _project(m, [_step(1, False), _step(2, False)], 0, 15)
+    assert_true(r[0] == 0 and r[1] == 0 and r[2] == 100 and r[3] == 115)
+
+
+def test_bins_as_htslib() raises:
+    assert_equal(N_BINS, 37449)
+    assert_equal(reg2bin(0, 1), 4681)
+    assert_equal(reg2bin(0, 1 << 14), 4681)
+    assert_equal(reg2bin(0, (1 << 14) + 1), 585)
+    assert_equal(reg2bin(0, 1 << 29), 0)
+    assert_equal(bin_level(0), 0)
+    assert_equal(bin_level(4681), 5)
+    assert_equal(bin_parent(4681), 585)
 
 
 def main() raises:

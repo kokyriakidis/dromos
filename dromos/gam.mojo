@@ -9,7 +9,7 @@ convert's settings -- cs and bq on, no segment translation -- so its lines match
 from std.math import floor
 from std.memory import bitcast
 
-from dromos.nodes import NodeTable
+from dromos.nodes import Nodes
 from dromos.output import InlineDigits
 
 comptime TAG = "GAM"
@@ -300,7 +300,9 @@ struct _Cs:
         self.deleting = True
 
 
-def gaf_line[tags: Bool = True](p: ImmPointer[UInt8, _], a: Alignment, nodes: NodeTable, mut out: List[UInt8]) raises:
+def gaf_line[
+    N: Nodes, //, tags: Bool = True
+](p: ImmPointer[UInt8, _], a: Alignment, nodes: N, mut out: List[UInt8]) raises:
     """Appends the GAF line (with its newline) vg convert writes for alignment `a` of the message at `p`; with
     `tags` false, its 12 columns alone (no cs, bq, AS or dv, and no node letters needed)."""
     put_bytes(out, p, a.name_at, a.name_length)

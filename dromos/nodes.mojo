@@ -18,7 +18,21 @@ comptime MAGIC = "DROMOSN1"
 """The table's first eight bytes."""
 
 
-struct NodeTable(Movable):
+trait Nodes:
+    """What GAF lines need of a graph's nodes: each node's length (0 for an id the graph lacks) and, for cs, its
+    letters."""
+
+    def length(self, node: Int) -> Int:
+        ...
+
+    def has_letters(self) -> Bool:
+        ...
+
+    def letter(self, node: Int, reverse: Bool, i: Int) -> UInt8:
+        ...
+
+
+struct NodeTable(Movable, Nodes):
     """A node table read whole into memory."""
 
     var data: List[UInt8]
