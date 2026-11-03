@@ -18,7 +18,7 @@ from std.sys import stderr
 
 from dromos.bam import RecordWriter
 from dromos.bam_sort import BamStaging
-from dromos.contig import Contig, Reference, comp
+from dromos.contig import Contig, Reference
 from dromos.gaf_text import parse_unsigned
 from dromos.gam import Alignment, gaf_line, put_bytes, put_int, put_text
 from dromos.linearize import (
@@ -34,7 +34,7 @@ from dromos.linearize import (
     linearize,
     upper,
 )
-from dromos.nodes import NodeTable
+from dromos.nodes import NodeTable, comp
 from dromos.output import write_all
 from dromos.parallel import Background, ParallelTask, parallel_for
 from dromos.stream import MessageSink, imm_untracked, mut_untracked
@@ -208,6 +208,8 @@ struct Surjector(Movable):
     var graph: Bool
     var windows: List[List[Window]]
     var records: RecordWriter
+    var complements: List[UInt8]
+    """`comp` of every byte."""
 
     def __init__(
         out self,
@@ -223,6 +225,9 @@ struct Surjector(Movable):
         self.graph = graph
         self.windows = windows^
         self.records = RecordWriter()
+        self.complements = List[UInt8](capacity=256)
+        for b in range(256):
+            self.complements.append(comp(UInt8(b)))
 
     def touches(self, p: ImmPointer[UInt8, _], n: Int, mut fields: List[Int], mut walk: List[Int]) -> Bool:
         """Whether GAF line `p[:n]` (no newline) may place a base on a contig: its walk holds a node a contig
@@ -332,12 +337,9 @@ struct Surjector(Movable):
                     s.read.resize(unsafe_uninit_length=at + take)
                     var dst = s.read.unsafe_ptr().unsafe_offset(at)
                     if step & 1 == 1:
-                        var last = letters + length - off - 1
-                        for t in range(take):
-                            dst[unsafe_offset=t] = comp(self.nodes.at(last - t))
+                        self.nodes.copy_reverse(dst, letters + length - off - 1, take)
                     else:
-                        for t in range(take):
-                            dst[unsafe_offset=t] = upper(self.nodes.at(letters + off + t))
+                        self.nodes.copy_forward(dst, letters + off, take)
                     s.score.resize(at + take, CLIP_MATCH)
                     var pl = _place(contig, step, length, off)
                     if pl[1] != 0:
@@ -416,9 +418,17 @@ struct Surjector(Movable):
             s.merged.append(b)
         # The read in the BAM's orientation: a GAF read on `-` is the path's letters reverse-complemented.
         if not fwd:
-            s.read.reverse()
-            for t in range(rl):
-                s.read[t] = comp(s.read[t])
+            var r = s.read.unsafe_ptr()
+            var lo = 0
+            var hi = rl - 1
+            while lo < hi:
+                var a = r[unsafe_offset=lo]
+                r[unsafe_offset=lo] = self.complements[Int(r[unsafe_offset=hi])]
+                r[unsafe_offset=hi] = self.complements[Int(a)]
+                lo += 1
+                hi -= 1
+            if lo == hi:
+                r[unsafe_offset=lo] = self.complements[Int(r[unsafe_offset=lo])]
         var pos = 0
         if not linearize(Span(s.read), s.merged, Span(contig.seq), self.graph, self.windows[c], pos, s.cigar):
             return False

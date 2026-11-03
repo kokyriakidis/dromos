@@ -6,31 +6,9 @@ The contig's paths (fragments) are laid end to end in the order of their offsets
 its placement's start; bases no fragment covers are N, and the contig is as long as its farthest fragment end."""
 
 from dromos.linearize import upper
-from dromos.nodes import NodeTable
+from dromos.nodes import NodeTable, comp
 from dromos.parallel import ParallelTask, parallel_for
 from dromos.refmap import ContigPath, RefMap
-
-
-comptime _A = UInt8(ord("A"))
-comptime _C = UInt8(ord("C"))
-comptime _G = UInt8(ord("G"))
-comptime _T = UInt8(ord("T"))
-comptime _N = UInt8(ord("N"))
-
-
-@always_inline
-def comp(b: UInt8) -> UInt8:
-    """pgcatalog's complement: of A, C, G or T in either case, in capitals; N for any other letter."""
-    var u = upper(b)
-    if u == _A:
-        return _T
-    if u == _C:
-        return _G
-    if u == _G:
-        return _C
-    if u == _T:
-        return _A
-    return _N
 
 
 struct Contig(Movable):
@@ -83,7 +61,7 @@ struct Contig(Movable):
                 lo = min(lo, node)
                 hi = max(hi, node)
                 length = max(length, map.placement(cp.first + s).start + map.length(node))
-        self.seq = List[UInt8](length=length, fill=_N)
+        self.seq = List[UInt8](length=length, fill=UInt8(ord("N")))
         self.base = lo
         var visits = List[Int](length=hi - lo + 1, fill=0)
         self.place = List[Int](length=hi - lo + 1, fill=-1)

@@ -4,6 +4,7 @@ cache (cache.mojo: its NODES, LENGTHS, STARTS and LETTERS)."""
 from std.math import iota
 
 from dromos.cache import BLOCK, LENGTHS, LETTERS, NONE, STARTS, CacheFile
+from dromos.linearize import upper
 
 
 trait Nodes:
@@ -33,6 +34,10 @@ struct NodeTable(Movable, Nodes):
     """Letters as bytes, not 4-bit codes."""
     var table: SIMD[DType.uint8, 16]
     var with_letters: Bool
+    var forward_pairs: List[UInt16]
+    """For each byte of two 4-bit letters: the low one's letter then the high one's, in capitals."""
+    var reverse_pairs: List[UInt16]
+    """For each byte of two 4-bit letters: the complements (`comp`) of the high one's letter, then the low one's."""
 
     def __init__(out self, path: String, letters: Bool = True) raises:
         var cache = CacheFile(path)
@@ -50,6 +55,13 @@ struct NodeTable(Movable, Nodes):
         self.wide = cache.width == 8
         self.table = cache.table
         self.with_letters = letters
+        self.forward_pairs = List[UInt16](capacity=256)
+        self.reverse_pairs = List[UInt16](capacity=256)
+        for byte in range(256):
+            var low = self.table[byte & 15]
+            var high = self.table[byte >> 4]
+            self.forward_pairs.append(UInt16(upper(low)) | UInt16(upper(high)) << 8)
+            self.reverse_pairs.append(UInt16(comp(high)) | UInt16(comp(low)) << 8)
         self.cache = cache^
 
     @always_inline
@@ -81,6 +93,48 @@ struct NodeTable(Movable, Nodes):
             return self.bases[unsafe_offset=index]
         var code = (self.bases[unsafe_offset=index >> 1] >> UInt8((index & 1) << 2)) & 15
         return self.table[Int(code)]
+
+    def copy_forward(self, dst: MutPointer[UInt8, _], index: Int, count: Int):
+        """Letters `index ..< index + count` (as `at` numbers them) at `dst`, in capitals: two a lookup."""
+        if self.wide:
+            for t in range(count):
+                dst[unsafe_offset=t] = upper(self.bases[unsafe_offset=index + t])
+            return
+        var t = 0
+        if index & 1 == 1 and count > 0:
+            dst[unsafe_offset=0] = upper(self.at(index))
+            t = 1
+        var src = self.bases.unsafe_offset((index + t) >> 1)
+        var pairs = (count - t) >> 1
+        var out = dst.unsafe_offset(t)
+        for k in range(pairs):
+            out.unsafe_offset(2 * k).unsafe_bitcast[UInt16]()[] = self.forward_pairs[Int(src[unsafe_offset=k])]
+        t += 2 * pairs
+        if t < count:
+            dst[unsafe_offset=t] = upper(self.at(index + t))
+
+    def copy_reverse(self, dst: MutPointer[UInt8, _], last: Int, count: Int):
+        """The complements (`comp`) of letters `last`, `last - 1`, ... (`count` of them) at `dst`: a stretch read on
+        the reverse strand, two a lookup."""
+        if self.wide:
+            for t in range(count):
+                dst[unsafe_offset=t] = comp(self.bases[unsafe_offset=last - t])
+            return
+        var t = 0
+        if last & 1 == 0 and count > 0:
+            dst[unsafe_offset=0] = comp(self.at(last))
+            t = 1
+        # Letter last - t is a byte's high one: it and the low one before it, a byte at a time, downwards.
+        var top = (last - t) >> 1
+        var pairs = (count - t) >> 1
+        var out = dst.unsafe_offset(t)
+        for k in range(pairs):
+            out.unsafe_offset(2 * k).unsafe_bitcast[UInt16]()[] = self.reverse_pairs[
+                Int(self.bases[unsafe_offset=top - k])
+            ]
+        t += 2 * pairs
+        if t < count:
+            dst[unsafe_offset=t] = comp(self.at(last - t))
 
     @always_inline
     def letter(self, node: Int, reverse: Bool, i: Int) -> UInt8:
@@ -114,3 +168,25 @@ def complement(c: UInt8) -> UInt8:
     if c == UInt8(ord("t")):
         return UInt8(ord("a"))
     return c
+
+
+comptime _A = UInt8(ord("A"))
+comptime _C = UInt8(ord("C"))
+comptime _G = UInt8(ord("G"))
+comptime _T = UInt8(ord("T"))
+comptime _N = UInt8(ord("N"))
+
+
+@always_inline
+def comp(b: UInt8) -> UInt8:
+    """pgcatalog's complement: of A, C, G or T in either case, in capitals; N for any other letter."""
+    var u = upper(b)
+    if u == _A:
+        return _T
+    if u == _C:
+        return _G
+    if u == _G:
+        return _C
+    if u == _T:
+        return _A
+    return _N
