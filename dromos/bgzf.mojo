@@ -46,16 +46,22 @@ struct RawFile(Movable):
     var fd: Int32
     var path: String
     var size: Int
+    """The file's size; the largest Int for a pipe, read to its end."""
     var direct: Bool
+    var seekable: Bool
+    """Whether the file is a regular one, read with pread anywhere; a pipe (stdin) is read in order, with read."""
 
     def __init__(out self, path: String, direct: Bool = False) raises:
         var c_path = List[UInt8](path.as_bytes())
         c_path.append(0)
         comptime open_name = "open64" if CompilationTarget.is_linux() else "open"
+        var st = stat(path)
+        self.seekable = (Int(st.st_mode) & 0o170000) == 0o100000
+        self.size = Int(st.st_size) if self.seekable else Int.MAX
         self.direct = False
         self.fd = -1
         comptime if CompilationTarget.is_linux():
-            if direct:
+            if direct and self.seekable:
                 self.fd = external_call[open_name, Int32](c_path.unsafe_ptr(), O_RDONLY | O_DIRECT, Int32(0))
                 self.direct = self.fd >= 0
         if self.fd < 0:
@@ -63,14 +69,17 @@ struct RawFile(Movable):
         if self.fd < 0:
             raise Error(t"cannot open {path}")
         self.path = path
-        self.size = Int(stat(path).st_size)
 
     def read(self, dst: MutPointer[UInt8, _], count: Int, offset: Int) -> Int:
         """Up to `count` bytes from `offset` into `dst`: fewer only at the end of the file; -1 on an error. A direct
         file's `dst`, `count` and `offset` are multiples of DIRECT_ALIGN."""
         var got = 0
         while got < count and offset + got < self.size:
-            var n = external_call["pread", Int](self.fd, dst.unsafe_offset(got), count - got, offset + got)
+            var n: Int
+            if self.seekable:
+                n = external_call["pread", Int](self.fd, dst.unsafe_offset(got), count - got, offset + got)
+            else:
+                n = external_call["read", Int](self.fd, dst.unsafe_offset(got), count - got)
             if n < 0:
                 return -1
             if n == 0:
@@ -79,7 +88,7 @@ struct RawFile(Movable):
         return got
 
     def prefetch(self, offset: Int, count: Int):
-        if self.direct:
+        if self.direct or not self.seekable:
             return
         comptime if CompilationTarget.is_linux():
             _ = external_call["posix_fadvise", Int32](self.fd, offset, count, POSIX_FADV_WILLNEED)
@@ -304,3 +313,101 @@ struct MappedFile(Movable):
 
     def __deinit__(deinit self):
         _ = external_call["munmap", Int32](self.ptr, self.size)
+
+
+def load_zlib() raises -> OwnedDLHandle:
+    """zlib, from the environment pixi sets up or the system's (every Linux has libz.so.1)."""
+    comptime suffix = ".dylib" if CompilationTarget.is_macos() else ".so"
+    var names: List[String] = [
+        "libz.1.dylib" if CompilationTarget.is_macos() else "libz.so.1",
+        String("libz") + suffix,
+    ]
+    var prefix = getenv("CONDA_PREFIX")
+    if prefix:
+        names.append(prefix + "/lib/libz" + suffix)
+    for name in names:
+        try:
+            return OwnedDLHandle(name)
+        except:
+            pass
+    raise Error("zlib not found")
+
+
+comptime Z_STREAM_BYTES = 112
+"""sizeof(z_stream) on a 64-bit system."""
+comptime _Z_NEXT_IN = 0
+comptime _Z_AVAIL_IN = 8
+comptime _Z_NEXT_OUT = 24
+comptime _Z_AVAIL_OUT = 32
+comptime Z_OK = 0
+comptime Z_STREAM_END = 1
+comptime Z_BUF_ERROR = -5
+
+
+struct GzipStream(Movable):
+    """A gzip file inflated as one stream by zlib, a piece of it at a time, its members one after another (each
+    member's CRC32 and length checked by zlib), as a gzip reader that reads several members reads it."""
+
+    var state: List[UInt8]
+    """The z_stream, at a fixed address (zlib keeps a pointer to it)."""
+    var started: Bool
+    var member_done: Bool
+    """Whether the last member read is finished: more input starts a new one."""
+
+    def __init__(out self):
+        self.state = List[UInt8](length=Z_STREAM_BYTES, fill=0)
+        self.started = False
+        self.member_done = False
+
+    @always_inline
+    def _set(mut self, at: Int, value: Int):
+        self.state.unsafe_ptr().unsafe_offset(at).unsafe_bitcast[Int]()[] = value
+
+    @always_inline
+    def _avail(self, at: Int) -> Int:
+        return Int(self.state.unsafe_ptr().unsafe_offset(at).unsafe_bitcast[UInt32]()[])
+
+    def inflate(mut self, lib: OwnedDLHandle, src: ImmPointer[UInt8, _], length: Int, mut out: List[UInt8]) raises:
+        """Inflates `src[:length]`, all of it, appending the letters to `out`."""
+        var z = self.state.unsafe_ptr()
+        if not self.started:
+            var version: List[UInt8] = [UInt8(ord("1")), 0]
+            var init = lib.get_function[Int32]("inflateInit2_")
+            # 15 + 16: a gzip stream, 32 KiB window.
+            if init(z, Int32(31), version.unsafe_ptr(), Int32(Z_STREAM_BYTES)) != Z_OK:
+                raise Error("zlib: inflateInit2 failed")
+            self.started = True
+        var inflate = lib.get_function[Int32]("inflate")
+        var reset = lib.get_function[Int32]("inflateReset")
+        self._set(_Z_NEXT_IN, Int(src))
+        self.state.unsafe_ptr().unsafe_offset(_Z_AVAIL_IN).unsafe_bitcast[UInt32]()[] = UInt32(length)
+        while self._avail(_Z_AVAIL_IN) > 0:
+            if self.member_done:
+                if reset(z) != Z_OK:
+                    raise Error("zlib: inflateReset failed")
+                self.member_done = False
+            var at = len(out)
+            var room = max(1 << 22, at)
+            out.reserve(at + room)
+            room = min(room, (1 << 31) - 1)
+            self._set(_Z_NEXT_OUT, Int(out.unsafe_ptr().unsafe_offset(at)))
+            self.state.unsafe_ptr().unsafe_offset(_Z_AVAIL_OUT).unsafe_bitcast[UInt32]()[] = UInt32(room)
+            var ret = Int(inflate(z, Int32(0)))
+            var made = room - self._avail(_Z_AVAIL_OUT)
+            out.resize(unsafe_uninit_length=at + made)
+            if ret == Z_STREAM_END:
+                self.member_done = True
+            elif ret != Z_OK and not (ret == Z_BUF_ERROR and made > 0):
+                raise Error(t"zlib: not gzip, or corrupt (inflate returned {ret})")
+
+    def finished(self) -> Bool:
+        """Whether the stream ended at the end of a member."""
+        return self.member_done or not self.started
+
+    def free(mut self, lib: OwnedDLHandle):
+        if self.started:
+            try:
+                _ = lib.get_function[Int32]("inflateEnd")(self.state.unsafe_ptr())
+            except:
+                pass
+            self.started = False

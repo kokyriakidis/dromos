@@ -67,6 +67,35 @@ def _get64(p: ImmPointer[UInt8, _], at: Int) -> Int:
     return _get32(p, at) | _get32(p, at + 4) << 32
 
 
+def _append_slim(mut out: List[UInt8], p: ImmPointer[UInt8, _], n: Int):
+    """pgcat's append_line with slim: the GAF line `p[:n]`'s first 12 columns, then of the rest only its SLIM_TAGS
+    (rq:i:, the rescue's MAPQ; pu:Z:, why a line had no place; rs:Z:, where the rescue put it), in their order."""
+    var field = 0
+    var s = 0
+    for i in range(n + 1):
+        if i < n and p[unsafe_offset=i] != UInt8(ord("\t")):
+            continue
+        var length = i - s
+        if field < 12:
+            if field > 0:
+                out.append(UInt8(ord("\t")))
+            out.extend(Span(unsafe_ptr=p.unsafe_offset(s), length=length))
+        elif length >= 5 and p[unsafe_offset=s + 2] == UInt8(ord(":")) and p[unsafe_offset=s + 4] == UInt8(ord(":")):
+            var a = p[unsafe_offset=s]
+            var b = p[unsafe_offset=s + 1]
+            var c = p[unsafe_offset=s + 3]
+            var keep = (
+                (a == UInt8(ord("r")) and b == UInt8(ord("q")) and c == UInt8(ord("i")))
+                or (a == UInt8(ord("p")) and b == UInt8(ord("u")) and c == UInt8(ord("Z")))
+                or (a == UInt8(ord("r")) and b == UInt8(ord("s")) and c == UInt8(ord("Z")))
+            )
+            if keep:
+                out.append(UInt8(ord("\t")))
+                out.extend(Span(unsafe_ptr=p.unsafe_offset(s), length=length))
+        field += 1
+        s = i + 1
+
+
 @always_inline
 def _store(p: MutPointer[UInt8, _], v: Int, bytes: Int):
     for k in range(bytes):
@@ -203,8 +232,10 @@ struct IndexSink(MessageSink, Movable):
     """Side tasks gathering the last step's lines into buckets, each its share of the buckets."""
     var gathering: Bool
     """Whether the last step placed lines, for the next to gather."""
+    var lines: Bool
+    """Whether the messages are a GAF's lines (else a GAM's alignments)."""
 
-    def __init__(out self, var map: RefMap, threads: Int) raises:
+    def __init__(out self, var map: RefMap, threads: Int, lines: Bool = False) raises:
         var n = len(map.contigs)
         # Output order is by contig name (bytes), then position, then the line itself.
         self.by_rank = List[Int](capacity=n)
@@ -225,6 +256,7 @@ struct IndexSink(MessageSink, Movable):
         self.buckets = List[List[_Bucket]](length=n, fill=List[_Bucket]())
         self.gatherers = threads
         self.gathering = False
+        self.lines = lines
 
     def slices(self) -> Int:
         return len(self.states)
@@ -240,6 +272,9 @@ struct IndexSink(MessageSink, Movable):
         var st = mut_untracked(Pointer(to=self.states[slice]))
         st[].recs.clear()
         var placed = Placed(0, 0, 0)
+        if self.lines:
+            self._take_lines(st[], data, messages, first, last)
+            return
         for m in range(first, last):
             st[].alignment.decode[slim=True](data, messages[unsafe_offset=2 * m], messages[unsafe_offset=2 * m + 1])
             # The line goes straight after room for its record header, kept if it is placed.
@@ -283,6 +318,49 @@ struct IndexSink(MessageSink, Movable):
                 st[].counts[C_WHY + why - NO_ANCHOR] += 1
             else:
                 st[].counts[C_MALFORMED] += 1
+
+    def _take_lines(
+        self,
+        mut st: _Slice,
+        data: ImmPointer[UInt8, ImmUntrackedOrigin],
+        messages: ImmPointer[Int, ImmUntrackedOrigin],
+        first: Int,
+        last: Int,
+    ):
+        """Lines `first ..< last` of a GAF, read as pgcat reads them: a line's trailing carriage return left out, the
+        line classified as text, and a placed one kept slim (its 12 columns and SLIM_TAGS)."""
+        var placed = Placed(0, 0, 0)
+        for m in range(first, last):
+            var start = messages[unsafe_offset=2 * m]
+            var n = messages[unsafe_offset=2 * m + 1] - start
+            var p = data.unsafe_offset(start)
+            if n > 0 and p[unsafe_offset=n - 1] == UInt8(ord("\r")):
+                n -= 1
+            var why = 0
+            var aligned = 0
+            var kind = self._classify(p, n, st.walk, st.anchors, placed, why, aligned)
+            if kind == _SKIP:
+                continue
+            st.counts[C_LINES] += 1
+            if kind == _PLACED:
+                var r = self.rank[placed.contig]
+                st.counts[C_PLACED] += 1
+                st.span[r] = max(st.span[r], aligned)
+                var at = len(st.recs)
+                st.recs.resize(unsafe_uninit_length=at + HEADER)
+                _append_slim(st.recs, p, n)
+                var h = st.recs.unsafe_ptr().unsafe_offset(at)
+                _store(h, r, 4)
+                _store(h.unsafe_offset(4), placed.start, 8)
+                _store(h.unsafe_offset(12), placed.end, 8)
+                _store(h.unsafe_offset(20), len(st.recs) - at - HEADER, 4)
+            elif kind == _UNMAPPED:
+                st.counts[C_UNMAPPED] += 1
+            elif kind == _UNPLACED:
+                st.counts[C_UNPLACED] += 1
+                st.counts[C_WHY + why - NO_ANCHOR] += 1
+            else:
+                st.counts[C_MALFORMED] += 1
 
     def _place(
         self,

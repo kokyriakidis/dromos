@@ -28,7 +28,9 @@ habits:
   tabix.rs; refmap.mojo and tabix.mojo port them). Check any change at `-l 0` against pgcat's `--level 0` on the
   same alignments: the same file byte for byte, and the same .tbi decompressed. At other levels only the deflate
   differs: compare decompressed content and tabix queries.
-- The GAM pipeline (stream.mojo) is shared: a sink says what messages become (convert.mojo, index.mojo).
+- The pipeline (stream.mojo) is shared: a sink says what messages (a GAF's lines) become (convert.mojo, index.mojo).
+  GAF input must index as pgcat indexes the same file: check plain, gzip, BGZF and stdin at `-l 0`, and a GAF with
+  tags kept and dropped, CRLF, comments, short lines and no final newline.
 - Pointers handed to parallel tasks carry their owner's origin, or the owner is an explicit allocation that outlives
   the tasks (see sporos's CLAUDE.md for the patterns, copied here from sporos: parallel.mojo, output.mojo, bgzf.mojo).
 - Finished work merges straight into `main` and is pushed; no pull requests.
