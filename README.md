@@ -12,7 +12,7 @@ and keeps what the other commands need of it in one cache file beside it. It is 
 |---|---|
 | `dromos index` | the alignments placed on the reference, sorted, bgzipped and tabix-indexed: the index pgphase reads |
 | `dromos gam-to-gaf` | a GAM as the GAF lines `vg convert -G` writes, in the GAM's order |
-| `dromos surject` | the alignments on one reference contig as SAM: the records `pgcatalog surject` writes |
+| `dromos surject` | the alignments on every reference contig in one pass, the records `pgcatalog surject` writes: a sorted, indexed BAM, or SAM |
 | `dromos catalog` | a GBZ graph's site catalogs, one per reference contig: the `.pgsites` files `pgcatalog build` writes |
 | `dromos view` | a catalog as VCF, whole or a region of it, as `pgcatalog view` prints it |
 | `dromos prepare` | a GBZ graph's cache, made ahead of the commands that read it |
@@ -33,14 +33,34 @@ Inflating vg's DEFLATE is half the work. It runs at about 870 MB/s of output per
 [libdeflate](https://github.com/ebiggers/libdeflate), as fast as DEFLATE decoders go. A 10 GB GAF indexes in under
 5 s, about the speed of the disk.
 
-`dromos surject` against `pgcatalog surject` (which loads the 6 GB graph), on the chr10 alignments of a 3.8 GB
-slice of that GAM (487,571 reads; SAM to /dev/null, 10 threads):
+`dromos surject` against `pgcatalog surject` (which loads the 6 GB graph), on the chr10 alignments of a 5.8 GB
+slice of that GAM (487,571 reads; SAM to /dev/null, 10 threads), and against dromos before its aligners ran on
+threads of their own and its band was filled in vectors (both dromos columns with turbo off):
 
-| chr10 of the slice | `pgcatalog surject` (from its GAF) | **`dromos surject`** (from the GAM) |
-|---|---|---|
-| default | 200 s, 11.5 GB | **77 s**, 4.8 GB |
-| `--graph-placement` | 46 s, 10.5 GB | **19 s**, 3.7 GB |
-| `--catalog chr10.pgsites` | 329 s, 14.1 GB | **178 s**, 5.8 GB |
+| chr10 of the slice | `pgcatalog surject` (from its GAF) | dromos before | **`dromos surject`** (from the GAM) |
+|---|---|---|---|
+| default | 200 s, 11.5 GB | 78.4 s, 561 CPU s, 4.7 GB | **22.5 s**, 205 CPU s, 3.6 GB |
+| `--graph-placement` | 46 s, 10.5 GB | 21.4 s, 186 CPU s, 3.6 GB | **15.2 s**, 134 CPU s, 2.3 GB |
+| `--catalog chr10.pgsites` | 329 s, 14.1 GB | 178.2 s, 1,561 CPU s, 5.9 GB | **88.3 s**, 818 CPU s, 5.9 GB |
+
+Every contig in one pass, into a sorted, indexed BAM (`-o`, level 4; output and spills on a hard disk that
+writes 181 MB/s; 10 threads, turbo off):
+
+| Every contig, one pass | Wall | CPU | Peak memory |
+|---|---|---|---|
+| the slice (489,489 reads; a 2.6 GB BAM) | 46.9 s | 396 s | 17.1 GB |
+| the slice, `--graph-placement` | 36.2 s | 327 s | 17.2 GB |
+| the slice, `--catalog DIR` (all 25 catalogs) | 124 s ¹ | 1,160 s ¹ | 21.5 GB |
+| **HG002, the whole GAM** (155 GB, 12,800,930 reads; a 67.9 GB BAM and its .bai) | **25 min 26 s** | 11,358 s | 27.7 GB |
+
+The whole GAM takes 13.8 minutes to read and align (every core busy) and 11.3 to sort and write: 43 GB of records
+spilled in 10 rounds (`-m 8G`) are read back while the 68 GB BAM is written, both on the one hard disk, which bounds
+that phase. Before, a contig was a pass over the whole GAM, then `samtools sort`: chr20 alone takes 204 s with the
+previous dromos (140 s now). In the slice's pass the BAM's deflate takes 27% of the CPU, the band's fill 14%,
+inflating the GAM 8%, the records' zstd staging 7% and rebuilding the reads 5%.
+
+¹ Measured while each catalog was inflated whole (31.7 GB at the peak); read a buffer at a time, as now, they cost
+about 4 s more on the small data, and the peak is 21.5 GB.
 
 `dromos catalog` against `pgcatalog build` (which loads the 6 GB graph whole first), from the same cached snarls,
 10 threads, writing to a hard disk:
@@ -154,25 +174,38 @@ dromos gam-to-gaf --slim --graph graph.gbz reads.gam          # their 12 columns
 ### `dromos surject`
 
 ```sh
-dromos surject --graph graph.gbz --reference-sample CHM13 --contig chr20 reads.gam > chr20.sam
-dromos surject --graph graph.gbz --reference-sample CHM13 --contig chr20 --sam-contig chr20 reads.gaf.gz \
-  | samtools sort -o chr20.bam && samtools index chr20.bam
+dromos surject --graph graph.gbz --reference-sample CHM13 reads.gam -o reads.bam   # every contig: BAM, .bai
+dromos surject --graph graph.gbz --reference-sample CHM13 --contig chr20 --contig chr6 reads.gaf.gz -o two.bam
+dromos surject --graph graph.gbz --reference-sample CHM13 --contig chr20 reads.gam > chr20.sam   # SAM, IN's order
 ```
 
-- **What it writes.** The alignments of IN on one reference contig as SAM, the records `pgcatalog surject` writes
-  for the same reads and options, in IN's order (a port of its surject.rs). Each read is rebuilt from its walk and
-  `cs`; a base on a node the contig visits once takes that node's position, and the placed stretches are joined by
-  aligning what lies between them to the reference (affine gaps, in a band). Read ends off the reference are aligned
-  or soft-clipped, and ends diverging from the read's own graph alignment clipped. Reads with no base on the contig
-  are left out.
+- **What it writes.** The alignments of IN on the reference contigs, the records `pgcatalog surject` writes for the
+  same reads and options (a port of its surject.rs), every contig of the reference sample in one pass over IN
+  (`--contig`, repeated, chooses some). Each read is rebuilt from its walk and `cs`; a base on a node a contig visits
+  once takes that node's position, and the placed stretches are joined by aligning what lies between them to the
+  reference (affine gaps, in a band). Read ends off the reference are aligned or soft-clipped, and ends diverging
+  from the read's own graph alignment clipped. A read with bases on several contigs gets a record on each, the one
+  that contig's own run makes; reads with no base on any are left out.
+- **BAM.** `-o OUT.bam` writes a BAM sorted as `samtools sort` sorts (by contig, position, then reverse strand,
+  then input order) and its index, `OUT.bam.bai`, or `.csi` when a contig is longer than a .bai holds (2^29 bases)
+  or with `--csi`. The header is `@HD SO:coordinate`, an `@SQ` for each contig in the order of the reference's
+  paths, and dromos's `@PG`. Records wait for the sort compressed by zstd, and past half of `-m` (8G) they spill to
+  a file in `--tmp-dir` (OUT.bam's folder), unlinked as soon as it is made.
+- **Level.** `-l` sets the BAM's deflate level, 4 by default, chosen by measurement on the slice below (11.6 GB of
+  BAM records): libdeflate levels 1, 4 and 6 compress them to 2.91, 2.63 and 2.59 GB at 187, 101 and 52 MB/s a
+  core, and the final sort and write takes 10.1, 15.0 and 19.4 s on 10 cores. 4 is within 2% of 6's size at twice
+  its speed; on a hard disk (180 MB/s) the whole genome's final write waits on the disk at 4 anyway.
+- **SAM.** Without `-o`, SAM on stdout in IN's order, a read's records in contig order; one contig's SAM is what it
+  always was.
+- **Names.** `--sam-names full` (`CHM13#0#chr20`, the default) or `short` (`chr20`); `--sam-contig NAME` names a
+  single contig.
 - **Any input.** A GAM, or a GAF with `cs` (and `bq` for qualities) in any encoding, told apart by its first bytes.
   A GAM's alignments are first written as vg's GAF lines, so a GAM and its GAF give the same records. dromos index's
   output keeps no `cs` and cannot be used.
-- **Options.** `--contig NAME` (required); `--sam-contig NAME`, the contig's name in the SAM (`<sample>#0#<contig>`);
-  `--graph-placement`, read bases placed only where the graph puts them; `--catalog FILE`, the contig's catalog
-  (`.pgsites`): reads spanning one of its snarl windows aligned there as alleles; `--reference-sample NAME`, the
+- **Options.** `--graph-placement`, read bases placed only where the graph puts them; `--catalog DIR`, the contigs'
+  catalogs (`DIR/<contig>.pgsites`, as `dromos catalog --out DIR` writes them; a `.pgsites` file for a single
+  contig): reads spanning one of a contig's snarl windows aligned there as alleles; `--reference-sample NAME`, the
   reference; `--cache FILE`; `-t THREADS`.
-- **The header.** `@HD` and `@SQ` as pgcatalog writes them; the `@PG` line is dromos's own.
 
 `dromos COMMAND -h` lists each command's options. `DROMOS_TIMING=1` reports where the time goes.
 
@@ -193,9 +226,17 @@ dromos surject --graph graph.gbz --reference-sample CHM13 --contig chr20 --sam-c
   walked on threads of their own while the nodes are found, measured and their letters unpacked and packed by range
   on every core, and each path's placements are laid out by a task of its own. Every section is written through a
   mapping of the file, by the threads that make it (buffered writes to one file take its lock in turn).
-- **Surjection in batches.** A read's alignment to the reference costs from nothing to a second. Each step's
-  slices gather the reads that touch the contig, as GAF lines; a few hundred MB of them are then aligned by one
-  worker a thread taking pieces in turn, so threads wait at the end of a batch, not of every chunk.
+- **Surjection without barriers.** A read's alignment to the reference costs from nothing to a second. Each step's
+  slices gather the reads that touch a contig, as GAF lines, into pieces of a ring; aligner threads that live for
+  the whole run take the pieces as they are published, and each step writes out the prefix of pieces done since the
+  last, in order. No thread waits for the slowest read of a batch; reading waits once 512 MB of lines are in flight.
+- **The band in vectors.** The affine-gap band is filled a row at a time, 16 cells a vector (AVX-512): the
+  insertion and diagonal scores come from the row before, and the deletion scores along the row from a running
+  minimum, which gives exactly the integers, and so the tracebacks, of the cell-by-cell fill.
+- **Sorted with spills.** surject's BAM records gather by megabase of a contig in zstd frames as they are made;
+  past half the memory allowed they are written to a spill file by a thread of their own, a bucket's frames
+  together. At the end, windows of buckets (a gigabyte of records at most) are read back, sorted, deflated and
+  written in the index's three-deep pipeline, the .bai built as each block's address becomes known.
 - **Catalogs on every core.** The graph's GBWT is loaded by the crate and node letters unpacked a page of ids at a
   time, as needed. Snarls are built in pgcatalog's batches, each step building one batch while the previous one's
   lines are written straight into their blocks and compressed; threads with nothing left build the next batches.
@@ -217,6 +258,12 @@ dromos is checked byte for byte against the tools it replaces, on HG002 HiFi ali
 - `surject` writes the same SAM records as `pgcatalog surject` (pgcatalog 0.2.0), from the GAM and from its GAF,
   with and without `--graph-placement` and `--catalog`: chr10 of the slice (487,571 records), and slices of the whole
   GAM on chr20 (48,706) and chr6 across the MHC (47,027).
+- `surject -o` writes, for every contig, the records its single-contig run gives piped through `samtools sort`
+  (samtools 1.24, `samtools view OUT.bam CONTIG`), in every mode, on the slice, the chr20 and chr6 slices and the
+  small data; a single contig's BAM holds samtools sort's records byte for byte, and its .bai (or .csi) says what
+  `samtools index` says of the same file; spilling, threads and stdin change nothing. The whole HG002 GAM's BAM
+  (12,733,701 records) indexes as `samtools index` indexes it, and its chr20 is chr20's single run over the whole GAM
+  sorted by samtools.
 - `reference-samples` prints the lines `pgcatalog reference-samples` prints.
 - `catalog` writes the same `.pgsites` files as `pgcatalog build` (pgcatalog 0.2.0), byte for byte, from the same
   snarls: all 25 CHM13 contigs of the HPRC graph (43,494,146 records, 152 GB of VCF text, the largest record a 6.6 GB

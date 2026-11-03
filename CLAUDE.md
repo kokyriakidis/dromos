@@ -1,11 +1,11 @@
 # dromos
 
 Pangenome graph alignments in Mojo: vg's GAM read as fast as the disk delivers it, written as pgphase's index (the
-file `pgcat index-gaf --slim` writes), as the GAF lines `vg convert -G` writes, or as SAM on one reference contig
-(`pgcatalog surject`'s records) (github.com/kokyriakidis/pgphase). It reads the GBZ graph itself, through the gbz
-crate: it makes the site catalogs pgphase's pgcatalog made (`catalog`, `view`), and keeps what the other commands
-read of the graph in one cache file beside it (`G.gbz.dromos`, `prepare`). dromos alone turns a graph and its
-alignments into pgphase's inputs.
+file `pgcat index-gaf --slim` writes), as the GAF lines `vg convert -G` writes, or surjected onto the reference
+contigs (`pgcatalog surject`'s records, every contig in one pass, as SAM or a sorted, indexed BAM)
+(github.com/kokyriakidis/pgphase). It reads the GBZ graph itself, through the gbz crate: it makes the site catalogs
+pgphase's pgcatalog made (`catalog`, `view`), and keeps what the other commands read of the graph in one cache file
+beside it (`G.gbz.dromos`, `prepare`). dromos alone turns a graph and its alignments into pgphase's inputs.
 
 ## Mojo skills
 
@@ -51,11 +51,19 @@ habits:
 - `dromos/convert.mojo`: the `gam-to-gaf` sink. `dromos/index.mojo`: the `index` sink (placement, counts).
 - `dromos/refmap.mojo`: pgcat's reference map (a reference sample's sections of the cache) and placement rule.
   `dromos/gaf_text.mojo`: a GAF line as pgcat reads it. `dromos/staging.mojo`: placed lines by bucket.
-  `dromos/sort_write.mojo`: the final sort, BGZF and tabix (`dromos/tabix.mojo`).
-- `dromos/surject.mojo`: the `surject` sink (reads rebuilt from GAF lines, batches aligned by side tasks);
-  `dromos/linearize.mojo`: its alignment to the reference (banded affine gaps, chaining, clipping);
-  `dromos/contig.mojo`: the contig's letters and once-visited nodes from the cache's map and node table; with
+  `dromos/sort_write.mojo`: the final sort, BGZF and tabix; `IndexWriter` cuts BGZF into fixed blocks and indexes
+  records as their blocks get addresses, for any `BlockIndex`. `dromos/tabix.mojo`: htslib's binning index at any
+  depth (`BinIndex`), as a .tbi (`TbiBuilder`).
+- `dromos/surject.mojo`: the `surject` sink: reads rebuilt from GAF lines, a record on each contig a read places a
+  base on, pieces published to a ring and aligned by aligner threads that run for the whole input, records written
+  out in order (SAM on stdout, or BAM records to the staging buckets) as each prefix of pieces is done;
+  `dromos/linearize.mojo`: its alignment to the reference (banded affine gaps, a row of the band in vectors,
+  chaining, clipping); `dromos/contig.mojo`: a contig's letters and once-visited nodes from the cache's map and node
+  table, and `Reference`, the contigs surjected to (made at once) and which of them a node lies on; with
   `load_windows` in pgsites.mojo they port pgcatalog's surject.rs, reference.rs and pileup.rs.
+- `dromos/bam.mojo`: BAM records encoded as `samtools view -b` encodes the same SAM lines, the header, and the
+  .bai/.csi `BamIndex`. `dromos/bam_sort.mojo`: `surject -o`'s sort: records staged by megabase bucket in zstd
+  frames, spilled to an unlinked file past half the memory allowed, read back, sorted, deflated and indexed.
 - `dromos/bgzf.mojo`: files, BGZF blocks, libdeflate, zstd and zlib. `dromos/nodes.mojo`: the node table (the
   cache's lengths and letters). `dromos/output.mojo`, `dromos/parallel.mojo`: writing, integers, threads.
 
@@ -96,7 +104,17 @@ habits:
   haplotypes are searched in parts whose walks and counts add up.
 - `dromos surject` must write the SAM records `pgcatalog surject` writes (pgphase's tools/pgcatalog), byte for byte,
   from a GAM and from its GAF: check any change with `pixi run check` (its surject cases; `--full` for the slice).
-  Float ties in `chain` use libm's log2, as Rust does.
+  Float ties in `chain` use libm's log2, as Rust does. Without `--contig` it surjects every contig of the reference
+  sample in one pass; a read gets a record on each contig it places a base on, exactly the record that contig's
+  single run makes (one contig's SAM stays byte for byte what it was).
+- `dromos surject -o OUT.bam`: for every contig, `samtools view OUT.bam CONTIG` must give that contig's single run
+  piped through `samtools sort` (which sorts by reference, position, reverse strand, then input order: checked
+  against samtools 1.24 itself); a single contig's records are samtools sort's byte for byte; the .bai or .csi
+  must say what `samtools index` (`-c`) says of the same file (tests/integration/same_index.py: bins may come in
+  any order). check.sh and edges.sh hold these cases (SAMTOOLS names samtools in the env file).
+- `Banded.fill` (vectors) must give `fill_reference`'s (cell by cell, pgcatalog's) traceback bytes and last row
+  exactly, and `clip_lengths` its base-by-base results: the unit tests compare them on random inputs; keep both in
+  step with any change to the costs or the band.
 - The pipeline (stream.mojo) is shared: a sink says what messages (a GAF's lines) become (convert.mojo, index.mojo).
   GAF input must index as pgcat indexes the same file, in every encoding (the check covers plain, gzip, BGZF, stdin
   and edge cases).
