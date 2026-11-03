@@ -382,9 +382,8 @@ struct Unit(Movable):
         self.giant = False
         self.done = False
 
-    def compress(mut self, level: Int, threads: Int) raises:
-        """The block's text into its frame (one zstd frame), the text then freed."""
-        var c = Compressor()
+    def compress(mut self, c: Compressor, level: Int, threads: Int) raises:
+        """The block's text into its frame (one zstd frame, `c` set up afresh for it), the text then freed."""
         c.start(level, len(self.raw), threads, True)
         self.frame = c.frame(self.raw.unsafe_ptr(), len(self.raw))
         self.raw_length = len(self.raw)
@@ -443,6 +442,9 @@ struct Writer(Movable):
         if new_block:
             self._seal_last()
             self.units.append(Unit(window, pos, own))
+            # Room for the block's lines at once: it takes lines until it is BLOCK_BYTES long, the last at most
+            # OWN_BLOCK_BYTES and its newline.
+            self.units[len(self.units) - 1].raw.reserve(length + 1 if own else BLOCK_BYTES + OWN_BLOCK_BYTES + 1)
         var k = len(self.units) - 1
         ref b = self.units[k]
         var at = len(b.raw)
@@ -550,7 +552,7 @@ struct _CompressTask(ParallelTask):
         ref u = self.units[unsafe_offset=index]
         if u.sealed and not u.done and not u.giant:
             try:
-                u.compress(self.level, self.threads)
+                u.compress(Compressor(), self.level, self.threads)
             except:
                 self.bad[] = 1
 

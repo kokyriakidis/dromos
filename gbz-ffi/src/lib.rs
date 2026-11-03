@@ -957,20 +957,25 @@ pub unsafe extern "C" fn dgbz_parts_follow_forward(
 ) -> usize {
     let p = &*p;
     let mut written = 0;
+    // States at one node one after another (paths that met again) read its record once.
+    let mut last: Option<(usize, Option<Record<'_>>)> = None;
     for i in 0..n {
         let state = (*states.add(i)).state();
-        let (node, o) = gbz::support::decode_node(state.forward.node);
-        let Some(record) = p.record_of(node, o) else {
+        if last.as_ref().is_none_or(|(at, _)| *at != state.forward.node) {
+            let (node, o) = gbz::support::decode_node(state.forward.node);
+            last = Some((state.forward.node, p.record_of(node, o)));
+        }
+        let Some((_, Some(record))) = last.as_ref() else {
             *counts.add(i) = -1;
             continue;
         };
-        let ranks = edge_ranks(&record);
+        let ranks = edge_ranks(record);
         if written + ranks.len() > cap {
             return i;
         }
         let mut k = 0;
         for r in ranks {
-            if let Some(s) = GBWT::bd_internal(&record, &state, record.successor(r)) {
+            if let Some(s) = GBWT::bd_internal(record, &state, record.successor(r)) {
                 *out.add(written + k) = DgbzState::of(&s);
                 k += 1;
             }

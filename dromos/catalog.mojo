@@ -1,12 +1,15 @@
 """One contig's site catalog, or one region of it, from its snarls (pgcatalog's catalog.rs, record.rs and
 reference.rs, ported): every snarl the reference path passes through, at every nesting level, with all its alleles,
-as `vg deconstruct -a` writes them, without what needs haplotype names (genotypes, AC/AF/AN/NS).
+as `vg deconstruct -a` writes them, without what needs haplotype names (genotypes, AC/AF/AN/NS). The file is
+pgcatalog's byte for byte.
 
 Pass 1 finds each snarl's reference traversal; snarls the reference does not pass through once have no record. The
-rest are sorted by position, ancestors first at a tie, and built in batches on every thread: a snarl's haplotype walks
-by forward GBWT search, its alleles (the reference, then distinct sequences, most haplotypes first), then LV/PS from
-the ancestors built so far, and the lines written straight into the catalog's blocks, which are compressed in
-parallel. A record whose line is longer than STREAM_BYTES is compressed as it is written, in a block of its own.
+rest are sorted by position, ancestors first at a tie, and built in pgcatalog's batches: a snarl's haplotype walks by
+forward GBWT search, its alleles (the reference, then distinct sequences, most haplotypes first), then LV/PS from the
+ancestors built so far, and the lines written straight into the catalog's blocks, compressed in parallel. Each step
+builds one batch while the previous one's lines are written; threads with nothing left in a step build later batches.
+Heavy snarls are searched ahead by helper threads, their haplotypes in parts; a record whose line is longer than
+STREAM_BYTES is made a window of alleles at a time and compressed as it is made, on a thread of its own.
 
 The crate does the search (a batch of states per call) and gives the node letters, a page of node ids at a time as
 they are first needed.
@@ -22,7 +25,7 @@ from std.time import perf_counter_ns
 from dromos.graph import NO_LENGTH, GbzParts, Metadata, SearchState
 from dromos.output import decimal_digits, put_padded
 from dromos.parallel import Background, ParallelTask, parallel_for
-from dromos.pgsites import FrameStream, Writer
+from dromos.pgsites import Compressor, FrameStream, Writer
 from dromos.snarls import Snarl, canonical, put_visit, read_snarls
 from dromos.stream import imm_untracked, mut_untracked, untracked
 
@@ -392,6 +395,7 @@ struct Record(Movable):
 
     var present: Bool
     """False when every haplotype spells the reference: no record."""
+    var built: Bool
     var pos: Int
     var start: UInt64
     var end: UInt64
@@ -411,6 +415,7 @@ struct Record(Movable):
 
     def __init__(out self):
         self.present = False
+        self.built = False
         self.pos = 0
         self.start = 0
         self.end = 0
@@ -524,6 +529,10 @@ def _put_byte[S: LineSink](mut out: S, b: UInt8) raises:
 
 @always_inline
 def _put_number[S: LineSink](mut out: S, value: Int) raises:
+    var r = out.room()
+    if r[1] >= 24:
+        out.grew(put_padded(r[0], value, 0))
+        return
     var digits = Array[UInt8, 24](fill=0)
     var n = put_padded(digits.unsafe_ptr(), value, 0)
     _put(out, Span(digits)[:n])
@@ -814,16 +823,19 @@ struct Searcher(Movable):
 
 
 struct Builder(Movable):
-    """One thread's record building, its buffers kept from snarl to snarl."""
+    """One thread's record building, its buffers kept from snarl to snarl, and its zstd context (reset for each block:
+    a context made afresh maps and touches megabytes of memory each time)."""
 
     var searcher: Searcher
+    var compressor: Compressor
     var found: WalkSet
     var order: List[Int]
     var text_a: List[UInt8]
     var text_b: List[UInt8]
 
-    def __init__(out self):
+    def __init__(out self) raises:
         self.searcher = Searcher()
+        self.compressor = Compressor()
         self.found = WalkSet()
         self.order = List[Int]()
         self.text_a = List[UInt8]()
@@ -1128,6 +1140,8 @@ struct _TraverseTask(ParallelTask):
             self.found[unsafe_offset=i] = t
 
 
+comptime LOOKAHEAD = 8
+"""Batches after the one a step builds whose records fill the step's end."""
 comptime HEAVY_SPAN = 50_000
 comptime HEAVY_NODES = 2_000
 """Snarls spanning at least HEAVY_SPAN reference bases, or HEAVY_NODES node ids (a graph's ids run along it, so the
@@ -1470,6 +1484,14 @@ struct _StepTask(ParallelTask):
     var chrom: ImmPointer[String, ImmUntrackedOrigin]
     var level: Int
     var threads: Int
+    var fill_batch: ImmPointer[Int, ImmUntrackedOrigin]
+    var fill: ImmPointer[Int, ImmUntrackedOrigin]
+    """Records of the next batches to build while a step's last jobs finish: each one's batch (its address) and
+    index there."""
+    var fill_count: Int
+    var fill_next: MutPointer[Atomic[Int64], MutUntrackedOrigin]
+    var left: MutPointer[Atomic[Int64], MutUntrackedOrigin]
+    """The step's jobs not finished."""
 
     def __init__(
         out self,
@@ -1485,7 +1507,17 @@ struct _StepTask(ParallelTask):
         chrom: ImmPointer[String, ImmUntrackedOrigin],
         level: Int,
         threads: Int,
+        fill_batch: ImmPointer[Int, ImmUntrackedOrigin],
+        fill: ImmPointer[Int, ImmUntrackedOrigin],
+        fill_count: Int,
+        fill_next: MutPointer[Atomic[Int64], MutUntrackedOrigin],
+        left: MutPointer[Atomic[Int64], MutUntrackedOrigin],
     ):
+        self.fill_batch = fill_batch
+        self.fill = fill
+        self.fill_count = fill_count
+        self.fill_next = fill_next
+        self.left = left
         self.sh = sh^
         self.jobs = jobs
         self.count = count
@@ -1504,9 +1536,25 @@ struct _StepTask(ParallelTask):
         while True:
             var i = Int(self.next[].fetch_add(1))
             if i >= self.count:
-                return
+                break
             try:
                 self._job(b, self.jobs[unsafe_offset=i])
+            except:
+                self.sh.bad[] = 1
+            _ = self.left[].fetch_sub(1)
+        # Every job is taken: while the last ones run, records of the next batch (the cheapest first).
+        while self.left[].load() > 0:
+            var f = Int(self.fill_next[].fetch_add(1))
+            if f >= self.fill_count:
+                break
+            ref batch = MutPointer[_Batch, MutUntrackedOrigin](unsafe_from_address=self.fill_batch[unsafe_offset=f])[]
+            var k = self.fill[unsafe_offset=f]
+            var rt = self.sh.refs[unsafe_offset=batch.lo + k]
+            try:
+                b.build(
+                    self.sh.graph[], self.sh.reference[], self.sh.snarls[unsafe_offset=rt.snarl], rt.t, batch.records[k]
+                )
+                batch.records[k].built = True
             except:
                 self.sh.bad[] = 1
 
@@ -1548,7 +1596,7 @@ struct _StepTask(ParallelTask):
                 if Int(sink.at) - start != it.length:
                     raise Error("a record's line is not the length it was measured")
             if u[].sealed and not u[].done:
-                u[].compress(self.level, self.threads)
+                u[].compress(b.compressor, self.level, self.threads)
 
 
 struct _Phases:
@@ -1697,6 +1745,8 @@ struct ContigPlan(Movable):
     """Batch b is refs[bounds[b] ..< bounds[b + 1]]."""
     var heavy: List[_Heavy]
     var heavy_of: List[Int]
+    var widths: List[Int]
+    """Per reference traversal, the node ids between its snarl's boundaries."""
     var region: Optional[Tuple[Int, Int]]
     var helper_builders: List[Builder]
     var counters: Allocation[Atomic[Int64]]
@@ -1811,11 +1861,13 @@ struct ContigPlan(Movable):
 
         # Heavy snarls, in position order, and the helpers that search them ahead.
         self.heavy_of = List[Int](length=len(self.refs), fill=-1)
+        self.widths = List[Int](capacity=len(self.refs))
         for k in range(len(self.refs)):
             var t = self.refs[k].t
             var sn = self.snarls[self.refs[k].snarl]
             var span = abs(r.pos[t.s0] - r.pos[t.e0])
             var nodes = abs(Int(sn.end >> 1) - Int(sn.start >> 1))
+            self.widths.append(nodes)
             if span >= HEAVY_SPAN or nodes >= HEAVY_NODES:
                 var first = graph.parts.search_state(Int(sn.start >> 1), sn.start & 1 == 1)
                 var haplotypes = first.value().count() if first else 0
@@ -1907,9 +1959,10 @@ def _giants_done(mut giants: List[OwnedPointer[_GiantOut]], mut w: Writer):
 def run_steps(graph: Graph, var plan: ContigPlan, out_prefix: String, level: Int, threads: Int) raises -> ContigTail:
     """A prepared catalog's records built, placed, written and compressed, in steps: a step's tasks build one batch's
     records and, at the same time, write the previous batch's lines into their blocks and compress the sealed ones;
-    between steps the batch just built is placed (one thread) and the blocks done are written, in order. Heavy
-    snarls' parts no helper has taken are searched in the step that needs them; giant records are compressed on
-    threads of their own."""
+    between steps the batch just built is placed (one thread) and the blocks done are written, in order. Once every
+    task of a step is taken, the threads build records of the next LOOKAHEAD batches until its last tasks finish, so
+    no step waits idle on one long task. Heavy snarls' parts no helper has taken are searched in the step that needs
+    them; giant records are compressed on threads of their own."""
     plan.timing.lap(8)
     var sh = plan.shared(graph)
     var batches = len(plan.bounds) - 1
@@ -1923,20 +1976,27 @@ def run_steps(graph: Graph, var plan: ContigPlan, out_prefix: String, level: Int
     var giants = List[OwnedPointer[_GiantOut]]()
     var giant_threads = List[Background[_GiantTask]]()
     var records_written = 0
-    var prev = _Batch(0, 0)
+    # The batch built, the one before it (its lines written), and up to LOOKAHEAD after it, whose records fill the
+    # steps' ends.
+    var prev = OwnedPointer(_Batch(0, 0))
+    var cur = OwnedPointer(_Batch(plan.bounds[0], plan.bounds[1]) if batches > 0 else _Batch(0, 0))
+    var futures = List[OwnedPointer[_Batch]]()
+    var made = min(batches, 1)
     for step in range(batches + 1):
-        var cur = _Batch(plan.bounds[step], plan.bounds[step + 1]) if step < batches else _Batch(0, 0)
+        while len(futures) < LOOKAHEAD and made < batches:
+            futures.append(OwnedPointer(_Batch(plan.bounds[made], plan.bounds[made + 1])))
+            made += 1
         if step == batches:
             w.seal()
         # The jobs: heavy snarls' parts no helper has taken first, then units, the other records, and last the heavy
         # snarls' records awaited (a helper may still be searching a part).
         var jobs = List[_Job]()
         var unit_lines = List[List[Int]](length=len(w.units), fill=List[Int]())
-        for k in range(len(prev.items)):
-            var it = prev.items[k]
+        for k in range(len(prev[].items)):
+            var it = prev[].items[k]
             if it.offset >= 0:
                 unit_lines[it.unit - w.base].append(k)
-        for k in range(cur.lo, cur.hi):
+        for k in range(cur[].lo, cur[].hi):
             var h = plan.heavy_of[k]
             if h >= 0:
                 var taken = Int(plan.heavy[h].state_ptr[unsafe_offset=_TAKEN].load())
@@ -1946,32 +2006,70 @@ def run_steps(graph: Graph, var plan: ContigPlan, out_prefix: String, level: Int
             ref unit = w.units[u]
             if not unit.giant and (len(unit_lines[u]) > 0 or (unit.sealed and not unit.done)):
                 jobs.append(_Job(_UNIT, w.base + u))
-        for k in range(cur.lo, cur.hi):
-            if plan.heavy_of[k] < 0:
-                jobs.append(_Job(_BUILD, k - cur.lo))
-        for k in range(cur.lo, cur.hi):
+        # Records widest first (the node ids between a snarl's boundaries, as the heavy rule counts them): the
+        # costly ones start early and the step ends on cheap ones.
+        var first_build = len(jobs)
+        for k in range(cur[].lo, cur[].hi):
+            if plan.heavy_of[k] < 0 and not cur[].records[k - cur[].lo].built:
+                jobs.append(_Job(_BUILD, k - cur[].lo))
+        var widths = imm_untracked(plan.widths.unsafe_ptr().unsafe_offset(cur[].lo))
+
+        def wider_job(a: _Job, b: _Job) {widths} -> Bool:
+            var wa = widths[unsafe_offset=a.a]
+            var wb = widths[unsafe_offset=b.a]
+            return wa > wb or (wa == wb and a.a < b.a)
+
+        sort(Span(jobs)[first_build:], wider_job)
+        for k in range(cur[].lo, cur[].hi):
             if plan.heavy_of[k] >= 0:
                 jobs.append(_Job(_HEAVY, plan.heavy_of[k]))
+        # The next batches' other records not built, batch by batch, each's cheapest first, to fill the step's end.
+        var fill = List[Int]()
+        var fill_batch = List[Int]()
+        for f in range(len(futures)):
+            var address = Int(futures[f].ptr())
+            ref fb = futures[f][]
+            var first = len(fill)
+            for k in range(fb.lo, fb.hi):
+                if plan.heavy_of[k] < 0 and not fb.records[k - fb.lo].built:
+                    fill.append(k - fb.lo)
+                    fill_batch.append(address)
+            var fb_widths = imm_untracked(plan.widths.unsafe_ptr().unsafe_offset(fb.lo))
+
+            def narrower(a: Int, b: Int) {fb_widths} -> Bool:
+                var wa = fb_widths[unsafe_offset=a]
+                var wb = fb_widths[unsafe_offset=b]
+                return wa < wb or (wa == wb and a < b)
+
+            sort(Span(fill)[first:], narrower)
+        var fill_next = Atomic[Int64](0)
+        var left = Atomic[Int64](Int64(len(jobs)))
         var next = Atomic[Int64](0)
         var task = _StepTask(
             _Shared(sh.graph, sh.reference, sh.snarls, sh.refs, sh.heavy, sh.bad),
             imm_untracked(jobs.unsafe_ptr()),
             len(jobs),
             mut_untracked(Pointer(to=next)),
-            mut_untracked(Pointer(to=cur)),
-            imm_untracked(Pointer(to=prev)),
+            mut_untracked(cur.ptr()),
+            imm_untracked(prev.ptr()),
             imm_untracked(unit_lines.unsafe_ptr()),
             mut_untracked(Pointer(to=w)),
             mut_untracked(builders.unsafe_ptr()),
             imm_untracked(Pointer(to=chrom)),
             level,
             threads,
+            imm_untracked(fill_batch.unsafe_ptr()),
+            imm_untracked(fill.unsafe_ptr()),
+            len(fill),
+            mut_untracked(Pointer(to=fill_next)),
+            mut_untracked(Pointer(to=left)),
         )
         plan.timing.lap(4)
         parallel_for(task, min(threads, len(jobs)), threads)
         plan.timing.lap(5)
         # The tasks reach these through untracked pointers: reads after them keep them alive until they are done.
-        _ = len(jobs) + len(unit_lines) + len(builders) + Int(next.load()) + len(prev.items) + chrom.byte_length()
+        _ = len(jobs) + len(unit_lines) + len(builders) + Int(next.load()) + len(prev[].items) + chrom.byte_length()
+        _ = len(fill) + len(fill_batch) + Int(fill_next.load()) + Int(left.load()) + len(futures)
         if plan.bad[0] != 0:
             plan.stop()
             raise Error(t"{chrom}: a record could not be built or written")
@@ -1979,18 +2077,18 @@ def run_steps(graph: Graph, var plan: ContigPlan, out_prefix: String, level: Int
         w.write_done()
         plan.timing.lap(6)
         if step < batches:
-            for k in range(cur.lo, cur.hi):
+            for k in range(cur[].lo, cur[].hi):
                 if plan.heavy_of[k] >= 0:
-                    swap(cur.records[k - cur.lo], plan.heavy[plan.heavy_of[k]].record)
-            records_written += _place(cur, emitted, plan.parent, plan.snarls, plan.refs, plan.region, chrom, w)
+                    swap(cur[].records[k - cur[].lo], plan.heavy[plan.heavy_of[k]].record)
+            records_written += _place(cur[], emitted, plan.parent, plan.snarls, plan.refs, plan.region, chrom, w)
             # Giant records leave the batch for threads of their own.
-            for ref it in cur.items:
+            for ref it in cur[].items:
                 if it.offset >= 0:
                     continue
                 giants.append(OwnedPointer(_GiantOut(it.unit)))
-                var ps = List[UInt8](Span(cur.ps_text)[it.ps_at : it.ps_at + it.ps_length])
+                var ps = List[UInt8](Span(cur[].ps_text)[it.ps_at : it.ps_at + it.ps_length])
                 var record = Record()
-                swap(record, cur.records[it.record])
+                swap(record, cur[].records[it.record])
                 giant_threads.append(
                     Background(
                         _GiantTask(
@@ -2011,6 +2109,7 @@ def run_steps(graph: Graph, var plan: ContigPlan, out_prefix: String, level: Int
                 if len(giant_threads[len(giant_threads) - 1].handles) == 0:
                     raise Error("cannot start a thread")
         prev = cur^
+        cur = futures.pop(0) if len(futures) > 0 else OwnedPointer(_Batch(0, 0))
         plan.timing.lap(4)
     return ContigTail(plan^, w^, giants^, giant_threads^, records_written)
 
