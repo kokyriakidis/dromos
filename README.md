@@ -4,8 +4,8 @@
 
 dromos reads [vg](https://github.com/vgteam/vg)'s graph alignments, GAM or GAF, and turns them into what downstream
 tools need, in one pass over the file, on every core. It reads the GBZ pangenome graph itself, through the
-[gbz](https://github.com/jltsiren/gbwt-rs) crate, and makes the rest of pgphase's inputs from it: the site catalogs
-and the graph files. It is written in [Mojo](https://www.modular.com/mojo) and is the indexing engine behind
+[gbz](https://github.com/jltsiren/gbwt-rs) crate, makes the rest of pgphase's inputs from it (the site catalogs),
+and keeps what the other commands need of it in one cache file beside it. It is written in [Mojo](https://www.modular.com/mojo) and is the indexing engine behind
 [pgphase](https://github.com/kokyriakidis/pgphase) (`pgphase index`).
 
 | Command | What it writes |
@@ -15,8 +15,7 @@ and the graph files. It is written in [Mojo](https://www.modular.com/mojo) and i
 | `dromos surject` | the alignments on one reference contig as SAM: the records `pgcatalog surject` writes |
 | `dromos catalog` | a GBZ graph's site catalogs, one per reference contig: the `.pgsites` files `pgcatalog build` writes |
 | `dromos view` | a catalog as VCF, whole or a region of it, as `pgcatalog view` prints it |
-| `dromos ref-map` | a GBZ graph's reference map, where each node lies on the reference: `pgcatalog ref-map`'s file |
-| `dromos node-table` | a GBZ graph's node lengths and letters, the file `pgcatalog node-table` writes |
+| `dromos prepare` | a GBZ graph's cache, made ahead of the commands that read it |
 | `dromos reference-samples` | the reference samples a GBZ graph declares |
 
 ## Speed
@@ -77,29 +76,32 @@ It is built and tested on Linux x86-64.
 
 ## Usage
 
-### Graph files
+### The graph and its cache
 
-`index` places alignments by the graph's reference map, and `gam-to-gaf` and `surject` read its node table. dromos
-makes both from the GBZ, so a command may be given the graph in their place:
-
-```sh
-dromos index --reference-sample CHM13 graph.gbz reads.gam reads.coord.gaf.gz
-dromos gam-to-gaf graph.gbz reads.gam > reads.gaf
-```
-
-The first run makes the file and keeps it beside the graph, `graph.gbz.CHM13.refmap` or `graph.gbz.nodes`; later runs
-read it, and a graph newer than the file has it made again. When the graph's folder is not writable, `index` keeps the
-map beside its output; the other commands ask for the file. `--reference-sample` names the reference, needed when the
-graph declares more than one (HPRC graphs declare CHM13 and GRCh38; `dromos reference-samples graph.gbz` lists them).
-The files can also be made on their own:
+`index`, `gam-to-gaf` and `surject` take the GBZ graph (`--graph`) and read what they need of it from its cache:
+one file, `graph.gbz.dromos`, made the first time a command needs it and kept beside the graph. It holds the node
+lengths and letters (4 bits a letter) and, for every reference sample the graph declares (CHM13 and GRCh38 in HPRC
+graphs), where each node lies on the sample's paths. Commands map it into memory and read only the parts they use.
 
 ```sh
-dromos ref-map --graph graph.gbz --reference-sample CHM13 --out graph.refmap
-dromos node-table --graph graph.gbz --out graph.nodes        # --no-letters: lengths alone, for gam-to-gaf --slim
+dromos prepare --graph graph.gbz                       # made now, for a graph folder others will only read
+dromos index --graph graph.gbz --reference-sample CHM13 reads.gam reads.coord.gaf.gz
+dromos gam-to-gaf --graph graph.gbz --cache /scratch/graph.dromos reads.gam > reads.gaf
 ```
 
-On the HPRC graph a reference map takes 7 s and a node table 6 s, in under 8 GB of memory; pgcatalog takes 42 s and
-32 s, in 14 GB and 10 GB.
+- **Kept current.** The cache records the graph it was made from (its size, time and a hash of its first and last
+  4 MB). A graph that has changed, a cache cut short or damaged, or one of another dromos version is made again in
+  its place. A file there that is not a dromos cache, or another graph's cache, is refused, not written over.
+- **Where.** Beside the graph, or wherever `--cache FILE` says (on every command that reads it). It is written under
+  a temporary name in the same folder and renamed, so two runs making it at once both finish with a whole one. When
+  the folder cannot be written, the command stops and says so: give `--cache`, or have the cache made there once
+  with `dromos prepare`.
+- **Reference samples.** `--reference-sample` names the reference, needed when the graph declares more than one
+  (`dromos reference-samples graph.gbz` lists them). For a graph that declares none, the sample given is added to
+  the cache.
+
+On the HPRC graph the cache takes 8 s and 6.0 GB (both reference samples), in 9 GB of memory; the files it replaces,
+a reference map per sample and a node table, took 7 s each and 3.3 GB, 3.2 GB and 6.4 GB.
 
 ### `dromos catalog` and `dromos view`
 
@@ -126,10 +128,9 @@ dromos view graph.catalog/chr20.pgsites chr20:10,000,000-12,000,000 | bgzip > si
 ### `dromos index`
 
 ```sh
-dromos index graph.refmap reads.gam reads.coord.gaf.gz       # writes reads.coord.gaf.gz and its .tbi
-dromos index --reference-sample CHM13 graph.gbz reads.gam reads.coord.gaf.gz    # the graph itself
-dromos index graph.refmap reads.gaf.gz reads.coord.gaf.gz    # a GAF: plain, gzip or bgzip
-vg giraffe ... -o gaf | dromos index graph.refmap - reads.coord.gaf.gz    # straight from the aligner
+dromos index --graph graph.gbz --reference-sample CHM13 reads.gam reads.coord.gaf.gz    # and its .tbi
+dromos index --graph graph.gbz --reference-sample CHM13 reads.gaf.gz reads.coord.gaf.gz # a GAF: plain, gzip or bgzip
+vg giraffe ... -o gaf | dromos index --graph graph.gbz --reference-sample CHM13 - reads.coord.gaf.gz
 ```
 
 - **Any input.** A GAM, or a GAF that is plain, gzip or bgzip, told apart by its first bytes; `--gam` or `--gaf`
@@ -141,22 +142,20 @@ vg giraffe ... -o gaf | dromos index graph.refmap - reads.coord.gaf.gz    # stra
   alignment on each contig. Unmapped alignments, and those with no unique place on the reference, are left out and
   counted by reason.
 - **Options.** `-t THREADS` (all cores); `-l LEVEL`, the BGZF level, 0 to 12. The default, 1, writes about three
-  times as fast as 6, into a file 40% larger. `--reference-sample NAME`: for a graph, whose reference map to make;
-  for a map, checked against its sample.
+  times as fast as 6, into a file 40% larger. `--reference-sample NAME`, the reference; `--cache FILE`.
 
 ### `dromos gam-to-gaf`
 
 ```sh
-dromos gam-to-gaf graph.nodes reads.gam > reads.gaf     # the lines vg convert -G writes
-dromos gam-to-gaf --slim graph.nodes reads.gam          # their 12 columns alone
+dromos gam-to-gaf --graph graph.gbz reads.gam > reads.gaf     # the lines vg convert -G writes
+dromos gam-to-gaf --slim --graph graph.gbz reads.gam          # their 12 columns alone
 ```
 
 ### `dromos surject`
 
 ```sh
-dromos surject --contig chr20 graph.refmap graph.nodes reads.gam > chr20.sam
-dromos surject --contig chr20 --reference-sample CHM13 graph.gbz reads.gam > chr20.sam    # the graph for both
-dromos surject --contig chr20 --sam-contig chr20 graph.refmap graph.nodes reads.gaf.gz \
+dromos surject --graph graph.gbz --reference-sample CHM13 --contig chr20 reads.gam > chr20.sam
+dromos surject --graph graph.gbz --reference-sample CHM13 --contig chr20 --sam-contig chr20 reads.gaf.gz \
   | samtools sort -o chr20.bam && samtools index chr20.bam
 ```
 
@@ -171,8 +170,8 @@ dromos surject --contig chr20 --sam-contig chr20 graph.refmap graph.nodes reads.
   output keeps no `cs` and cannot be used.
 - **Options.** `--contig NAME` (required); `--sam-contig NAME`, the contig's name in the SAM (`<sample>#0#<contig>`);
   `--graph-placement`, read bases placed only where the graph puts them; `--catalog FILE`, the contig's catalog
-  (`.pgsites`): reads spanning one of its snarl windows aligned there as alleles; `--reference-sample NAME`, checked
-  against the reference map's; `-t THREADS`. The node table must have letters.
+  (`.pgsites`): reads spanning one of its snarl windows aligned there as alleles; `--reference-sample NAME`, the
+  reference; `--cache FILE`; `-t THREADS`.
 - **The header.** `@HD` and `@SQ` as pgcatalog writes them; the `@PG` line is dromos's own.
 
 `dromos COMMAND -h` lists each command's options. `DROMOS_TIMING=1` reports where the time goes.
@@ -186,10 +185,14 @@ dromos surject --contig chr20 --sam-contig chr20 graph.refmap graph.nodes reads.
 - **A GAM decoded only as far as needed.** A small protobuf reader frames GAM groups, resuming inside a group across
   chunks. For the index it sums each mapping's edits as it reads them. GAF lines follow libvgio's
   `alignment_to_gaf` line for line.
-- **No graph in memory.** The reference map and node table are memory-mapped, so their pages load as they are used.
-- **The graph read in parts.** The gbz crate reads the GBZ; dromos does the rest in Mojo. For a reference map or
-  node table it has the crate load the GBWT and the node letters' pieces at the same time, and unpacks letters by
-  node range on every core, where loading the whole graph unpacks them all on one thread first (most of its time).
+- **No graph in memory.** The graph's cache is memory-mapped, so its pages load as they are used, and a command
+  touches only its own parts: `index` the lengths and one sample's placements, `gam-to-gaf` the lengths and
+  letters.
+- **The graph read in parts, once.** The gbz crate reads the GBZ; dromos does the rest in Mojo. For the cache it has
+  the crate load the GBWT and the node letters' pieces at the same time; then the reference samples' paths are
+  walked on threads of their own while the nodes are found, measured and their letters unpacked and packed by range
+  on every core, and each path's placements are laid out by a task of its own. Every section is written through a
+  mapping of the file, by the threads that make it (buffered writes to one file take its lock in turn).
 - **Surjection in batches.** A read's alignment to the reference costs from nothing to a second. Each step's
   slices gather the reads that touch the contig, as GAF lines; a few hundred MB of them are then aligned by one
   worker a thread taking pieces in turn, so threads wait at the end of a batch, not of every chunk.
@@ -214,15 +217,16 @@ dromos is checked byte for byte against the tools it replaces, on HG002 HiFi ali
 - `surject` writes the same SAM records as `pgcatalog surject` (pgcatalog 0.2.0), from the GAM and from its GAF,
   with and without `--graph-placement` and `--catalog`: chr10 of the slice (487,571 records), and slices of the whole
   GAM on chr20 (48,706) and chr6 across the MHC (47,027).
-- `ref-map` and `node-table` write the same files as `pgcatalog ref-map` and `node-table`, byte for byte, on the HPRC
-  graph and a small one, for each reference sample; `reference-samples` prints the same lines.
+- `reference-samples` prints the lines `pgcatalog reference-samples` prints.
 - `catalog` writes the same `.pgsites` files as `pgcatalog build` (pgcatalog 0.2.0), byte for byte, from the same
   snarls: all 25 CHM13 contigs of the HPRC graph (43,494,146 records, 152 GB of VCF text, the largest record a 6.6 GB
   line on chr2), regions of them, and the small graph's catalogs pgphase's tests commit, whatever the threads; `view`
   prints what `pgcatalog view` prints.
 - `tests/integration/edges.sh` covers odd and damaged inputs: empty files, multi-member gzip, lines across chunk
   boundaries, any thread count, stdin, and truncated or corrupt files, which fail instead of leaving a partial
-  index.
+  index; and the graph's cache made, reused, made again (a changed graph, a cache cut short or damaged, another
+  version's), kept elsewhere, made by several runs at once, and refused (a read-only folder, a file that is not a
+  cache, another graph's cache).
 
 ```sh
 pixi run check ENV_FILE [--full]        # end-to-end checks; ENV_FILE names the data (see tests/integration/check.sh)
