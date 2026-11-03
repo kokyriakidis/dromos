@@ -73,7 +73,7 @@ machine, writing to a hard disk:
 | dromos before | 260.6 s | 2,162 s | 24.8 GB | 25 files, 1.51 GB |
 | **`dromos catalog`** | **184.7 s** | 1,732 s | 19.2 GB | **one file, 487 MB** |
 | **`dromos catalog`**, snarls from the graph's `.dist` | **191.0 s** | 1,737 s | 27.5 GB ² | the same records |
-| `dromos catalog` with no snarls (`vg chunk` and `vg snarls` first) | VGPATH | | | |
+| `dromos catalog` with no snarls: `vg chunk` (13.0 min), `vg snarls` (11.0 min), then the build | 27 min 5 s | 8,624 s | 22.6 GB ³ | the same records |
 
 The contigs are built three at a time, the biggest first, on one pool of workers, busy 98% of the build. On a busy
 machine (two of the ten cores taken by other work) the same build takes 239 s, the previous one 322 s. The catalog's
@@ -81,6 +81,7 @@ view of every contig is pgcatalog view's text of pgcatalog's catalogs, and the c
 the same text as the one from vg snarls.
 
 ² The distance index (8.5 GB) is mapped and read as needed; its pages count in the peak.
+³ dromos's own; vg's processes come and go beside it, up to six `vg snarls` at a time within the memory available.
 
 A region query (`dromos view CATALOG chr20:START-END`, a process each) opens the catalog and reads its contig's
 index in 10 ms; 100 kb of chr6 takes 24 ms against `pgcatalog view`'s 41 ms. Regions whose records make tens of MB
