@@ -14,6 +14,8 @@ allele, at ASM_COSTS.
 """
 
 from std.ffi import external_call
+from std.math import iota
+from std.sys.info import simd_width_of
 
 comptime M = UInt8(ord("M"))
 comptime I = UInt8(ord("I"))
@@ -34,6 +36,8 @@ comptime END_MATCHES = 0.9
 """The share of a read end's bases its alignment must match to be kept rather than clipped."""
 comptime INF = 536870911
 """i32::MAX / 4, as pgcatalog's band starts every cell."""
+comptime _V = simd_width_of[DType.int32]()
+"""Cells of a row `Banded.fill` takes at once."""
 
 
 @fieldwise_init
@@ -125,7 +129,172 @@ struct Banded(Movable):
         self.last = List[Int32]()
 
     def fill(mut self, q: Span[UInt8, _], r: Span[UInt8, _], half: Int, c: Costs) -> Bool:
-        """Fills the band; false (nothing filled) past MAX_CELLS cells."""
+        """Fills the band; false (nothing filled) past MAX_CELLS cells. The same scores and traceback bytes as
+        `fill_reference`, a row in vectors: the insertion (F) and diagonal scores come from the row before, and the
+        deletion scores (E), which run along the row, from a running minimum: E[j] = min(H[j-1] + open, E[j-1] +
+        extend) = min(A[j-1] + open, E[j-1] + extend) with A = min(diagonal, F), since H = min(A, E) and opening
+        costs at least as much as extending; so E[j] = min over k < j of A[k] + open + (j-1-k) extend (and the row's
+        E before its first cell, INF), the same integers."""
+        var n = len(q)
+        var m = len(r)
+        var w = 2 * half + 1
+        if (n + 1) * w > MAX_CELLS:
+            return False
+        self.half = half
+        self.w = w
+        self.tb.clear()
+        self.tb.resize((n + 1) * w, 0)
+        # H and F two rows at a time (row i at (i & 1) * w), with room for a vector read past the band's end.
+        var hs = List[Int32](length=2 * w + _V, fill=Int32(INF))
+        var fs = List[Int32](length=2 * w + _V, fill=Int32(INF))
+        var es = List[Int32](length=w, fill=Int32(INF))
+        var qu = List[UInt8](capacity=n)
+        for x in q:
+            qu.append(upper(x))
+        var ru = List[UInt8](capacity=m)
+        for x in r:
+            ru.append(upper(x))
+        var rp = ru.unsafe_ptr()
+        var tb = self.tb.unsafe_ptr()
+        var e_row = es.unsafe_ptr()
+        var mismatch = Int32(c.mismatch)
+        var extend = Int32(c.extend)
+        var open_cost = Int32(c.open + c.extend)
+        # Row 0: (0, 0) scores 0; the cells after it are a deletion from it.
+        var h0 = hs.unsafe_ptr()
+        var f0 = fs.unsafe_ptr()
+        h0[unsafe_offset=half] = 0
+        e_row[unsafe_offset=half] = Int32(INF)
+        f0[unsafe_offset=half] = Int32(INF)
+        for j in range(1, min(half, m) + 1):
+            var d = j + half
+            var opened = h0[unsafe_offset=d - 1] + open_cost
+            var extended = e_row[unsafe_offset=d - 1] + extend
+            var e = min(opened, extended)
+            var bits = UInt8(4) if opened <= extended else UInt8(0)
+            var h: Int32
+            if Int32(INF) <= e:
+                h = Int32(INF)
+            else:
+                bits |= 1
+                h = e
+            h0[unsafe_offset=d] = h
+            e_row[unsafe_offset=d] = e
+            f0[unsafe_offset=d] = Int32(INF)
+            tb[unsafe_offset=d] = bits
+        var lane = iota[DType.int32, _V]()
+        comptime Vi = SIMD[DType.int32, _V]
+        comptime Vb = SIMD[DType.uint8, _V]
+        var inf_v = Vi(INF)
+        var big_v = Vi(Int32.MAX)
+        var after_first = lane.ge(Int32(1))
+        for i in range(1, n + 1):
+            var h_cur = hs.unsafe_ptr().unsafe_offset((i & 1) * w)
+            var h_prev = hs.unsafe_ptr().unsafe_offset(((i + 1) & 1) * w)
+            var f_cur = fs.unsafe_ptr().unsafe_offset((i & 1) * w)
+            var f_prev = fs.unsafe_ptr().unsafe_offset(((i + 1) & 1) * w)
+            var row = tb.unsafe_offset(i * w)
+            var lo = max(i - half, 0)
+            var hi = min(i + half, m)
+            if lo > hi:
+                # Past the reference's end (a free end's band): this row and the rest have no cells.
+                break
+            var qi = qu[i - 1]
+            var d0 = lo + half - i
+            var count = hi - lo + 1
+            # The row's first cell has no left neighbour in the band (E is INF); from j = 0 no diagonal either.
+            var f = Int32(INF)
+            var bits = UInt8(0)
+            if d0 + 1 < w:
+                var opened = h_prev[unsafe_offset=d0 + 1] + open_cost
+                var extended = f_prev[unsafe_offset=d0 + 1] + extend
+                f = min(opened, extended)
+                bits = UInt8(8) if opened <= extended else UInt8(0)
+            var diag = Int32(INF)
+            if lo > 0:
+                diag = h_prev[unsafe_offset=d0] + (0 if qi == rp[unsafe_offset=lo - 1] else mismatch)
+            var e_left = Int32(INF)
+            var h_left: Int32
+            if diag <= e_left and diag <= f:
+                h_left = diag
+            elif e_left <= f:
+                bits |= 1
+                h_left = e_left
+            else:
+                bits |= 2
+                h_left = f
+            h_cur[unsafe_offset=d0] = h_left
+            f_cur[unsafe_offset=d0] = f
+            row[unsafe_offset=d0] = bits
+            # The minimum of A + open - t extend over the cells so far (and INF + extend before the first).
+            var carry = min(Int32(INF) + extend, min(diag, f) + open_cost)
+            var t = 1
+            while t + _V <= count:
+                var d = d0 + t
+                # F (none at the band's last offset, w - 1) and the diagonal, from the row before.
+                var opened_f = h_prev.unsafe_load[width=_V](d + 1) + open_cost
+                var extended_f = f_prev.unsafe_load[width=_V](d + 1) + extend
+                var has_f = (lane + Int32(d)).le(Int32(w - 2))
+                var f_v = has_f.select(min(opened_f, extended_f), inf_v)
+                var fb_v = (has_f & opened_f.le(extended_f)).select(Vb(8), Vb(0))
+                var same = rp.unsafe_load[width=_V](lo + t - 1).eq(qi)
+                var diag_v = h_prev.unsafe_load[width=_V](d) + same.select(Vi(0), Vi(mismatch))
+                # E: the running minimum of A + open - t extend before each cell, plus (t - 1) extend.
+                var c_v = min(diag_v, f_v) + open_cost - (lane + Int32(t)) * extend
+                comptime for p in range(6):
+                    comptime if (1 << p) < _V:
+                        c_v = min(c_v, lane.ge(Int32(1 << p)).select(c_v.shift_right[1 << p](), big_v))
+                var running = min(c_v, Vi(carry))
+                var e_v = after_first.select(running.shift_right[1](), Vi(carry)) + (lane + Int32(t - 1)) * extend
+                # H: the diagonal if no worse than E and F, else E if no worse than F, else F.
+                var take_diag = diag_v.le(e_v) & diag_v.le(f_v)
+                var take_e = e_v.le(f_v)
+                var h_v = take_diag.select(diag_v, take_e.select(e_v, f_v))
+                # A deletion opened here: H to the left plus open no worse than E to the left plus extend.
+                var h_before = after_first.select(h_v.shift_right[1](), Vi(h_left))
+                var e_before = after_first.select(e_v.shift_right[1](), Vi(e_left))
+                var e_bit = (h_before + open_cost).le(e_before + extend).select(Vb(4), Vb(0))
+                h_cur.unsafe_store(d, h_v)
+                f_cur.unsafe_store(d, f_v)
+                row.unsafe_store(d, fb_v | e_bit | take_diag.select(Vb(0), take_e.select(Vb(1), Vb(2))))
+                carry = running[_V - 1]
+                h_left = h_v[_V - 1]
+                e_left = e_v[_V - 1]
+                t += _V
+            # The rest, cell by cell.
+            for j in range(lo + t, hi + 1):
+                var d = j + half - i
+                var opened_e = h_left + open_cost
+                var extended_e = e_left + extend
+                var e = min(opened_e, extended_e)
+                bits = UInt8(4) if opened_e <= extended_e else UInt8(0)
+                f = Int32(INF)
+                if d <= w - 2:
+                    var opened_f = h_prev[unsafe_offset=d + 1] + open_cost
+                    var extended_f = f_prev[unsafe_offset=d + 1] + extend
+                    f = min(opened_f, extended_f)
+                    bits |= UInt8(8) if opened_f <= extended_f else UInt8(0)
+                diag = h_prev[unsafe_offset=d] + (0 if qi == rp[unsafe_offset=j - 1] else mismatch)
+                var h: Int32
+                if diag <= e and diag <= f:
+                    h = diag
+                elif e <= f:
+                    bits |= 1
+                    h = e
+                else:
+                    bits |= 2
+                    h = f
+                h_cur[unsafe_offset=d] = h
+                f_cur[unsafe_offset=d] = f
+                row[unsafe_offset=d] = bits
+                h_left = h
+                e_left = e
+        self.last = List[Int32](Span(hs)[(n & 1) * w : (n & 1) * w + w])
+        return True
+
+    def fill_reference(mut self, q: Span[UInt8, _], r: Span[UInt8, _], half: Int, c: Costs) -> Bool:
+        """`fill` cell by cell, as pgcatalog fills the band: the reference `fill` must agree with byte for byte (the
+        tests compare them)."""
         var n = len(q)
         var m = len(r)
         var w = 2 * half + 1
@@ -428,32 +597,83 @@ def clip_gap(n: Int) -> Int:
 def clip_lengths(score: List[Int]) -> Tuple[Int, Int]:
     """Read bases to clip at each end, from per-base scores (an indel's score on the base before it): the cut before
     a matching base with the lowest prefix score, and after one with the lowest suffix score, where that gains more
-    than CLIP_PENALTY."""
+    than CLIP_PENALTY. On ties the first such base from that end. A vector of scores at a time: their prefix sums, the
+    lowest among matching bases, and the first lane holding it when it is lower than any before."""
+    comptime W = simd_width_of[DType.int64]()
+    comptime Vl = SIMD[DType.int64, W]
     var n = len(score)
-    var p = score.unsafe_ptr()
-    var total = 0
-    var best = 0
+    var p = score.unsafe_ptr().unsafe_bitcast[Int64]()
+    var lane = iota[DType.int64, W]()
+    var big = Vl(Int64.MAX)
+    var match_v = Vl(CLIP_MATCH)
+    var total = Int64(0)
+    var best = Int64(0)
     var left = 0
-    for i in range(n):
-        var v = p[unsafe_offset=i]
+    var i = 0
+    while i + W <= n:
+        var v = p.unsafe_load[width=W](i)
+        var sums = _prefix_sums(v, lane)
+        var before = sums - v + total
+        var lowest = v.eq(match_v).select(before, big)
+        var low = lowest.reduce_min()
+        if low < best:
+            best = low
+            left = i + _first_lane(lowest, low)
+        total += sums[W - 1]
+        i += W
+    while i < n:
+        var v = Int64(p[unsafe_offset=i])
         if v == CLIP_MATCH and total < best:
             best = total
             left = i
         total += v
+        i += 1
     if -best <= CLIP_PENALTY:
         left = 0
+    # From the end down to `left`, a vector of the scores reversed at a time.
     total = 0
     best = 0
     var right = n
-    for i in range(n - 1, left - 1, -1):
-        var v = p[unsafe_offset=i]
+    var hi = n
+    while hi - W >= left:
+        var v = p.unsafe_load[width=W](hi - W).reversed()
+        var sums = _prefix_sums(v, lane)
+        var before = sums - v + total
+        var lowest = v.eq(match_v).select(before, big)
+        var low = lowest.reduce_min()
+        if low < best:
+            best = low
+            right = hi - _first_lane(lowest, low)
+        total += sums[W - 1]
+        hi -= W
+    for k in range(hi - 1, left - 1, -1):
+        var v = Int64(p[unsafe_offset=k])
         if v == CLIP_MATCH and total < best:
             best = total
-            right = i + 1
+            right = k + 1
         total += v
     if -best <= CLIP_PENALTY:
         right = n
     return (left, n - right)
+
+
+@always_inline
+def _prefix_sums[W: Int](v: SIMD[DType.int64, W], lane: SIMD[DType.int64, W]) -> SIMD[DType.int64, W]:
+    """Each lane's sum with the lanes before it."""
+    var sums = v
+    comptime for k in range(7):
+        comptime if (1 << k) < W:
+            sums += lane.ge(Int64(1 << k)).select(sums.shift_right[1 << k](), SIMD[DType.int64, W](0))
+    return sums
+
+
+@always_inline
+def _first_lane[W: Int](v: SIMD[DType.int64, W], x: Int64) -> Int:
+    """The first lane of `v` holding `x` (one does)."""
+    for k in range(W):
+        if v[k] == x:
+            return k
+    return W
 
 
 def _remerge(runs: List[CigarOp]) -> List[CigarOp]:
