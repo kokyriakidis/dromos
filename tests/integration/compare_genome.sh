@@ -30,7 +30,7 @@ for c in "${contigs[@]}"; do
   "$dromos" snarls --vg-file "$dir/$c.snarls" -o "$out/$c.vg.tsv" -t 4
   # The components whose span of node ids overlaps that of vg's start nodes.
   comps=$(awk -F'\t' 'NR==FNR {lo[$1]=$2; hi[$1]=$3; next} {n=int($2/2); if (FNR==1 || n<a) a=n; if (FNR==1 || n>b) b=n}
-      END {for (k in lo) if (lo[k]<=b && a<=hi[k]) print k}' "$out/comp/ranges" "$out/$c.vg.tsv" | sort -n | tr '\n' ' ')
+      END {for (k in lo) if (lo[k]<=b && a<=hi[k]) print k}' "$out/comp/ranges" "$out/$c.vg.tsv" | sort -n | paste -sd' ')
   : > "$out/$c.mine.tsv"
   for k in $comps; do cat "$out/comp/$k.tsv" >> "$out/$c.mine.tsv"; done
   python3 -I "$here/compare.py" "$out/$c.vg.tsv" "$out/$c.mine.tsv" > "$out/$c.cmp"
