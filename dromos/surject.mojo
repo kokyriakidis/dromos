@@ -16,10 +16,12 @@ over from its slim decode."""
 from std.atomic import Atomic
 from std.ffi import external_call
 from std.memory import Allocation, Layout, alloc, dealloc
+from std.os.path import dirname
 from std.sys import stderr
+from std.time import perf_counter_ns
 
-from dromos.bam import RecordWriter
-from dromos.bam_sort import BamStaging
+from dromos.bam import BamIndex, RecordWriter, bam_header, needs_csi
+from dromos.bam_sort import BamStaging, write_bam
 from dromos.contig import Contig, Reference
 from dromos.gaf_text import parse_unsigned
 from dromos.gam import Alignment, gaf_line, put_bytes, put_int, put_text
@@ -36,10 +38,14 @@ from dromos.linearize import (
     linearize,
     upper,
 )
+from dromos.graph import fingerprint, resolve_reference_sample
 from dromos.nodes import NodeTable, comp
-from dromos.output import write_all
+from dromos.output import OutFile, write_all
 from dromos.parallel import Background, ParallelTask, parallel_for
-from dromos.stream import MessageSink, imm_untracked, mut_untracked
+from dromos.prepare import graph_cache
+from dromos.refmap import RefMap
+from dromos.sites import Sites, load_all_windows
+from dromos.stream import MessageSink, imm_untracked, mut_untracked, stream_input
 
 
 @fieldwise_init
@@ -877,3 +883,167 @@ struct SurjectSink[bam: Bool](MessageSink, Movable):
             ),
             file=stderr,
         )
+
+
+struct SurjectOptions(Movable):
+    """What `dromos surject` is asked for (the command's options; cli/dromos_cli.mojo parses them)."""
+
+    var graph: String
+    var input: String
+    """A GAM or GAF (any encoding); /dev/stdin for standard input."""
+    var kind: Int
+    """stream.mojo's AUTO, GAF or GAM."""
+    var contigs: List[String]
+    """The contigs surjected to (every contig of the reference sample when empty)."""
+    var reference_sample: Optional[String]
+    var cache: Optional[String]
+    var sam_contig: Optional[String]
+    var short_names: Bool
+    var catalog: Optional[String]
+    var graph_placement: Bool
+    var out: Optional[String]
+    """A sorted, indexed BAM; SAM on stdout when none."""
+    var level: Int
+    var memory: Int
+    var tmp_dir: Optional[String]
+    var csi: Bool
+    var threads: Int
+
+    def __init__(out self):
+        self.graph = String()
+        self.input = String()
+        self.kind = 0
+        self.contigs = List[String]()
+        self.reference_sample = None
+        self.cache = None
+        self.sam_contig = None
+        self.short_names = False
+        self.catalog = None
+        self.graph_placement = False
+        self.out = None
+        self.level = 4
+        self.memory = 8 << 30
+        self.tmp_dir = None
+        self.csi = False
+        self.threads = 1
+
+
+def check_same_graph(sites: Sites, graph: String) raises:
+    """Refuses a catalog built from another graph than `graph` (their fingerprints differ)."""
+    var want = sites.prop("graph.fingerprint")
+    var have = fingerprint(graph)
+    if not want or want.value() != have:
+        var built = sites.prop("graph.file").or_else(String("?"))
+        raise Error(
+            t"{sites.path} was built from another graph ({built}, {want.or_else(String('no fingerprint'))}); {graph}"
+            t" is {have}"
+        )
+
+
+def _writable(path: String) raises:
+    """Makes and removes `path`: an error now if it cannot be written."""
+    _ = OutFile(path)
+    var c = List[UInt8](path.as_bytes())
+    c.append(0)
+    _ = external_call["unlink", Int32](c.unsafe_ptr())
+
+
+def run_surject(o: SurjectOptions) raises:
+    """`dromos surject`: the input's alignments on the reference contigs, as SAM on stdout or a sorted, indexed BAM."""
+    var threads = o.threads
+    var sample = resolve_reference_sample(o.graph, o.reference_sample)
+    var cache = graph_cache(o.graph, o.cache, sample, threads)
+    var t0 = perf_counter_ns()
+    var map = RefMap(cache, sample)
+    var nodes = NodeTable(cache)
+    # The contigs, in reference order: those named, or all.
+    var names = List[String]()
+    for c in map.contigs:
+        var wanted = len(o.contigs) == 0
+        for a in o.contigs:
+            wanted = wanted or a == c
+        if wanted:
+            names.append(c)
+    for a in o.contigs:
+        var known = False
+        for c in map.contigs:
+            known = known or a == c
+        if not known:
+            raise Error(t"no reference path {sample}#0#{a} in the graph")
+    if len(names) == 0:
+        raise Error(t"no reference paths of {sample} in the graph")
+    if o.sam_contig and len(names) != 1:
+        raise Error("--sam-contig names one contig: give one --contig (or --sam-names for several)")
+    var reference = Reference(map, nodes, names, threads)
+    var sam_names = List[String]()
+    var lengths = List[Int]()
+    for k in range(len(names)):
+        if o.sam_contig:
+            sam_names.append(o.sam_contig.value())
+        elif o.short_names:
+            sam_names.append(names[k])
+        else:
+            sam_names.append(reference.contigs[k].chrom)
+        lengths.append(len(reference.contigs[k].seq))
+    var windows = List[List[Window]](length=len(names), fill=List[Window]())
+    if o.catalog:
+        var sites = Sites(o.catalog.value())
+        check_same_graph(sites, o.graph)
+        windows = load_all_windows(sites, names, reference, map, threads)
+        var count = 0
+        for w in windows:
+            count += len(w)
+        print(t"[dromos] surject: {count} snarl windows", file=stderr)
+    if len(names) == 1:
+        print(
+            (
+                t"[dromos] {reference.contigs[0].chrom}: {len(reference.contigs[0].seq)} bases"
+                t" ({Float64(perf_counter_ns() - t0) * 1e-9} s)"
+            ),
+            file=stderr,
+        )
+    else:
+        var bases = 0
+        for n in lengths:
+            bases += n
+        print(
+            t"[dromos] {len(names)} contigs of {sample}: {bases} bases ({Float64(perf_counter_ns() - t0) * 1e-9} s)",
+            file=stderr,
+        )
+    var what = names[0] if len(names) == 1 else String(t"{len(names)} contigs")
+    var surjector = Surjector(reference^, nodes^, sam_names.copy(), o.graph_placement, windows^)
+    if not o.out:
+        var header = String("@HD\tVN:1.6\tSO:unsorted\n")
+        for k in range(len(sam_names)):
+            header += String(t"@SQ\tSN:{sam_names[k]}\tLN:{lengths[k]}\n")
+        header += "@PG\tID:dromos-surject\tPN:dromos\tVN:0.1.0\n"
+        var sink = SurjectSink[False](surjector^, threads, header, BamStaging(0, 1, o.memory, "."))
+        try:
+            stream_input(o.input, threads, sink, o.kind)
+        except e:
+            sink.finish(threads, complete=False)
+            raise e^
+        sink.finish(threads, complete=True)
+        sink.report(what)
+        return
+    var out = o.out.value()
+    var folder = dirname(out)
+    var spill_dir = o.tmp_dir.value() if o.tmp_dir else (folder if folder else String("."))
+    # Where the BAM and the spills go is tried now, not after the input has been read.
+    _writable(out + ".tmp")
+    _writable(spill_dir + "/.dromos-spill." + String(external_call["getpid", Int32]()))
+    var text = String("@HD\tVN:1.6\tSO:coordinate\n")
+    for k in range(len(sam_names)):
+        text += String(t"@SQ\tSN:{sam_names[k]}\tLN:{lengths[k]}\n")
+    text += "@PG\tID:dromos-surject\tPN:dromos\tVN:0.1.0\n"
+    var header = bam_header(text, sam_names, lengths)
+    var staging = BamStaging(len(names), threads, o.memory, spill_dir)
+    var sink = SurjectSink[True](surjector^, threads, String(), staging^)
+    try:
+        stream_input(o.input, threads, sink, o.kind)
+    except e:
+        sink.finish(threads, complete=False)
+        raise e^
+    sink.finish(threads, complete=True)
+    sink.report(what)
+    write_bam(sink.staging, header, BamIndex(sam_names, lengths, o.csi or needs_csi(lengths)), out, o.level, threads)

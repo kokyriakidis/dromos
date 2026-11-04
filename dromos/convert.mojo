@@ -3,7 +3,8 @@
 from dromos.gam import Alignment, gaf_line, slim_line
 from dromos.nodes import NodeTable
 from dromos.output import write_all
-from dromos.stream import MessageSink, mut_untracked
+from dromos.prepare import graph_cache
+from dromos.stream import AUTO, MessageSink, mut_untracked, stream_input
 
 
 struct GafSink[tags: Bool](MessageSink, Movable):
@@ -78,3 +79,21 @@ struct GafSink[tags: Bool](MessageSink, Movable):
     def finish(mut self):
         """Writes what is left (also after an error, so the lines made so far are out)."""
         self._write_pending()
+
+
+def run_gam_to_gaf(graph: String, input: String, slim: Bool, cache_path: Optional[String], threads: Int) raises:
+    """`dromos gam-to-gaf`: the input's alignments as the GAF lines vg convert -G writes (`slim`: their 12 columns),
+    on stdout."""
+    var cache = graph_cache(graph, cache_path, None, threads)
+    if slim:
+        var sink = GafSink[False](NodeTable(cache, letters=False), threads)
+        try:
+            stream_input(input, threads, sink, AUTO)
+        finally:
+            sink.finish()
+    else:
+        var sink = GafSink[True](NodeTable(cache), threads)
+        try:
+            stream_input(input, threads, sink, AUTO)
+        finally:
+            sink.finish()

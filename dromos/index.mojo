@@ -17,10 +17,12 @@ from std.time import perf_counter_ns
 
 from dromos.gaf_text import MALFORMED, PLACED, SKIP, UNMAPPED, UNPLACED, append_slim, classify
 from dromos.gam import Alignment, slim_line
+from dromos.graph import resolve_reference_sample
+from dromos.prepare import graph_cache
 from dromos.refmap import NO_ANCHOR, Anchor, Placed, RefMap, reason_name
 from dromos.sort_write import write_sorted
 from dromos.staging import HEADER, Staging, put_record
-from dromos.stream import MessageSink, imm_untracked, mut_untracked
+from dromos.stream import MessageSink, imm_untracked, mut_untracked, stream_input
 
 # Why an alignment has no place, counted per slice: input lines, placed, unmapped, unplaced (then by reason, in
 # refmap.mojo's order) and malformed.
@@ -307,3 +309,30 @@ def _name_less(a: String, b: String) -> Bool:
         if x[i] != y[i]:
             return x[i] < y[i]
     return len(x) < len(y)
+
+
+def run_index(
+    graph: String,
+    input: String,
+    kind: Int,
+    out_path: String,
+    reference_sample: Optional[String],
+    cache_path: Optional[String],
+    level: Int,
+    threads: Int,
+) raises:
+    """`dromos index`: the input's alignments (`kind`: stream.mojo's AUTO, GAF or GAM) placed on the reference, sorted,
+    bgzipped and tabix-indexed into `out_path` and its .tbi."""
+    var sample = resolve_reference_sample(graph, reference_sample)
+    var cache = graph_cache(graph, cache_path, sample, threads)
+    var t0 = perf_counter_ns()
+    var sink = IndexSink(RefMap(cache, sample), threads)
+    print(
+        (
+            t"[dromos] the graph's cache: {len(sink.map.contigs)} contigs of {sample}"
+            t" ({Float64(perf_counter_ns() - t0) * 1e-9} s)"
+        ),
+        file=stderr,
+    )
+    stream_input(input, threads, sink, kind)
+    sink.finish(out_path, level, threads)

@@ -1,28 +1,20 @@
 """Dromos: pangenome graph alignments, fast. `dromos COMMAND -h` for each command's usage."""
 
-from std.ffi import external_call
-from std.os.path import dirname
 from std.sys import argv, exit, stderr
 from std.time import perf_counter_ns
 
 from dromos.build import BuildOptions, run_build
-from dromos.bam import BamIndex, bam_header, needs_csi
-from dromos.bam_sort import BamStaging, write_bam
-from dromos.contig import Reference
-from dromos.convert import GafSink
-from dromos.graph import fingerprint, reference_samples, resolve_reference_sample
-from dromos.index import IndexSink
-from dromos.linearize import Window
-from dromos.nodes import NodeTable
-from dromos.output import OutFile
+from dromos.convert import run_gam_to_gaf
+from dromos.graph import reference_samples
+from dromos.index import run_index
 from dromos.parallel import default_threads
 from dromos.prepare import graph_cache
-from dromos.sites import Sites, info, load_all_windows, view
+from dromos.sites import info, view
 from dromos.snarlfind import find_all_snarls, write_records_tsv, write_snarls_tsv
 from dromos.snarls import read_snarls
-from dromos.refmap import RefMap
-from dromos.stream import AUTO, GAF, GAM, stream_input
-from dromos.surject import SurjectSink, Surjector
+from dromos.stream import AUTO, GAF, GAM
+from dromos.surject import SurjectOptions, run_surject
+
 
 comptime OVERVIEW = """dromos: pangenome graph alignments, fast
 
@@ -317,19 +309,9 @@ def index_main() raises:
         _fail("--gaf or --gam, not both", "index")
     var graph = _graph(args, INDEX_USAGE)
     var pos = args.positional(2)
-    var sample = resolve_reference_sample(graph, sample_arg)
-    var cache = graph_cache(graph, cache_arg, sample, threads)
-    var t0 = perf_counter_ns()
-    var sink = IndexSink(RefMap(cache, sample), threads)
-    print(
-        (
-            t"[dromos] the graph's cache: {len(sink.map.contigs)} contigs of {sample}"
-            t" ({Float64(perf_counter_ns() - t0) * 1e-9} s)"
-        ),
-        file=stderr,
+    run_index(
+        graph, _input(pos[0]), GAF if gaf else (GAM if gam else AUTO), pos[1], sample_arg, cache_arg, level, threads
     )
-    stream_input(_input(pos[0]), threads, sink, GAF if gaf else (GAM if gam else AUTO))
-    sink.finish(pos[1], level, threads)
 
 
 def gam_to_gaf_main() raises:
@@ -342,19 +324,7 @@ def gam_to_gaf_main() raises:
     var cache_arg = args.value("--cache")
     var graph = _graph(args, GAM_TO_GAF_USAGE)
     var pos = args.positional(1)
-    var cache = graph_cache(graph, cache_arg, None, threads)
-    if slim:
-        var sink = GafSink[False](NodeTable(cache, letters=False), threads)
-        try:
-            stream_input(_input(pos[0]), threads, sink, AUTO)
-        finally:
-            sink.finish()
-    else:
-        var sink = GafSink[True](NodeTable(cache), threads)
-        try:
-            stream_input(_input(pos[0]), threads, sink, AUTO)
-        finally:
-            sink.finish()
+    run_gam_to_gaf(graph, _input(pos[0]), slim, cache_arg, threads)
 
 
 def _size(text: String, option: String, command: StaticString) -> Int:
@@ -370,159 +340,48 @@ def _size(text: String, option: String, command: StaticString) -> Int:
     return _number(digits, option, 1, Int.MAX // scale, command) * scale
 
 
-def _writable(path: String) raises:
-    """Makes and removes `path`: an error now if it cannot be written."""
-    _ = OutFile(path)
-    var c = List[UInt8](path.as_bytes())
-    c.append(0)
-    _ = external_call["unlink", Int32](c.unsafe_ptr())
-
-
-def _same_graph(sites: Sites, graph: String) raises:
-    """Refuses a catalog built from another graph than `graph` (their fingerprints differ)."""
-    var want = sites.prop("graph.fingerprint")
-    var have = fingerprint(graph)
-    if not want or want.value() != have:
-        var built = sites.prop("graph.file").or_else(String("?"))
-        raise Error(
-            t"{sites.path} was built from another graph ({built}, {want.or_else(String('no fingerprint'))}); {graph}"
-            t" is {have}"
-        )
-
-
 def surject_main() raises:
     var args = _Args("surject")
     if args.help():
         print(SURJECT_USAGE, end="")
         return
-    var threads = args.threads()
-    var contig_args = args.values("--contig")
-    var sample_arg = args.value("--reference-sample")
-    var sam_arg = args.value("--sam-contig")
+    var o = SurjectOptions()
+    o.threads = args.threads()
+    o.contigs = args.values("--contig")
+    o.reference_sample = args.value("--reference-sample")
+    o.sam_contig = args.value("--sam-contig")
     var names_arg = args.value("--sam-names")
-    var catalog_arg = args.value("--catalog")
-    var cache_arg = args.value("--cache")
-    var out_arg = args.value("-o")
+    o.catalog = args.value("--catalog")
+    o.cache = args.value("--cache")
+    o.out = args.value("-o")
     var level_arg = args.value("-l")
     var memory_arg = args.value("-m")
-    var tmp_arg = args.value("--tmp-dir")
-    var placement = args.flag("--graph-placement")
-    var csi = args.flag("--csi")
+    o.tmp_dir = args.value("--tmp-dir")
+    o.graph_placement = args.flag("--graph-placement")
+    o.csi = args.flag("--csi")
     var gaf = args.flag("--gaf")
     var gam = args.flag("--gam")
     if gaf and gam:
         _fail("--gaf or --gam, not both", "surject")
-    var short_names = False
+    o.kind = GAF if gaf else (GAM if gam else AUTO)
     if names_arg:
         if names_arg.value() == "short":
-            short_names = True
+            o.short_names = True
         elif names_arg.value() != "full":
             _fail(String(t"--sam-names is full or short, not {names_arg.value()}"), "surject")
-    var level = _number(level_arg.value(), "-l", 0, 12, "surject") if level_arg else 4
-    var memory = _size(memory_arg.value(), "-m", "surject") if memory_arg else 8 << 30
-    if not out_arg and (level_arg or memory_arg or tmp_arg or csi):
+    if level_arg:
+        o.level = _number(level_arg.value(), "-l", 0, 12, "surject")
+    if memory_arg:
+        o.memory = _size(memory_arg.value(), "-m", "surject")
+    if not o.out and (level_arg or memory_arg or o.tmp_dir or o.csi):
         _fail("-l, -m, --tmp-dir and --csi are for a BAM (-o)", "surject")
-    var graph = _graph(args, SURJECT_USAGE)
-    var pos = args.positional(1)
-    var sample = resolve_reference_sample(graph, sample_arg)
-    var cache = graph_cache(graph, cache_arg, sample, threads)
-    var t0 = perf_counter_ns()
-    var map = RefMap(cache, sample)
-    var nodes = NodeTable(cache)
-    # The contigs, in reference order: those named, or all.
-    var names = List[String]()
-    for c in map.contigs:
-        var wanted = len(contig_args) == 0
-        for a in contig_args:
-            wanted = wanted or a == c
-        if wanted:
-            names.append(c)
-    for a in contig_args:
-        var known = False
-        for c in map.contigs:
-            known = known or a == c
-        if not known:
-            raise Error(t"no reference path {sample}#0#{a} in the graph")
-    if len(names) == 0:
-        raise Error(t"no reference paths of {sample} in the graph")
-    if sam_arg and len(names) != 1:
+    o.graph = _graph(args, SURJECT_USAGE)
+    o.input = _input(args.positional(1)[0])
+    if o.sam_contig and len(o.contigs) > 1:
         _fail("--sam-contig names one contig: give one --contig (or --sam-names for several)", "surject")
-    if sam_arg and names_arg:
+    if o.sam_contig and names_arg:
         _fail("--sam-contig or --sam-names, not both", "surject")
-    var reference = Reference(map, nodes, names, threads)
-    var sam_names = List[String]()
-    var lengths = List[Int]()
-    for k in range(len(names)):
-        if sam_arg:
-            sam_names.append(sam_arg.value())
-        elif short_names:
-            sam_names.append(names[k])
-        else:
-            sam_names.append(reference.contigs[k].chrom)
-        lengths.append(len(reference.contigs[k].seq))
-    var windows = List[List[Window]](length=len(names), fill=List[Window]())
-    if catalog_arg:
-        var sites = Sites(catalog_arg.value())
-        _same_graph(sites, graph)
-        windows = load_all_windows(sites, names, reference, map, threads)
-        var count = 0
-        for w in windows:
-            count += len(w)
-        print(t"[dromos] surject: {count} snarl windows", file=stderr)
-    if len(names) == 1:
-        print(
-            (
-                t"[dromos] {reference.contigs[0].chrom}: {len(reference.contigs[0].seq)} bases"
-                t" ({Float64(perf_counter_ns() - t0) * 1e-9} s)"
-            ),
-            file=stderr,
-        )
-    else:
-        var bases = 0
-        for n in lengths:
-            bases += n
-        print(
-            t"[dromos] {len(names)} contigs of {sample}: {bases} bases ({Float64(perf_counter_ns() - t0) * 1e-9} s)",
-            file=stderr,
-        )
-    var what = names[0] if len(names) == 1 else String(t"{len(names)} contigs")
-    var surjector = Surjector(reference^, nodes^, sam_names.copy(), placement, windows^)
-    var kind = GAF if gaf else (GAM if gam else AUTO)
-    if not out_arg:
-        var header = String("@HD\tVN:1.6\tSO:unsorted\n")
-        for k in range(len(sam_names)):
-            header += String(t"@SQ\tSN:{sam_names[k]}\tLN:{lengths[k]}\n")
-        header += "@PG\tID:dromos-surject\tPN:dromos\tVN:0.1.0\n"
-        var sink = SurjectSink[False](surjector^, threads, header, BamStaging(0, 1, memory, "."))
-        try:
-            stream_input(_input(pos[0]), threads, sink, kind)
-        except e:
-            sink.finish(threads, complete=False)
-            raise e^
-        sink.finish(threads, complete=True)
-        sink.report(what)
-        return
-    var out = out_arg.value()
-    var folder = dirname(out)
-    var spill_dir = tmp_arg.value() if tmp_arg else (folder if folder else String("."))
-    # Where the BAM and the spills go is tried now, not after the input has been read.
-    _writable(out + ".tmp")
-    _writable(spill_dir + "/.dromos-spill." + String(external_call["getpid", Int32]()))
-    var text = String("@HD\tVN:1.6\tSO:coordinate\n")
-    for k in range(len(sam_names)):
-        text += String(t"@SQ\tSN:{sam_names[k]}\tLN:{lengths[k]}\n")
-    text += "@PG\tID:dromos-surject\tPN:dromos\tVN:0.1.0\n"
-    var header = bam_header(text, sam_names, lengths)
-    var staging = BamStaging(len(names), threads, memory, spill_dir)
-    var sink = SurjectSink[True](surjector^, threads, String(), staging^)
-    try:
-        stream_input(_input(pos[0]), threads, sink, kind)
-    except e:
-        sink.finish(threads, complete=False)
-        raise e^
-    sink.finish(threads, complete=True)
-    sink.report(what)
-    write_bam(sink.staging, header, BamIndex(sam_names, lengths, csi or needs_csi(lengths)), out, level, threads)
+    run_surject(o)
 
 
 def prepare_main() raises:
