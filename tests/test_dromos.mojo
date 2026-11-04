@@ -34,6 +34,7 @@ from dromos.graph import (
     fingerprint,
     graph_id,
     is_gbz,
+    read_metadata,
     reference_paths,
     reference_samples,
     resolve_reference_sample,
@@ -78,6 +79,7 @@ from dromos.gaf_text import MALFORMED, PLACED, SKIP, UNMAPPED, append_slim, clas
 from dromos.output import decimal_digits
 from dromos.bgzf import inflate_blocks, load_libdeflate, scan_blocks
 from dromos.stream import BGZF, GZIP, PLAIN, looks_like_gaf, mut_untracked
+from dromos.reffasta import LINE, fill_letters, reference_contigs, write_reference_fasta
 from dromos.refmap import AMBIGUOUS, INCONSISTENT, MISSING_NODE, NO_ANCHOR, Anchor, Placed, RefMap
 from dromos.tabix import N_BINS, bin_level, bin_parent, reg2bin
 from dromos.linearize import (
@@ -1286,6 +1288,81 @@ def _small_catalog(path: String, contigs: List[String], regions: List[Tuple[Int,
         w.complete(k, blocks^, md5, done[0].records, length)
     pool[].close()
     _ = w.finish()
+
+
+def _fasta_contigs(path: String) raises -> Tuple[List[String], List[List[UInt8]], String]:
+    """A FASTA's contigs (names and letters) and the .fai samtools faidx would write of it; each line but a contig's
+    last must be LINE letters, the last at most that."""
+    var data = _read_all(path)
+    var names = List[String]()
+    var seqs = List[List[UInt8]]()
+    var fai = String()
+    var i = 0
+    while i < len(data):
+        assert_equal(data[i], UInt8(ord(">")))
+        var end = i
+        while data[end] != UInt8(ord("\n")):
+            end += 1
+        names.append(String(unsafe_from_utf8=Span(data)[i + 1 : end]))
+        i = end + 1
+        var offset = i
+        var seq = List[UInt8]()
+        var short = False
+        while i < len(data) and data[i] != UInt8(ord(">")):
+            assert_false(short, "a short line before a contig's last")
+            var start = i
+            while data[i] != UInt8(ord("\n")):
+                i += 1
+            assert_true(i - start <= LINE and i > start)
+            short = i - start < LINE
+            seq.extend(Span(data)[start:i])
+            i += 1
+        fai += String(t"{names[len(names) - 1]}\t{len(seq)}\t{offset}\t{LINE}\t{LINE + 1}\n")
+        seqs.append(seq^)
+    return (names^, seqs^, fai^)
+
+
+def test_reference_fasta() raises:
+    """The small graph's reference FASTA, for each reference sample: its contigs in the catalog's order, each one's
+    letters the catalog's reference sequence (ReferencePath and reference_md5, from the graph itself), the .fai the
+    file's, and the same file for any threads and chunk size (chunks of 7 lines cut nodes and lines everywhere)."""
+    var cache = _tmp("dromos_test_fasta.dromos")
+    make_cache(GBZ, cache, ["CHM13", "GRCh38"], None, 4, 3)
+    var nodes = NodeTable(cache)
+    var md = read_metadata(GBZ)
+    var graph = Graph(GBZ, 2)
+    var gmd = graph.parts.metadata()
+    for sample in ["CHM13", "GRCh38"]:
+        var map = RefMap(cache, sample)
+        var contigs = reference_contigs(map, nodes, md, False, 3)
+        assert_equal(len(contigs), 2)
+        assert_equal(contigs[0].name, "chr6")
+        assert_equal(contigs[1].name, "chr19")
+        var a = _tmp("dromos_test_a.fa")
+        var b = _tmp("dromos_test_b.fa")
+        var size = write_reference_fasta(map, nodes, contigs, a, 3)
+        _ = write_reference_fasta(map, nodes, contigs, b, 1, chunk_lines=7)
+        var whole = _read_all(a)
+        assert_equal(size, len(whole))
+        assert_true(whole == _read_all(b), "the same file for any threads and chunks")
+        var got = _fasta_contigs(a)
+        assert_equal(String(unsafe_from_utf8=_read_all(a + ".fai")), got[2])
+        for k in range(2):
+            assert_equal(got[0][k], contigs[k].name)
+            var r = ReferencePath(graph, gmd, sample, contigs[k].name, 2)
+            assert_equal(len(got[1][k]), r.length)
+            var h = Md5()
+            h.update(Span(got[1][k]))
+            assert_equal(hex_string(Span(h.digest())), hex_string(Span(reference_md5(graph, r))))
+        # A window's letters, alone: as the file has them.
+        var w = List[UInt8](length=1000, fill=UInt8(ord("N")))
+        var at = contigs[0].length - 1500
+        fill_letters(map, nodes, contigs[0], at, at + 1000, w.unsafe_ptr())
+        assert_true(w == List[UInt8](Span(got[1][0])[at : at + 1000]))
+        # Full names: the catalog's CHROM.
+        var full = reference_contigs(map, nodes, md, True, 3)
+        assert_equal(full[0].name, String(t"{sample}#0#chr6"))
+        assert_equal(full[0].length, contigs[0].length)
 
 
 def test_catalogs_of_the_small_graph() raises:

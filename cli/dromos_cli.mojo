@@ -10,6 +10,7 @@ from dromos.graph import reference_samples
 from dromos.index import run_index
 from dromos.parallel import default_threads
 from dromos.prepare import graph_cache
+from dromos.reffasta import ReferenceFastaOptions, run_reference_fasta
 from dromos.sites import info, view
 from dromos.snarlfind import find_all_snarls, write_records_tsv, write_snarls_tsv
 from dromos.snarls import read_snarls
@@ -29,11 +30,12 @@ comptime OVERVIEW = """dromos: pangenome graph alignments, fast
   dromos catalog-info       a catalog's header: the graph it belongs to, its contigs, its snarls' source
   dromos snarls             a GBZ graph's snarls, the decomposition vg snarls makes, as a table (or a distance
                             index's)
+  dromos reference-fasta    the reference FASTA (and .fai) the graph's reference paths spell, matching its catalog
   dromos prepare            a GBZ graph's cache, made ahead of the commands that read it
   dromos reference-samples  the reference samples a GBZ graph declares
 
-index, gam-to-gaf and surject take the GBZ graph (--graph) and read what they need of it from its cache, one file
-made on first use and kept beside the graph (GRAPH.gbz.dromos; --cache FILE puts it elsewhere).
+index, gam-to-gaf, surject and reference-fasta take the GBZ graph (--graph) and read what they need of it from its
+cache, one file made on first use and kept beside the graph (GRAPH.gbz.dromos; --cache FILE puts it elsewhere).
 
 dromos COMMAND -h shows a command's usage. DROMOS_TIMING=1 reports where the time goes, on stderr.
 """
@@ -192,6 +194,25 @@ A site catalog's header on stdout, a field a line (key, tab, value): the format,
 fingerprint, node ids, GBZ and GBWT tags), the reference sample, where its snarls came from and how it was built;
 then a line per contig: its name, CHROM, length, the MD5 of its reference sequence (SAM's M5), records, blocks and the
 regions built.
+"""
+
+comptime REFERENCE_FASTA_USAGE = """dromos reference-fasta --graph GRAPH.gbz [options]
+
+The reference sample's contigs as the graph spells them, a FASTA (80 letters a line) and its .fai: every contig with
+a phase-0 path of the sample, in the catalog's order (chr1, chr2, ..., chr22, chrM, chrX, chrY), each laid out as the
+catalog lays its reference sequence: its paths (fragments) at their offsets, letters in capitals, N where no fragment
+lies. So each contig's MD5 is the one dromos catalog-info prints, and pgphase takes this FASTA with the graph's index
+and catalog. (HPRC v2.1's chrY path is not chm13v2.0.fa's chrY: this FASTA's chrY is the graph's.)
+
+  --graph FILE              the pangenome graph (GBZ)
+  --cache FILE              the graph's cache: made there on first use (and again when the graph changes), read
+                            after [GRAPH.gbz.dromos, beside the graph]
+  --reference-sample NAME   the sample whose paths are the reference [the graph's declared reference sample, if it
+                            declares exactly one; HPRC graphs declare CHM13 and GRCh38 and need this]
+  -o FILE                   the FASTA; its index is FILE.fai [GRAPH.SAMPLE.fa beside the graph]
+  --names short|full        the contigs' names: chr20, as chm13v2.0.fa and pgphase name them, or CHM13#0#chr20, the
+                            catalog's CHROM [short]
+  -t THREADS                threads [the machine's cores]
 """
 
 comptime REFERENCE_SAMPLES_USAGE = """dromos reference-samples GRAPH.gbz
@@ -513,6 +534,27 @@ def catalog_info_main() raises:
     info(args.positional(1)[0])
 
 
+def reference_fasta_main() raises:
+    var args = _Args("reference-fasta")
+    if args.help():
+        print(REFERENCE_FASTA_USAGE, end="")
+        return
+    var o = ReferenceFastaOptions()
+    o.threads = args.threads()
+    o.cache = args.value("--cache")
+    o.reference_sample = args.value("--reference-sample")
+    o.out = args.value("-o")
+    var names = args.value("--names")
+    if names:
+        if names.value() == "full":
+            o.full_names = True
+        elif names.value() != "short":
+            _fail(String(t"--names is short or full, not {names.value()}"), "reference-fasta")
+    o.graph = _graph(args, REFERENCE_FASTA_USAGE)
+    _ = args.positional(0)
+    _ = run_reference_fasta(o)
+
+
 def reference_samples_main() raises:
     var args = _Args("reference-samples")
     if args.help():
@@ -550,6 +592,8 @@ def main():
             snarls_main()
         elif command == "prepare":
             prepare_main()
+        elif command == "reference-fasta":
+            reference_fasta_main()
         elif command == "reference-samples":
             reference_samples_main()
         else:

@@ -5,8 +5,10 @@ file `pgcat index-gaf --slim` writes), as the GAF lines `vg convert -G` writes, 
 contigs (`pgcatalog surject`'s records, every contig in one pass, as SAM or a sorted, indexed BAM)
 (github.com/kokyriakidis/pgphase). It reads the GBZ graph itself, through the gbz crate: it makes the graph's site
 catalog, one file of every contig's snarls in binary columns (`catalog`; `view` prints pgcatalog view's text of it,
-`catalog-info` its header), and keeps what the other commands read of the graph in one cache file beside it
-(`G.gbz.dromos`, `prepare`). dromos alone turns a graph and its alignments into pgphase's inputs.
+`catalog-info` its header), writes the reference FASTA its reference paths spell (`reference-fasta`: the catalog's
+reference, contig for contig), and keeps what the other commands read of the graph in one cache file beside it
+(`G.gbz.dromos`, `prepare`). dromos alone turns a graph and its alignments into pgphase's inputs: the index, the
+catalog and the reference FASTA.
 
 dromos is one repository holding a graph-algorithms library (`dromos/`) and its command line (`cli/`): a
 dependency-light Mojo alternative to vg and libbdsg for what pgphase needs (the GBZ read through the gbz crate, the
@@ -17,8 +19,8 @@ snarl decomposition, haplotype walks, reference positions, linearization).
 - Library modules (`dromos/*.mojo`: graph access, formats, the snarl tree, haplotype walks, reference positions,
   linearization) never import `cli/`. They raise errors; they do not parse arguments or print usage.
 - `cli/dromos_cli.mojo` is a thin layer: it parses each command's options, prints its usage and calls the command's
-  entry point in the library (`run_build`, `run_index`, `run_gam_to_gaf`, `run_surject`, `graph_cache`, `view`,
-  `info`, `find_all_snarls`, `run_dist_snarls`). No algorithm lives there.
+  entry point in the library (`run_build`, `run_index`, `run_gam_to_gaf`, `run_surject`, `run_reference_fasta`,
+  `graph_cache`, `view`, `info`, `find_all_snarls`, `run_dist_snarls`). No algorithm lives there.
 - Each algorithm has an importable entry point and its own tests (tests/test_dromos.mojo, and the integration
   checks), and is accepted only once checked against its reference (vg, libbdsg, pgcatalog) on the HPRC graph.
 
@@ -38,8 +40,8 @@ habits:
 ## Layout
 
 - `cli/dromos_cli.mojo`: the commands, `index`, `gam-to-gaf`, `surject`, `catalog`, `view`, `catalog-info`,
-  `snarls`, `prepare` and `reference-samples`, each with its own options and `-h`. index, gam-to-gaf and surject take
-  the graph as `--graph G.gbz` (and `--cache FILE`) and read its cache.
+  `reference-fasta`, `snarls`, `prepare` and `reference-samples`, each with its own options and `-h`. index,
+  gam-to-gaf, surject and reference-fasta take the graph as `--graph G.gbz` (and `--cache FILE`) and read its cache.
 - `gbz-ffi/`: the gbz crate (=0.6.2, with simple-sds =0.4.2) behind a C interface, a Rust cdylib
   (`libdromos_gbz`, built by `pixi run build` beside build/dromos; dromos finds it there, then at $DROMOS_GBZ_LIB).
   A thin layer: the whole graph (`dgbz_load`), header-only reads (tags, metadata), and the parts the graph's cache and
@@ -93,6 +95,11 @@ habits:
   chaining, clipping); `dromos/contig.mojo`: a contig's letters and once-visited nodes from the cache's map and node
   table, and `Reference`, the contigs surjected to (made at once) and which of them a node lies on; with
   `load_windows` in pgsites.mojo they port pgcatalog's surject.rs, reference.rs and pileup.rs.
+- `dromos/reffasta.mojo`: `reference-fasta` (`run_reference_fasta`): each contig with a phase-0 path of the
+  reference sample (`reference_contigs`: the cache's paths, their phases and offsets from the GBZ's metadata), laid
+  out as the catalog lays its reference sequence (fragments at their offsets, capitals, N between), in the catalog's
+  natural order; the file laid out first (`fasta_layout`, 80 letters a line, as chm13v2.0.fa), then chunks of lines
+  filled (`fill_letters`) and written at their offsets on every thread, and the .fai written directly.
 - `dromos/bam.mojo`: BAM records encoded as `samtools view -b` encodes the same SAM lines, the header, and the
   .bai/.csi `BamIndex`. `dromos/bam_sort.mojo`: `surject -o`'s sort: records staged by megabase bucket in zstd
   frames, spilled to an unlinked file past half the memory allowed, read back, sorted, deflated and indexed.
@@ -156,6 +163,10 @@ habits:
   with the unit tests, `pixi run check ENV --full` (compare_genome.sh: every contig of the cached vg snarls EXACT),
   fuzz.py (random graphs against vg snarls: differences only from ties), and bfcheck.py (every snarl is one of
   BubbleFinder's). BubbleFinder is GPL-3.0: run its binary as an oracle, never read or copy its source.
+- `dromos reference-fasta` must write, for every contig, the length and MD5 the catalog's header gives
+  (`catalog-info`; check.sh's catalog group compares `samtools dict`'s M5 on the whole HPRC genome) and the .fai
+  `samtools faidx` writes; the unit tests compare the small graph's letters with `ReferencePath`'s. Keep its layout
+  rules in step with the catalog's MD5 (docs/catalog-format.md).
 - `dromos surject` must write the SAM records `pgcatalog surject` writes (pgphase's tools/pgcatalog), byte for byte,
   from a GAM and from its GAF: check any change with `pixi run check` (its surject cases; `--full` for the slice).
   Float ties in `chain` use libm's log2, as Rust does. Without `--contig` it surjects every contig of the reference

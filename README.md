@@ -16,6 +16,7 @@ and keeps what the other commands need of it in one cache file beside it. It is 
 | `dromos catalog` | a GBZ graph's site catalog: every snarl on the reference, every contig, in one file of binary columns |
 | `dromos view` | a catalog as VCF, a contig or a region of it: the text `pgcatalog view` prints |
 | `dromos catalog-info` | a catalog's header: the graph it belongs to, its contigs, where its snarls came from |
+| `dromos reference-fasta` | the reference FASTA the graph's reference paths spell, and its .fai: the catalog's reference, contig for contig |
 | `dromos snarls` | a GBZ graph's snarls, the decomposition `vg snarls` makes, as a table; or a distance index's |
 | `dromos prepare` | a GBZ graph's cache, made ahead of the commands that read it |
 | `dromos reference-samples` | the reference samples a GBZ graph declares |
@@ -102,6 +103,23 @@ of VCF take up to twice as long as pgcatalog, which stores that text: dromos reb
 the records of a region with their walks and alleles are read 1.0 to 1.5 times as fast as from `.pgsites` blocks
 inflated and parsed for the same (chr6, 1 Mb: 18.9 ms against 28.4 ms; chr20, 100 kb: 35.4 ms against 36.0 ms).
 
+## What pgphase needs, all from dromos
+
+pgphase phases a sample from three files made from the graph and its alignments, each by dromos:
+
+```sh
+dromos index --graph graph.gbz --reference-sample CHM13 reads.gam reads.coord.gaf.gz   # the alignments' index
+dromos catalog --graph graph.gbz --reference-sample CHM13                              # graph.CHM13.sites
+dromos reference-fasta --graph graph.gbz --reference-sample CHM13                      # graph.CHM13.fa, .fa.fai
+```
+
+The reference FASTA must be the sequence the graph's reference paths spell, contig for contig: pgphase checks each
+contig against the catalog (its length and MD5, then, when the MD5 differs, the REF alleles of sampled records) and
+refuses one that is not the catalog's reference. `dromos reference-fasta` writes exactly that sequence.
+A published FASTA of the same assembly may not be it: in HPRC v2.1, `CHM13#0#chrY` (57,686,750 bp) is not
+chm13v2.0.fa's chrY (62,460,029 bp), and `CHM13#0#chrM` is the rCRS (16,569 bp, like CHM13's own chrM, but another
+sequence); the other 23 contigs are chm13v2.0.fa's.
+
 ## Install
 
 dromos builds with [pixi](https://pixi.sh), which fetches the pinned Mojo toolchain, the Rust toolchain and the
@@ -121,10 +139,11 @@ It is built and tested on Linux x86-64.
 
 ### The graph and its cache
 
-`index`, `gam-to-gaf` and `surject` take the GBZ graph (`--graph`) and read what they need of it from its cache:
-one file, `graph.gbz.dromos`, made the first time a command needs it and kept beside the graph. It holds the node
-lengths and letters (4 bits a letter) and, for every reference sample the graph declares (CHM13 and GRCh38 in HPRC
-graphs), where each node lies on the sample's paths. Commands map it into memory and read only the parts they use.
+`index`, `gam-to-gaf`, `surject` and `reference-fasta` take the GBZ graph (`--graph`) and read what they need of it
+from its cache: one file, `graph.gbz.dromos`, made the first time a command needs it and kept beside the graph. It
+holds the node lengths and letters (4 bits a letter) and, for every reference sample the graph declares (CHM13 and
+GRCh38 in HPRC graphs), where each node lies on the sample's paths. Commands map it into memory and read only the
+parts they use.
 
 ```sh
 dromos prepare --graph graph.gbz                       # made now, for a graph folder others will only read
@@ -180,6 +199,26 @@ dromos catalog-info graph.CHM13.sites                                  # the gra
   printed of that contig's `.pgsites` catalog: its VCF header, then the records overlapping the region as tabix
   would return them. Without a contig, every contig, in one VCF.
 - **`dromos catalog-info CATALOG`** prints the header, a field a line, then a line per contig.
+
+### `dromos reference-fasta`
+
+```sh
+dromos reference-fasta --graph graph.gbz --reference-sample CHM13                  # graph.CHM13.fa and its .fai
+dromos reference-fasta --graph graph.gbz --reference-sample CHM13 -o chm13.graph.fa --names full
+```
+
+- **What it writes.** Every contig with a phase-0 path of the reference sample, in the catalog's order (chr1, chr2,
+  ..., chr22, chrM, chrX, chrY), laid out as the catalog lays its reference sequence: the contig's paths (fragments)
+  at their offsets, each node's letters in capitals (reverse-complemented where the path visits it backwards), `N`
+  where no fragment lies. Each contig's MD5 is the one `dromos catalog-info` prints for it. 80 letters a line, as
+  chm13v2.0.fa has them, and the `.fai` samtools faidx would write (written directly: no samtools needed).
+- **Names.** `--names short` (`chr20`, the default: chm13v2.0.fa's names, which pgphase takes) or `full`
+  (`CHM13#0#chr20`, the catalog's CHROM).
+- **Fast.** The letters come from the graph's cache; the file is laid out first, then cut into chunks of 65,536
+  lines that every core fills and writes at their offsets. The HPRC graph's CHM13 (25 contigs, 3.11 Gbp, a 3.15 GB
+  file) takes 3.2 s on 10 threads, its cache made (the file then reaches the disk from the page cache).
+- **Options.** `--graph`, `--cache`, `--reference-sample`, `-o FILE` (`GRAPH.SAMPLE.fa` beside the graph), `--names`,
+  `-t`.
 
 ### `dromos snarls`
 
@@ -327,6 +366,9 @@ dromos is checked byte for byte against the tools it replaces, on HG002 HiFi ali
   (12,733,701 records) indexes as `samtools index` indexes it, and its chr20 is chr20's single run over the whole GAM
   sorted by samtools.
 - `reference-samples` prints the lines `pgcatalog reference-samples` prints.
+- `reference-fasta` writes, for each of the 25 CHM13 contigs of the HPRC graph, the length and MD5 the catalog's
+  header gives (`samtools dict`'s M5), and the `.fai` `samtools faidx` writes; on the small graph, each contig's
+  letters are the catalog's reference sequence, the same file for any threads and chunk size.
 - `catalog` writes, for every contig, the records `pgcatalog build` writes from the same snarls: `dromos view` of
   the one file prints pgcatalog view's text of each `.pgsites` catalog, byte for byte, for all 25 CHM13 contigs of
   the HPRC graph (43,494,146 records, 152 GB of VCF text, the largest record a 6.6 GB line on chr2), regions of
@@ -343,8 +385,9 @@ dromos is checked byte for byte against the tools it replaces, on HG002 HiFi ali
   index; and the graph's cache made, reused, made again (a changed graph, a cache cut short or damaged, another
   version's), kept elsewhere, made by several runs at once, and refused (a read-only folder, a file that is not a
   cache, another graph's cache); site catalogs of odd snarls files, regions and thread counts (the same file on any),
-  catalogs refused (truncated, damaged, another format version, another graph's), and distance indexes refused by
-  `snarls --dist --graph` (truncated, version 5, another graph's).
+  catalogs refused (truncated, damaged, another format version, another graph's), distance indexes refused by
+  `snarls --dist --graph` (truncated, version 5, another graph's), and reference FASTAs refused (a sample the graph
+  lacks, an output that cannot be written, leaving no index behind).
 
 ```sh
 pixi run check ENV_FILE [--full] [--only GROUP,...]  # end-to-end checks; ENV_FILE names the data

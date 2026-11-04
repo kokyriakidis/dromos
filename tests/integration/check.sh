@@ -3,9 +3,10 @@
 #
 #   tests/integration/check.sh ENV_FILE [--full] [--only GROUP,...]
 #
-# Groups: cache (reference-samples, prepare, --cache), catalog (catalog, view, catalog-info), snarls (computed and
-# --dist snarls against vg snarls), convert (gam-to-gaf), index, surject. --only runs those groups alone: run the ones
-# a change touches. --full adds the whole-genome and slice-wide cases of the groups run. Each group's time is printed.
+# Groups: cache (reference-samples, prepare, --cache), catalog (catalog, view, catalog-info, reference-fasta), snarls
+# (computed and --dist snarls against vg snarls), convert (gam-to-gaf), index, surject. --only runs those groups alone:
+# run the ones a change touches. --full adds the whole-genome and slice-wide cases of the groups run. Each group's time
+# is printed.
 #
 # ENV_FILE sets (paths on the machine with the data):
 #   DROMOS     the dromos binary to check (default: build/dromos)
@@ -27,13 +28,14 @@
 #              against vg snarls and the computed snarls, every contig)
 #   WORK       a directory for outputs and the pgcat and pgcatalog references (made once, kept), and for the graph's
 #              cache: dromos reads GBZ through a link in WORK/graph, its cache made beside it
-#   SAMTOOLS   samtools (1.24; default: samtools), whose sort and index surject -o's BAM is checked against
+#   SAMTOOLS   samtools (1.24; default: samtools), whose sort and index surject -o's BAM is checked against,
+#              and whose faidx and dict reference-fasta's FASTA is
 #   CARVED     a folder of carved slices of the whole GAM, chr20s.gam and chr6s.gam with their .gaf (only with --full)
 #
 # Every index is made at -l 0 (stored blocks), where dromos and pgcat write the same bytes: the files must be equal,
 # and their .tbi equal decompressed.
 set -u
-[ $# -ge 1 ] || { sed -n 2,28p "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n 2,36p "$0"; exit 2; }
 source "$1"
 shift
 FULL="" ONLY=""
@@ -223,6 +225,20 @@ same_view "view: chr1, past its end" "$WORK/dcat.chr1.sites" "$WORK/pcat.chr1/ch
 "$DROMOS" catalog-info "$ALL" | grep -q "^snarls.source.dromos" && pass "catalog-info: the snarls computed" \
   || fail "catalog-info: the snarls computed"
 [ "$FULL" == "--full" ] && same_views "catalog: the whole genome, computed snarls" "$ALL" "$CATALOG_DIR"
+# reference-fasta: the FASTA of the catalog's reference, every contig in the catalog's order with its length and MD5
+# (samtools dict's M5: of the letters in capitals), and the .fai samtools faidx writes of it.
+FA=$WORK/dfa.CHM13.fa
+"$DROMOS" reference-fasta --graph "$G" --reference-sample CHM13 -t 10 -o "$FA" 2> "$FA.err"
+"$SAMTOOLS" faidx --fai-idx "$FA.samtools.fai" "$FA" &
+"$SAMTOOLS" dict "$FA" | awk -F'\t' '$1 == "@SQ" {print substr($2, 4) "\t" substr($3, 4) "\t" substr($4, 4)}' \
+  > "$FA.dict"
+wait
+cmp -s "$FA.dict" <("$DROMOS" catalog-info "$ALL" | awk -F'\t' 'f {print $1 "\t" $3 "\t" $4} /^#contig/ {f = 1}') \
+  && pass "reference-fasta: each contig's length and MD5 the catalog's ($(wc -l < "$FA.dict") contigs)" \
+  || fail "reference-fasta: each contig's length and MD5 the catalog's"
+[ -s "$FA.fai" ] && cmp -s "$FA.fai" "$FA.samtools.fai" && pass "reference-fasta: the .fai samtools faidx's" \
+  || fail "reference-fasta: the .fai samtools faidx's"
+rm -f "$FA" "$FA".*
 find "$WORK" -maxdepth 1 -name 'dcat.*' ! -name 'dcat.all.sites' -exec rm -rf {} +
 fi
 

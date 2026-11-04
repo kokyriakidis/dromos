@@ -157,6 +157,17 @@ fails "a graph declaring two reference samples, none chosen" $D index --graph gw
 fails "a reference sample the graph lacks" $D index --graph gw/g.gbz --reference-sample NOBODY empty.gaf x.gz
 label="no cache left by a sample the graph lacks"; ok bash -c "! ls gw | grep -q part"
 fails "prepare: no graph" $D prepare
+# reference-fasta refuses a sample the graph lacks (before its cache is looked at) and an output it cannot write, and
+# leaves no index of a FASTA it did not write.
+$D prepare --graph gw/g.gbz 2> /dev/null; cp gw/g.gbz.dromos rf.before
+fails "reference-fasta: a reference sample the graph lacks" $D reference-fasta --graph gw/g.gbz \
+  --reference-sample NOBODY -o rf.fa
+label="reference-fasta: the graph's cache untouched"; ok bash -c "cmp -s gw/g.gbz.dromos rf.before && ! test -e rf.fa"
+fails "reference-fasta: an unwritable output" $D reference-fasta $GW -o /proc/nope/x.fa
+$D reference-fasta $GW -o rf.fa 2> /dev/null && chmod 444 rf.fa
+fails "reference-fasta: a FASTA it cannot write over" $D reference-fasta $GW -o rf.fa
+label="reference-fasta: no index left beside it"; ok bash -c "! test -e rf.fa.fai"
+chmod 644 rf.fa
 # 7b. surject: every contig without --contig; -o's BAM from odd inputs, whatever the threads; options that do not fit.
 SAMTOOLS=${SAMTOOLS:-samtools}
 HERE=$OLDPWD/tests/integration
