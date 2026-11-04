@@ -321,7 +321,7 @@ fails "view: not a catalog" $D view $SMALL_GAF
 fails "view: a missing catalog" $D view /nonexistent.sites
 fails "view: a .pgsites" $D view $PV
 label="view: a .pgsites, named"; ok grep -q "pgsites" f.err
-head -c 2000 $V > cut.sites; fails "view: a catalog cut short" $D view cut.sites
+head -c $(( $(stat -c %s $V) / 2 )) $V > cut.sites; fails "view: a catalog cut short" $D view cut.sites
 label="view: a catalog cut short, named"; ok grep -q "truncated" f.err
 python3 -I -c "import sys; d=bytearray(open(sys.argv[1],'rb').read()); d[200]^=0xFF; open(sys.argv[2],'wb').write(d)" \
   $V flip.sites
