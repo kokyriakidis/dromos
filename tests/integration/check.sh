@@ -105,8 +105,10 @@ pgcatalog_catalog() {  # folder, region options...: pgcatalog's catalogs, made o
 }
 dromos_catalog() {  # file, options...: dromos's catalog, from SNARLS_OF (linked, never written: every contig is in it)
   local out=$1; shift
+  local from
+  from=$(cd "$SNARLS_OF" && pwd)
   rm -rf "$out" "$out.snarls"; mkdir -p "$out.snarls"
-  for f in "$SNARLS_OF"/*; do ln -s "$f" "$out.snarls/"; done
+  for f in "$from"/*; do ln -s "$f" "$out.snarls/"; done
   "$DROMOS" catalog --graph "$GRAPH_OF" --reference-sample CHM13 --snarls-cache "$out.snarls" --out "$out" "$@" \
     2> "$out.err"
 }
