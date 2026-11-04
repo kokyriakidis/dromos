@@ -19,7 +19,8 @@
 #              (chr10)
 #   SNARLS     the graph's snarls cache (<contig>.snarls and graph.id, as pgcatalog build keeps it), read, not changed:
 #              vg snarls, the oracle dromos's computed snarls are checked against
-#   DIST       the graph's distance index (giraffe's .dist; optional: the catalog from it is checked with --full)
+#   DIST       the graph's distance index (giraffe's .dist; optional: with --full, dromos snarls --dist of it is checked
+#              against vg snarls and the computed snarls, every contig)
 #   WORK       a directory for outputs and the pgcat and pgcatalog references (made once, kept), and for the graph's
 #              cache: dromos reads GBZ through a link in WORK/graph, its cache made beside it
 #   SAMTOOLS   samtools (1.24; default: samtools), whose sort and index surject -o's BAM is checked against
@@ -96,10 +97,10 @@ cmp -s "$WORK/elsewhere.dromos" "$G.dromos" && pass "the cache made on first use
 rm -f "$WORK/elsewhere.dromos" "$WORK/d.graph.gz" "$WORK/d.graph.gz.tbi"
 
 # catalog and view: dromos view of dromos's one catalog prints, for each contig and region, what pgcatalog view prints
-# of pgcatalog build's catalog of it from the same snarls (the small graph from its committed snarls, from its
-# distance index and from snarls dromos computes; HPRC contigs, a region, and the whole genome); the same file
-# whatever the threads. Computed snarls must give the catalog vg snarls give: the same bytes but for the header, whose
-# fields are the same but for its snarls.* keys.
+# of pgcatalog build's catalog of it from the same snarls (the small graph from its committed snarls and from snarls
+# dromos computes; HPRC contigs, a region, and the whole genome); the same file whatever the threads. Computed snarls
+# must give the catalog vg snarls give: the same bytes but for the header, whose fields are the same but for its
+# snarls.* keys.
 pgcatalog_catalog() {  # folder, region options...: pgcatalog's catalogs, made once
   local out=$1; shift
   [ -e "$out/done" ] || { rm -rf "$out"; mkdir -p "$out" && cp -r "$SNARLS_OF" "$out/snarls" \
@@ -151,14 +152,27 @@ for c in chr6 chr19; do
   cmp -s <("$DROMOS" view "$WORK/dcat.small.sites" $c) tests/data/micb-kir3dl1.catalog/$c.vcf || bad=1
 done
 [ $bad -eq 0 ] && pass "catalog: the small graph's committed views" || fail "catalog: the small graph's committed views"
-"$DROMOS" catalog --graph "$GBZ_SMALL" --reference-sample CHM13 --dist tests/data/micb-kir3dl1.dist --region chr6 \
-  --region chr19 -t 2 --out "$WORK/dcat.small.dist.sites" 2> /dev/null
-same_views "catalog: the small graph, snarls from its distance index" "$WORK/dcat.small.dist.sites" "$WORK/pcat.small"
 "$DROMOS" catalog --graph "$GBZ_SMALL" --reference-sample CHM13 --region chr6 --region chr19 -t 2 \
   --out "$WORK/dcat.small.computed.sites" 2> /dev/null
 same_views "catalog: the small graph, snarls computed" "$WORK/dcat.small.computed.sites" "$WORK/pcat.small"
 same_catalog "catalog: the small graph, computed snarls as vg snarls" "$WORK/dcat.small.computed.sites" \
   "$WORK/dcat.small.sites"
+# snarls --dist: the small graph's distance index gives vg snarls' snarls and the computed snarls (compare.py: the same
+# snarls, parents, and chains or children's order), and the same table checked against its graph or not.
+exact() {  # name, table, table: compare.py says EXACT
+  [ "$(python3 -I "$HERE/compare.py" "$2" "$3" | tail -1)" == EXACT ] && pass "$1" || fail "$1"
+}
+SN=$WORK/snarls.small
+rm -rf "$SN"; mkdir -p "$SN"
+"$DROMOS" snarls --dist tests/data/micb-kir3dl1.dist --graph "$GBZ_SMALL" -o "$SN/dist.tsv" 2> /dev/null
+"$DROMOS" snarls --dist tests/data/micb-kir3dl1.dist -t 3 -o "$SN/alone.tsv" 2> /dev/null
+"$DROMOS" snarls --vg-file tests/data/micb-kir3dl1.vg.snarls -o "$SN/vg.tsv" 2> /dev/null
+"$DROMOS" snarls --graph "$GBZ_SMALL" -o "$SN/computed.tsv" 2> /dev/null
+[ -s "$SN/dist.tsv" ] && cmp -s "$SN/dist.tsv" "$SN/alone.tsv" \
+  && pass "snarls --dist: the small graph's, the same table checked against its graph or not" \
+  || fail "snarls --dist: the small graph's, the same table checked against its graph or not"
+exact "snarls --dist: the small graph's as vg snarls'" "$SN/vg.tsv" "$SN/dist.tsv"
+exact "snarls --dist: the small graph's as the computed snarls" "$SN/dist.tsv" "$SN/computed.tsv"
 GRAPH_OF=$GBZ SNARLS_OF=$SNARLS
 for c in chr20 chr6 chr1 chrY "chr20:10,000,000-12,000,000"; do
   d=$(echo "$c" | tr ':,' '__')
@@ -183,8 +197,8 @@ same_view "view: chr20, a contig named alone" "$WORK/dcat.chr20.sites" "$P20" ch
 same_view "view: chr6, the MHC" "$WORK/dcat.chr6.sites" "$WORK/pcat.chr6/chr6.pgsites" chr6:29,000,000-34,000,000
 same_view "view: chr1, past its end" "$WORK/dcat.chr1.sites" "$WORK/pcat.chr1/chr1.pgsites" chr1:300000000-300000100
 # The whole genome, once, from snarls dromos computes (the default); with --full, each contig's view against
-# pgcatalog's catalogs, the same catalog from vg snarls and from the distance index, and the computed snarls
-# themselves against vg snarls' files (tests/integration/compare_genome.sh: every contig EXACT).
+# pgcatalog's catalogs, the same catalog from vg snarls, and the computed snarls themselves against vg snarls' files
+# (tests/integration/compare_genome.sh: every contig EXACT).
 ALL=$WORK/dcat.all.sites
 "$DROMOS" catalog --graph "$GBZ" --reference-sample CHM13 -t 10 --out "$ALL" 2> "$ALL.err"
 "$DROMOS" catalog-info "$ALL" | grep -q "^graph.fingerprint" && pass "catalog-info: the whole genome's header" \
@@ -197,19 +211,32 @@ if [ "$FULL" == "--full" ]; then
   dromos_catalog "$WORK/dcat.vg.sites" -t 10
   same_catalog "catalog: the whole genome, computed snarls as vg snarls" "$ALL" "$WORK/dcat.vg.sites"
   rm -rf "$WORK/dcat.vg.sites"*
-  if [ -n "${DIST:-}" ]; then
-    "$DROMOS" catalog --graph "$GBZ" --reference-sample CHM13 --dist "$DIST" -t 10 --out "$WORK/dcat.dist.sites" \
-      2> /dev/null
-    same_catalog "catalog: the whole genome, the distance index's snarls as computed snarls" "$ALL" \
-      "$WORK/dcat.dist.sites"
-    rm -rf "$WORK/dcat.dist.sites"*
-  fi
   rm -rf "$WORK/snarls.cmp"
   "$HERE/compare_genome.sh" "$DROMOS" "$GBZ" "$SNARLS" "$WORK/snarls.cmp" > "$WORK/snarls.cmp.log" 2>&1
   n=$(ls "$SNARLS" | grep -c '\.snarls$')
   tail -1 "$WORK/snarls.cmp.log" | grep -qx "EXACT $n of $n" \
     && pass "snarls: the whole genome's computed snarls as vg snarls' ($n contigs)" \
     || fail "snarls: the whole genome's computed snarls as vg snarls' ($(tail -1 "$WORK/snarls.cmp.log"))"
+  # The distance index's snarls (snarls --dist, checked against the graph): vg snarls' and the computed snarls', every
+  # contig (the computed snarls split above, reused).
+  if [ -n "${DIST:-}" ]; then
+    rm -rf "$WORK/dist.cmp"; mkdir -p "$WORK/dist.cmp"
+    "$DROMOS" snarls --dist "$DIST" --graph "$GBZ" -t 10 -o "$WORK/dist.tsv" 2> "$WORK/dist.cmp/err" \
+      && pass "snarls --dist: the whole genome's distance index, checked against its graph" \
+      || fail "snarls --dist: the whole genome's distance index, checked against its graph"
+    MINE=$WORK/dist.tsv "$HERE/compare_genome.sh" "$DROMOS" "$GBZ" "$SNARLS" "$WORK/dist.cmp" \
+      > "$WORK/dist.cmp.log" 2>&1
+    tail -1 "$WORK/dist.cmp.log" | grep -qx "EXACT $n of $n" \
+      && pass "snarls --dist: the whole genome's distance index as vg snarls' ($n contigs)" \
+      || fail "snarls --dist: the whole genome's distance index as vg snarls' ($(tail -1 "$WORK/dist.cmp.log"))"
+    ORACLE=$WORK/dist.tsv "$HERE/compare_genome.sh" "$DROMOS" "$GBZ" "$SNARLS" "$WORK/snarls.cmp" \
+      > "$WORK/dist.computed.log" 2>&1
+    tail -1 "$WORK/dist.computed.log" | grep -qx "EXACT $n of $n" \
+      && pass "snarls --dist: the whole genome's distance index as the computed snarls ($n contigs)" \
+      || fail "snarls --dist: the whole genome's distance index as the computed snarls ($(tail -1 \
+        "$WORK/dist.computed.log"))"
+    rm -rf "$WORK/dist.tsv" "$WORK/dist.cmp/mine" "$WORK/snarls.cmp/oracle"
+  fi
 fi
 find "$WORK" -maxdepth 1 -name 'dcat.*' ! -name 'dcat.all.sites' -exec rm -rf {} +
 

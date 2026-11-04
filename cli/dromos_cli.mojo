@@ -143,8 +143,7 @@ built from, and dromos refuses it with another graph.
   --level N                 zstd level, 1-22 [9]; higher is smaller and slower
 
 Snarls are computed from the graph (vg snarls' decomposition of each contig's component: no vg, no distance index),
-unless one of these gives them:
-  --dist FILE               a distance index of the graph (giraffe's .dist, read in place)
+unless vg's are asked for:
   --snarls-cache DIR        vg snarls of each contig (<contig>.snarls), kept for later runs on the same graph; vg chunk
                             and vg snarls make those missing
   --vg PATH                 the vg binary, for vg chunk and vg snarls, run for contigs not in the cache [vg]
@@ -420,7 +419,14 @@ def catalog_main() raises:
     o.threads = _number(t.value(), "--threads", 1, 1024, "catalog") if t else default_threads()
     o.graph = args.value("--graph").or_else(String())
     o.out = args.value("--out").or_else(String())
-    o.dist = args.value("--dist")
+    if args.flag("--dist"):
+        _fail(
+            (
+                "--dist is no longer a catalog option: the snarls are computed from the graph (or read with"
+                " --snarls-cache); dromos snarls --dist reads a distance index's"
+            ),
+            "catalog",
+        )
     o.reference_sample = args.value("--reference-sample")
     while True:
         var r = args.value("--region")
@@ -441,8 +447,6 @@ def catalog_main() raises:
     if not o.graph:
         print(CATALOG_USAGE, end="", file=stderr)
         exit(1)
-    if o.dist and o.snarls_cache:
-        _fail("--dist or --snarls-cache (the snarls' source), not both", "catalog")
     run_build(o)
 
 

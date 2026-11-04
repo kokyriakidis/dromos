@@ -31,9 +31,6 @@ comptime MAGIC = SIMD[DType.uint8, 4](0x67, 0xA1, 0x7C, 0xC6)
 comptime VERSION_SENTINEL = 1023
 comptime READ_VERSIONS = "3 and 4"
 """The versions this reader takes."""
-comptime ORIENTATION = (
-    "vg SnarlManager::regularize: per chain, flipped when fewer than half of its consecutive node pairs ascend by id"
-)
 
 # Record types of versions 3 and 4 (tag >> 9).
 comptime ROOT = 1
@@ -157,14 +154,12 @@ def _header(path: String, file: MappedFile) raises -> _Header:
     if version < 3 or version > 64:
         raise Error(
             t"{path}: a distance index from before libbdsg's versioned format (2025); dromos reads versions"
-            t" {READ_VERSIONS}. Leave out --dist: dromos catalog computes the snarls"
-            t" from the graph itself"
+            t" {READ_VERSIONS}. dromos snarls --graph computes the snarls from the graph itself"
         )
     if version > 4:
         raise Error(
             t"{path}: a distance index of version {version}; dromos reads versions {READ_VERSIONS} (version 5"
-            t" renumbers its records). Leave out --dist: dromos catalog computes the snarls from"
-            t" the graph itself"
+            t" renumbers its records). dromos snarls --graph computes the snarls from the graph itself"
         )
     var components = _entry(w, width, mask, 2)
     var id_slots = _entry(w, width, mask, 3)
@@ -271,8 +266,8 @@ struct DistIndex(Movable):
         var t = self.kind(top)
         if _is_root_snarl(t):
             raise Error(
-                t"{self.path}: a root snarl (a component with no chain through it), which dromos does not read; leave"
-                t" out --dist: dromos catalog computes the snarls from the graph itself"
+                t"{self.path}: a root snarl (a component with no chain through it), which dromos does not read;"
+                t" dromos snarls --graph computes the snarls from the graph itself"
             )
         if _is_chain(t):
             self._chain(top, NO_PARENT, NO_PARENT, out)

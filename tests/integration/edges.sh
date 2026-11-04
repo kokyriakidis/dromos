@@ -195,10 +195,11 @@ fails "surject: a contig the graph lacks" $D surject $DG --contig chrNone $G
 fails "surject: --sam-names neither full nor short" $D surject $DG --sam-names long $G
 fails "surject: -l without -o" $D surject $DG -l 3 $G
 fails "surject -o: a folder that does not exist" $D surject $DG $G -o /nonexistent/x.bam
-# 8. catalog and view on the small graph (GBZ_SMALL, its committed snarls and distance index), against pgcatalog build
-# and view: odd snarls files, regions and contigs, threads (the same file whatever their number); a missing snarls
-# cache made with vg (VG, the vg binary pgcatalog runs); distance indexes refused; snarls computed by dromos (the
-# default: any threads, a contig with no snarls, a tiny graph); damaged catalogs refused.
+# 8. catalog and view on the small graph (GBZ_SMALL, its committed snarls), against pgcatalog build and view: odd
+# snarls files, regions and contigs, threads (the same file whatever their number); a missing snarls cache made with
+# vg (VG, the vg binary pgcatalog runs); --dist refused; snarls computed by dromos (the default: any threads, a contig
+# with no snarls, a tiny graph); damaged catalogs refused. dromos snarls --dist --graph refuses distance indexes of
+# another graph, cut short or of another version.
 S=$OLDPWD/tests/data/micb-kir3dl1.catalog/snarls
 [ -d "$S" ] || S=$HOME/dromos/tests/data/micb-kir3dl1.catalog/snarls
 SD=$(dirname $(dirname $S))/micb-kir3dl1.dist
@@ -256,17 +257,12 @@ if [ -n "${VG:-}" ]; then
 fi
 fails "catalog: no graph" $D catalog --out cx
 fails "catalog: a graph that is not one" $D catalog --graph $SMALL_GAF --out cx --reference-sample CHM13
-fails "catalog: --dist and --snarls-cache" $D catalog --graph $GBZ_SMALL --reference-sample CHM13 --dist $SD \
-  --snarls-cache $S --out cx
-# The distance index (--dist): vg snarls' records from it; one beside the graph is not read unless named; another
-# graph's refused.
+# A distance index is no longer the catalog's: --dist refused, naming where it went; one beside the graph not read.
+fails "catalog: --dist" $D catalog --graph $GBZ_SMALL --reference-sample CHM13 --dist $SD --out cx
+label="catalog: --dist refused, the snarls computed from the graph and dromos snarls --dist named"
+ok bash -c "grep -q 'snarls are computed from the graph' f.err && grep -q 'dromos snarls --dist' f.err && ! test -e cx"
 rm -rf cb; mkdir -p cb; cp -r $S cb/snarls
 $PGCATALOG build --graph $GBZ_SMALL --reference-sample CHM13 --out cb --region chr6 --region chr19 > cb.err 2>&1
-$D catalog --graph $GBZ_SMALL --reference-sample CHM13 --region chr6 --region chr19 -t 3 --dist $SD --out dist.sites \
-  > dist.err 2>&1
-n=$(views_of dist.sites cb)
-[ "$n" -gt 0 ] && echo "ok    catalog: from the distance index, vg snarls' records ($n contigs)" \
-  || echo "FAIL  catalog: from the distance index ($n)"
 mkdir -p dg; ln -sf $GBZ_SMALL dg/small.gbz; cp $SD dg/small.dist
 $D catalog --graph dg/small.gbz --reference-sample CHM13 --region chr6 --region chr19 -t 3 > dg.err 2>&1
 label="catalog: a .dist beside the graph left alone, the snarls computed"
@@ -322,12 +318,22 @@ if [ -n "${VG:-}" ]; then
     printf 'W\tCHM13\t0\tchrB\t0\t2\t>7\n'; } > tiny.gfa
   computed_pair "catalog: computed snarls, a tiny graph" tiny.gfa chrA chrB
 fi
-fails "catalog: another graph's distance index (HPRC's .dist, the small graph)" $D catalog --graph $GBZ_SMALL \
-  --reference-sample CHM13 --region chr6 --dist ${DIST:-/nonexistent.dist} --out cx
-fails "catalog: another graph's distance index (the small graph's, HPRC)" $D catalog $DG --region chrY --dist $SD \
-  -t 4 --out cx
-head -c 50000 $SD > cut.dist; fails "catalog: a distance index cut short" $D catalog --graph $GBZ_SMALL \
-  --reference-sample CHM13 --region chr6 --dist cut.dist --out cx
+# dromos snarls --dist --graph: the graph's own index read, others refused, no table written.
+$D snarls --dist $SD --graph $GBZ_SMALL -o sx.tsv 2> sx.err
+label="snarls --dist --graph: the graph's own distance index"; ok test -s sx.tsv
+rm -f sx.tsv
+if [ -n "${DIST:-}" ]; then
+  fails "snarls --dist --graph: another graph's distance index (HPRC's .dist, the small graph)" $D snarls --dist $DIST \
+    --graph $GBZ_SMALL -o sx.tsv
+  label="snarls --dist --graph: another graph's refused, named so"; ok grep -q "not this graph's distance index" f.err
+fi
+fails "snarls --dist --graph: another graph's distance index (the small graph's, HPRC)" $D snarls --dist $SD $DN \
+  -t 4 -o sx.tsv
+label="snarls --dist --graph: another graph's refused, named so (HPRC)"
+ok grep -q "not this graph's distance index" f.err
+label="snarls --dist --graph: no table when refused"; ok bash -c "! test -e sx.tsv"
+head -c 50000 $SD > cut.dist; fails "snarls --dist --graph: a distance index cut short" $D snarls --dist cut.dist \
+  --graph $GBZ_SMALL -o sx.tsv
 python3 -I - $SD v5.dist << 'PY'
 import struct, sys
 d = bytearray(open(sys.argv[1], 'rb').read())
@@ -338,9 +344,10 @@ bit = width  # entry 1 holds 1023 ^ version: version 4 to 5 clears its lowest bi
 d[data + bit // 8] &= ~(1 << (bit % 8)) & 0xFF
 open(sys.argv[2], 'wb').write(d)
 PY
-fails "catalog: a distance index of version 5" $D catalog --graph $GBZ_SMALL --reference-sample CHM13 --region chr6 \
-  --dist v5.dist --out cx
-label="catalog: version 5 refused, naming the way out"; ok grep -q "Leave out --dist" f.err
+fails "snarls --dist --graph: a distance index of version 5" $D snarls --dist v5.dist --graph $GBZ_SMALL -o sx.tsv
+label="snarls --dist: version 5 refused, naming the way out"; ok grep -q "dromos snarls --graph computes" f.err
+fails "snarls: --dist with --vg-file" $D snarls --dist $SD --vg-file $S/chr6.snarls -o sx.tsv
+fails "snarls: --dist with --stats" $D snarls --dist $SD --stats -o sx.tsv
 # The catalog's views, against pgcatalog's catalog of chr6 (and of a region past chr6's end: no records).
 rm -rf cb; mkdir -p cb; cp -r $S cb/snarls
 $PGCATALOG build --graph $GBZ_SMALL --reference-sample CHM13 --out cb --region chr6 --region chr6:200000000-200000100 \
@@ -387,9 +394,7 @@ label="view: another format version, named"; ok grep -q "version 2" f.err
 fails "catalog-info: a damaged catalog" $D catalog-info cut.sites
 # surject refuses a catalog of another graph, or one lacking a contig.
 fails "surject: another graph's catalog" $D surject $DG --contig chr6 --catalog $V $G
-if [ -n "${DIST:-}" ]; then
-  $D catalog $DG --region chrY:1-2000000 --dist $DIST --out y.sites -t 4 2> /dev/null
-  fails "surject: a catalog lacking the contig" $D surject $DG --contig chr20 --catalog y.sites $G
-  label="surject: a catalog of a region of its contig"; ok bash -c "$D surject $DG --contig chrY --catalog y.sites $G \
-    > /dev/null 2> y.err"
-fi
+$D catalog $DG --region chrY:1-2000000 --out y.sites -t 4 2> /dev/null
+fails "surject: a catalog lacking the contig" $D surject $DG --contig chr20 --catalog y.sites $G
+label="surject: a catalog of a region of its contig"; ok bash -c "$D surject $DG --contig chrY --catalog y.sites $G \
+  > /dev/null 2> y.err"

@@ -15,6 +15,10 @@ from dromos.stream import BGZF, GZIP, encoding, imm_untracked, mut_untracked, un
 
 comptime NO_PARENT = UInt64.MAX
 """`Snarl.parent_start` of a snarl the file gives no parent."""
+comptime ORIENTATION = (
+    "vg SnarlManager::regularize: per chain, flipped when fewer than half of its consecutive node pairs ascend by id"
+)
+"""How computed snarls (snarlfind.mojo) and a distance index's (dist.mojo) are oriented: as vg snarls writes them."""
 comptime SNARL_TAG = "SNARL"
 comptime DECODE_SPAN = 1 << 16
 """Messages one task decodes."""

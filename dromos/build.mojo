@@ -3,12 +3,12 @@ of chosen contigs, or of regions of them.
 
 0. The reference paths come from the GBZ's path metadata, read alone.
 1. Snarls are computed from the graph itself (snarlfind.mojo: vg snarls' decomposition of the components the
-   contigs' reference paths lie in), or come from a distance index (dist.mojo, `--dist`), checked against the graph,
-   or from vg snarls of each contig's connected component, cached (`--snarls-cache`): one `vg chunk -C` pass extracts
-   the components of the contigs not yet in the snarls cache, and `vg snarls` runs on several at once (it uses about
-   one core each). Whole-genome vg snarls would make every contig pay for the genome: vg enumerates a snarl's
-   haplotypes before checking which contig it is on. `SnarlSource` is the one interface to the three; each gives
-   the same snarls, so the same catalog but for its header's `snarls.*` keys.
+   contigs' reference paths lie in), or come from vg snarls of each contig's connected component, cached
+   (`--snarls-cache`): one `vg chunk -C` pass extracts the components of the contigs not yet in the snarls cache, and
+   `vg snarls` runs on several at once (it uses about one core each). Whole-genome vg snarls would make every contig
+   pay for the genome: vg enumerates a snarl's haplotypes before checking which contig it is on. `SnarlSource` is the
+   one interface to the two; both give the same snarls, so the same catalog but for its header's `snarls.*` keys.
+   (A distance index is no longer a source: `dromos snarls --dist` reads one, distgraph.mojo.)
 2. The graph's parts are read once (the GBWT, and the node letters' pieces, unpacked as they are needed; computed
    snarls are found from the same load), then the contigs are built CONTIGS_AT_ONCE at a time, the biggest first,
    their steps on one pool of workers (catalog.mojo), and written into one file in their order (sites.mojo).
@@ -27,7 +27,6 @@ from std.time import perf_counter_ns
 
 from dromos.bgzf import RawFile
 from dromos.catalog import ContigPlan, Graph, ReferencePath, finish_catalog, run_steps
-from dromos.dist import CHAIN, ORIENTATION, DistIndex
 from dromos.graph import Metadata, fingerprint, graph_tags, reference_paths, resolve_reference_sample
 from dromos.sites import (
     BLOCK_BP,
@@ -42,7 +41,7 @@ from dromos.sites import (
     put_oriented,
 )
 from dromos.snarlfind import TIES, snarls_of_nodes
-from dromos.snarls import Snarl, read_snarls
+from dromos.snarls import ORIENTATION, Snarl, read_snarls
 from dromos.parallel import Background, ParallelTask
 from dromos.pool import Pool
 from dromos.stream import mut_untracked, untracked
@@ -56,7 +55,6 @@ comptime WORK_PREFIX = ".dromos-work-"
 struct BuildOptions(Movable):
     var graph: String
     var out: String
-    var dist: Optional[String]
     var reference_sample: Optional[String]
     var regions: List[String]
     var snarls_jobs: Optional[Int]
@@ -68,7 +66,6 @@ struct BuildOptions(Movable):
     def __init__(out self):
         self.graph = String()
         self.out = String()
-        self.dist = None
         self.reference_sample = None
         self.regions = List[String]()
         self.snarls_jobs = None
@@ -507,59 +504,36 @@ def catalog_path(o: BuildOptions, sample: String) -> String:
 
 
 comptime VG_SNARLS = 0
-comptime DIST_SNARLS = 1
-comptime COMPUTED_SNARLS = 2
+comptime COMPUTED_SNARLS = 1
 
 
 struct SnarlSource(Movable):
     """Where a contig's snarls come from: computed by dromos from the graph (snarlfind.mojo, every contig's at once),
-    vg snarls files (a folder of <contig>.snarls, made by vg chunk and vg snarls when missing), or a distance index
-    (dist.mojo)."""
+    or vg snarls files (a folder of <contig>.snarls, made by vg chunk and vg snarls when missing)."""
 
     var kind: Int
     var cache: String
-    var dist: Optional[DistIndex]
     var computed: Dict[String, List[Snarl]]
     """Computed snarls, by contig."""
 
     def __init__(out self, cache: String):
         self.kind = VG_SNARLS
         self.cache = cache
-        self.dist = None
-        self.computed = Dict[String, List[Snarl]]()
-
-    def __init__(out self, var dist: DistIndex):
-        self.kind = DIST_SNARLS
-        self.cache = String()
-        self.dist = dist^
         self.computed = Dict[String, List[Snarl]]()
 
     def __init__(out self, var computed: Dict[String, List[Snarl]]):
         self.kind = COMPUTED_SNARLS
         self.cache = String()
-        self.dist = None
         self.computed = computed^
 
-    def read(mut self, graph: Graph, r: ReferencePath, threads: Int) raises -> List[Snarl]:
+    def read(mut self, r: ReferencePath, threads: Int) raises -> List[Snarl]:
         """The snarls of `r`'s contig (its connected component). Computed snarls are handed over, once: drivers of
         different contigs may call this at the same time."""
         var contig = String(r.chrom[byte = r.chrom.rfind("#") + 1 :])
         if self.kind == VG_SNARLS:
             return read_snarls(self.cache + "/" + contig + ".snarls", threads)
-        if self.kind == COMPUTED_SNARLS:
-            var out = List[Snarl]()
-            swap(out, self.computed[contig])
-            return out^
-        ref d = self.dist.value()
-        if len(r.steps) == 0:
-            return List[Snarl]()
-        var top = d.top(Int(r.steps[0] >> 1))
-        var last = d.top(Int(r.steps[len(r.steps) - 1] >> 1))
-        if last != top:
-            raise Error(t"{d.path}: {r.chrom} runs through two components of the distance index: another graph's?")
-        check_chain_edges(d, graph, top, r.chrom)
         var out = List[Snarl]()
-        d.snarls(top, out)
+        swap(out, self.computed[contig])
         return out^
 
     def props(self, mut out: List[Tuple[String, String]]):
@@ -568,86 +542,11 @@ struct SnarlSource(Movable):
             out.append(("snarls.dromos.version", DROMOS_VERSION))
             out.append(("snarls.orientation", ORIENTATION))
             out.append(("snarls.ties", TIES))
-        elif self.kind == DIST_SNARLS:
-            ref d = self.dist.value()
-            out.append(("snarls.source", "distance index"))
-            out.append(("snarls.file", _base_name(d.path)))
-            out.append(("snarls.dist.version", String(d.version)))
-            out.append(("snarls.dist.bytes", String(d.file.size)))
-            out.append(("snarls.orientation", ORIENTATION))
         else:
             out.append(("snarls.source", "vg snarls"))
             var v = _read_text(self.cache + "/vg.version")
             out.append(("snarls.vg", String(v.value().strip()) if v else String("unknown (snarls found cached)")))
             out.append(("snarls.orientation", "vg snarls'"))
-
-
-def check_dist(d: DistIndex, graph: Graph) raises:
-    """Refuses a distance index whose node ids are not the graph's: the same smallest and largest id and the same
-    number of nodes."""
-    var g = graph.parts.node_range()
-    var count = d.node_count()
-    if d.min_id != g[1] or d.max_id() != g[2] or count != g[0]:
-        raise Error(
-            t"{d.path} is not this graph's distance index: it holds {count} nodes, ids {d.min_id} to {d.max_id()};"
-            t" the graph {g[0]} nodes, ids {g[1]} to {g[2]}"
-        )
-
-
-def check_chain_edges(d: DistIndex, graph: Graph, top: Int, chrom: String) raises:
-    """Refuses a distance index whose top-level chain (the one `chrom` runs along) steps between nodes the graph has
-    no edge between: each pair of consecutive chain nodes with no snarl between them is one of the graph's edges."""
-    var words = List[UInt64]()
-    var snarl_at = List[Int]()
-    if d.kind(top) < CHAIN:
-        return
-    d.chain_words(top, words, snarl_at)
-    var skip = List[Bool](length=len(words) + 1, fill=False)
-    for i in range(len(snarl_at) // 2):
-        skip[snarl_at[2 * i + 1]] = True
-    var froms = List[UInt64]()
-    var tos = List[UInt64]()
-    var succ = List[UInt64]()
-    var counts = List[Int64]()
-
-    for k in range(1, len(words)):
-        if skip[k]:
-            continue
-        froms.append(words[k - 1])
-        tos.append(words[k])
-        if len(froms) == 1 << 16:
-            _check_edges(d, graph, chrom, froms, tos, succ, counts)
-    if len(froms) > 0:
-        _check_edges(d, graph, chrom, froms, tos, succ, counts)
-
-
-def _check_edges(
-    d: DistIndex,
-    graph: Graph,
-    chrom: String,
-    mut froms: List[UInt64],
-    mut tos: List[UInt64],
-    mut succ: List[UInt64],
-    mut counts: List[Int64],
-) raises:
-    """Each `froms[j]` has an edge to `tos[j]`; the lists are emptied."""
-    graph.parts.edges(froms.unsafe_ptr(), len(froms), False, succ, counts)
-    var at = 0
-    for j in range(len(froms)):
-        var n = Int(counts[j])
-        if n < 0:
-            raise Error(t"{d.path} is not this graph's distance index: node {froms[j] >> 1} is not in the graph")
-        var found = False
-        for x in range(n):
-            found = found or succ[at + x] == tos[j]
-        at += n
-        if not found:
-            raise Error(
-                t"{d.path} is not this graph's distance index: its chain along {chrom} steps from node"
-                t" {froms[j] >> 1} to {tos[j] >> 1}, which the graph does not join"
-            )
-    froms.clear()
-    tos.clear()
 
 
 def run_build(o: BuildOptions) raises:
@@ -697,13 +596,9 @@ def run_build(o: BuildOptions) raises:
                     whole = True
         regions.append(List[Tuple[Int, Int]]() if whole else rs^)
 
-    # The snarls: computed once the graph is loaded (the default), a distance index, or vg snarls (cached, or made
-    # now).
+    # The snarls: computed once the graph is loaded (the default), or vg snarls (cached, or made now).
     var source = SnarlSource(Dict[String, List[Snarl]]())
-    if o.dist:
-        source = SnarlSource(DistIndex(o.dist.value()))
-        log(t"snarls from the distance index {o.dist.value()} (version {source.dist.value().version})")
-    elif o.snarls_cache:
+    if o.snarls_cache:
         var cache = o.snarls_cache.value()
         makedirs(cache, exist_ok=True)
         var id_file = cache + "/graph.id"
@@ -726,8 +621,6 @@ def run_build(o: BuildOptions) raises:
 
     var graph = Graph(o.graph, o.threads)
     log("graph loaded")
-    if source.kind == DIST_SNARLS:
-        check_dist(source.dist.value(), graph)
     var md = graph.parts.metadata()
     if source.kind == COMPUTED_SNARLS:
         source = SnarlSource(compute_snarls(graph, md, sample, contigs, o.threads))
@@ -810,34 +703,12 @@ comptime CONTIGS_AT_ONCE = 3
 """Contigs built at a time ($DROMOS_CONTIGS_AT_ONCE to change): their steps share the pool's workers."""
 
 
-def contig_weight(graph: Graph, md: Metadata, sample: String, contig: String, source: SnarlSource) raises -> Int:
-    """How much work a contig is, roughly, to start the biggest first: its chain's nodes in the distance index, or
-    its vg snarls file's size."""
+def contig_weight(contig: String, source: SnarlSource) raises -> Int:
+    """How much work a contig is, roughly, to start the biggest first: its computed snarls, or its vg snarls file's
+    size."""
     if source.kind == VG_SNARLS:
         return RawFile(source.cache + "/" + contig + ".snarls").size
-    if source.kind == COMPUTED_SNARLS:
-        return len(source.computed[contig])
-    var sample_id = md.sample_id(sample)
-    var contig_id = md.contig_id(contig)
-    if not sample_id or not contig_id:
-        return 0
-    var names = md.path_names()
-    var best = -1
-    var best_fragment = Int.MAX
-    for id in range(len(names)):
-        var p = names[id]
-        if p.sample == sample_id.value() and p.contig == contig_id.value() and p.phase == 0:
-            if p.fragment < best_fragment:
-                best = id
-                best_fragment = p.fragment
-    if best < 0:
-        return 0
-    var v = graph.parts.path_first(best)
-    ref d = source.dist.value()
-    if v == 0 or d.node_record(Int(v >> 1)) == 0:
-        return 0
-    var top = d.top(Int(v >> 1))
-    return d.entry(top + 1) if d.kind(top) >= CHAIN else 0
+    return len(source.computed[contig])
 
 
 struct _Shared(Movable):
@@ -916,7 +787,7 @@ struct _ContigTask(Movable, ParallelTask):
             var chrom = r.chrom
             var length = r.length
             var md5 = reference_md5(graph, r)
-            var snarls = sh.source[].read(graph, r, sh.threads)
+            var snarls = sh.source[].read(r, sh.threads)
             var plan = ContigPlan(graph, r^, snarls^, sh.regions[k], sh.threads, sh.pool, index)
             var done = finish_catalog(run_steps(graph, plan^, sh.level, sh.threads))
             var blocks = List[EncodedBlock]()
@@ -965,7 +836,7 @@ def run_contigs(
     writer puts the contigs in the file in their order, whatever order they finish in."""
     var weights = List[Int]()
     for c in contigs:
-        weights.append(contig_weight(graph, md, sample, c, source))
+        weights.append(contig_weight(c, source))
     var order = List[Int]()
     for k in range(len(contigs)):
         order.append(k)
