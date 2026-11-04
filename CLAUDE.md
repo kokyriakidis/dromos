@@ -18,7 +18,7 @@ snarl decomposition, haplotype walks, reference positions, linearization).
   linearization) never import `cli/`. They raise errors; they do not parse arguments or print usage.
 - `cli/dromos_cli.mojo` is a thin layer: it parses each command's options, prints its usage and calls the command's
   entry point in the library (`run_build`, `run_index`, `run_gam_to_gaf`, `run_surject`, `graph_cache`, `view`,
-  `info`, `find_all_snarls`). No algorithm lives there.
+  `info`, `find_all_snarls`, `run_dist_snarls`). No algorithm lives there.
 - Each algorithm has an importable entry point and its own tests (tests/test_dromos.mojo, and the integration
   checks), and is accepted only once checked against its reference (vg, libbdsg, pgcatalog) on the HPRC graph.
 
@@ -56,20 +56,24 @@ habits:
   placements are laid out; every section written through a mapping) and found or made again (`graph_cache`).
 - `dromos/snarls.mojo`: vg snarls files (plain, gzip, BGZF), pgcatalog's snarls.rs. `dromos/dist.mojo`: snarls from a
   giraffe distance index (libbdsg's SnarlDistanceIndex, versions 3 and 4), read in place, oriented as vg snarls writes
-  them. `dromos/bigraph.mojo`: the graph's nodes and edges read from the GBZ by ranges of ids on every thread and split
-  into weakly connected components (`Components`: a CSR `Bigraph` each, and each node's component).
-  `dromos/snarlfind.mojo`: vg snarls' snarls computed (vg's IntegratedSnarlFinder and SnarlManager rules on flat arrays;
-  its notes say which step is which), the components found in parallel, the biggest first (`find_all_snarls`,
-  `snarls_of_nodes`, `write_snarls_tsv`). `dromos/flat.mojo`: `Flat`, a List read and written without bounds checks, for
-  the finder's hot loops. `dromos/catalog.mojo`: one contig's records (pgcatalog's catalog.rs, record.rs and
-  reference.rs): node letters a page at a time, the reference path and its traversals, the haplotype walk search,
-  records, their blocks and `encode_block` (a block's columns), and the steps that build and encode them on the pool.
-  `dromos/build.mojo`: the `catalog` command (build.rs: regions, `SnarlSource`, the one interface to the snarls' three
-  sources: computed from the graph's own load, the default, `compute_snarls`; a distance index, `--dist`, checked
-  against the graph; or the snarls cache, `--snarls-cache`, vg chunk and vg snarls when a contig's snarls are not
-  cached; contigs built three at a time, the biggest first). `dromos/sites.mojo`: the site catalog's format
-  (docs/catalog-format.md is its specification): the writer, the reader, `view`, `info` and surject's snarl windows.
-  `dromos/pool.mojo`: worker threads shared by several jobs at once (every contig's steps).
+  them; a dependency-light reader and a second oracle for the snarl finder, not a source of the catalog's snarls.
+  `dromos/distgraph.mojo`: `dromos snarls --dist` (`run_dist_snarls`): every component's snarls of the index
+  (`dist_snarls`), and the checks that refuse another graph's index (`check_graph`: node ids and count, each reference
+  path in one component, top-level chains' steps the graph's edges). `dromos/bigraph.mojo`: the graph's nodes and edges
+  read from the GBZ by ranges of ids on every thread and split into weakly connected components (`Components`: a CSR
+  `Bigraph` each, and each node's component). `dromos/snarlfind.mojo`: vg snarls' snarls computed (vg's
+  IntegratedSnarlFinder and SnarlManager rules on flat arrays; its notes say which step is which), the components found
+  in parallel, the biggest first (`find_all_snarls`, `snarls_of_nodes`, `write_snarls_tsv`). `dromos/flat.mojo`: `Flat`,
+  a List read and written without bounds checks, for the finder's hot loops. `dromos/catalog.mojo`: one contig's records
+  (pgcatalog's catalog.rs, record.rs and reference.rs): node letters a page at a time, the reference path and its
+  traversals, the haplotype walk search, records, their blocks and `encode_block` (a block's columns), and the steps
+  that build and encode them on the pool. `dromos/build.mojo`: the `catalog` command (build.rs: regions, `SnarlSource`,
+  the one interface to the snarls' two sources: computed from the graph's own load, the default, `compute_snarls`; or
+  the snarls cache, `--snarls-cache`, vg chunk and vg snarls when a contig's snarls are not cached; contigs built three
+  at a time, the biggest first by their computed snarls' count or their snarls file's size; `--dist` is refused).
+  `dromos/sites.mojo`: the site catalog's format (docs/catalog-format.md is its specification): the writer, the reader,
+  `view`, `info` and surject's snarl windows. `dromos/pool.mojo`: worker threads shared by several jobs at once (every
+  contig's steps).
 - `dromos/stream.mojo`: the pipeline every command runs on: reads (O_DIRECT), decoding (BGZF, plain, gzip), GAM
   told from GAF by the first bytes (`looks_like_gaf`), framing (GAM messages or GAF lines), and a `MessageSink`
   taking slices of each chunk.
@@ -111,10 +115,16 @@ habits:
 - A cache is written under a temporary name in its folder and renamed; a file that is not a dromos cache, or
   another graph's (its name and fingerprint differ), is never written over; a damaged one, another version's, or one
   of an older state of the graph is made again. edges.sh checks each case.
-- End to end: `pixi run check ENV_FILE [--full]` (tests/integration/check.sh) checks dromos's outputs against vg's and
-  pgcat's byte for byte; ENV_FILE names the data on the machine that has it. Run it after any change that
-  could touch output. tests/integration/edges.sh ENV_FILE runs odd and damaged inputs (empty files, gzip and BGZF
-  shapes, the chunk boundary, threads, stdin, truncation, the graph's cache): every line must say ok.
+- End to end: `pixi run check ENV_FILE [--full] [--only GROUP,...]` (tests/integration/check.sh) checks dromos's
+  outputs against vg's and pgcat's byte for byte; ENV_FILE names the data on the machine that has it. Groups: cache,
+  catalog, snarls, convert, index, surject; each prints its time. tests/integration/edges.sh ENV_FILE runs odd and
+  damaged inputs (empty files, gzip and BGZF shapes, the chunk boundary, threads, stdin, truncation, the graph's
+  cache): every line must say ok.
+- The test loop must be fast: run the groups a change touches (`--only`), and all of them, with `--full`, only for a
+  change to shared code (stream.mojo, the gbz FFI, the cache) or a release. Reference outputs (pgcat's, pgcatalog's,
+  vg's snarls as tables) are made once in WORK and kept; never empty WORK to check. Cases run in parallel where they
+  are independent (contigs), never repeat what another case implies, and use a byte comparison before any slow
+  explaining tool. A slow check is a bug: time it and fix it.
 - Toolchain: one Mojo nightly, pinned exactly in `pixi.toml` (1.2.0.dev2026102005), the one karan, sporos and plegma
   build with. Move it on purpose: change the pin, `pixi lock`, build and test.
 - Build and test where the data are (a GAM and its GBZ graph): `pixi run ...`.
@@ -131,20 +141,21 @@ habits:
 - `dromos view` of a `dromos catalog` file must print, for each contig and region, pgcatalog view's text of pgcatalog
   build's catalog of it from the same snarls, byte for byte; the file must be the same for any threads. Check any change
   with `pixi run check` (its catalog and view cases; `--full` for the whole genome, against pgcatalog's catalogs, and
-  the catalogs from vg snarls and from the distance index against the computed snarls'; DIST in the env file names the
-  graph's .dist) and tests/integration/edges.sh. `DROMOS_CONTIGS_AT_ONCE` changes how many contigs a build runs at once
-  (3; the file is the same for any). Haplotype walks may be found in any order (they are sorted); a heavy snarl's
-  haplotypes are searched in parts whose walks and counts add up.
-- Snarls computed by dromos (the catalog's default) and snarls from a distance index must be vg snarls' (the same start
-  and end visits, the same parents read in either direction, the same chains): the catalog from any of the three
-  sources is the same file but for its header's `snarls.*` keys, on the whole HPRC genome. vg writes a parent in its
-  orientation before `regularize`, which follows its hash orders; the catalog reads a parent in either direction
-  (`canonical`). Where vg breaks a tie by hash order (equal-length cycles or leaf paths, a tied orientation vote) the
-  finder takes its own first; `DROMOS_SNARL_TIES=last|mask:N` breaks them otherwise, for tests/integration/fuzz.py.
-  Check any change to the finder with the unit tests, `pixi run check ENV --full` (compare_genome.sh: every contig of
-  the cached vg snarls EXACT), fuzz.py (random graphs against vg snarls: differences only from ties), and
-  bfcheck.py (every snarl is one of BubbleFinder's). BubbleFinder is GPL-3.0: run its binary as an oracle, never read
-  or copy its source.
+  the catalog from vg snarls against the computed snarls') and tests/integration/edges.sh. `DROMOS_CONTIGS_AT_ONCE`
+  changes how many contigs a build runs at once (3; the file is the same for any). Haplotype walks may be found in any
+  order (they are sorted); a heavy snarl's haplotypes are searched in parts whose walks and counts add up.
+- Snarls computed by dromos (the catalog's default) and snarls from a distance index (`dromos snarls --dist`) must be vg
+  snarls' (the same start and end visits, the same parents read in either direction, the same chains): the catalog from
+  either of its two sources is the same file but for its header's `snarls.*` keys, on the whole HPRC genome, and `pixi
+  run check ENV --full` compares the distance index's table (DIST in the env file names the graph's .dist) with vg
+  snarls' files and with the computed snarls (compare_genome.sh with MINE or ORACLE: every contig EXACT); the small
+  graph's tests/data/micb-kir3dl1.dist is compared always. vg writes a parent in its orientation before `regularize`,
+  which follows its hash orders; the catalog reads a parent in either direction (`canonical`). Where vg breaks a tie by
+  hash order (equal-length cycles or leaf paths, a tied orientation vote) the finder takes its own first;
+  `DROMOS_SNARL_TIES=last|mask:N` breaks them otherwise, for tests/integration/fuzz.py. Check any change to the finder
+  with the unit tests, `pixi run check ENV --full` (compare_genome.sh: every contig of the cached vg snarls EXACT),
+  fuzz.py (random graphs against vg snarls: differences only from ties), and bfcheck.py (every snarl is one of
+  BubbleFinder's). BubbleFinder is GPL-3.0: run its binary as an oracle, never read or copy its source.
 - `dromos surject` must write the SAM records `pgcatalog surject` writes (pgphase's tools/pgcatalog), byte for byte,
   from a GAM and from its GAF: check any change with `pixi run check` (its surject cases; `--full` for the slice).
   Float ties in `chain` use libm's log2, as Rust does. Without `--contig` it surjects every contig of the reference

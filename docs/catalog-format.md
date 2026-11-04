@@ -92,8 +92,9 @@ Properties (all values are text; a reader should ignore keys it does not know):
 | `graph.nodes`, `graph.min_node`, `graph.max_node` | the graph's node count and id range |
 | `gbz.<key>`, `gbwt.<key>` | each of the GBZ's tags and its GBWT's (`gbz.pggname`: the graph's content name) |
 | `reference.sample` | the sample whose paths are the reference (CHM13) |
-| `snarls.source` | `distance index` or `vg snarls` |
-| `snarls.file`, `snarls.dist.version`, `snarls.dist.bytes` | the distance index: its file name, its SnarlDistanceIndex version, its size |
+| `snarls.source` | `dromos` (computed from the graph) or `vg snarls`; `distance index` in catalogs of dromos before November 2026, which read one |
+| `snarls.dromos.version`, `snarls.ties` | computed snarls: the dromos that computed them, how it breaks the ties vg breaks by hash order |
+| `snarls.file`, `snarls.dist.version`, `snarls.dist.bytes` | a distance index (older catalogs): its file name, its SnarlDistanceIndex version, its size |
 | `snarls.vg` | the vg that made the snarls (`vg version`'s first line), when known |
 | `snarls.orientation` | how snarls are oriented (vg snarls' orientation either way) |
 | `build.block_bp`, `build.block_bytes`, `build.own_block_bytes`, `build.level` | the block rules and zstd level |

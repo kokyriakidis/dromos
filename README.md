@@ -16,7 +16,7 @@ and keeps what the other commands need of it in one cache file beside it. It is 
 | `dromos catalog` | a GBZ graph's site catalog: every snarl on the reference, every contig, in one file of binary columns |
 | `dromos view` | a catalog as VCF, a contig or a region of it: the text `pgcatalog view` prints |
 | `dromos catalog-info` | a catalog's header: the graph it belongs to, its contigs, where its snarls came from |
-| `dromos snarls` | a GBZ graph's snarls, the decomposition `vg snarls` makes, as a table |
+| `dromos snarls` | a GBZ graph's snarls, the decomposition `vg snarls` makes, as a table; or a distance index's |
 | `dromos prepare` | a GBZ graph's cache, made ahead of the commands that read it |
 | `dromos reference-samples` | the reference samples a GBZ graph declares |
 
@@ -73,29 +73,28 @@ machine, writing to a hard disk:
 | `pgcatalog build` (measured earlier) | 499 s | 2,588 s | 17.8 GB | 25 files, 1.51 GB |
 | dromos before | 260.6 s | 2,162 s | 24.8 GB | 25 files, 1.51 GB |
 | **`dromos catalog`**, cached vg snarls (`--snarls-cache`) | **184.7 s** | 1,732 s | 19.2 GB | **one file, 487 MB** |
-| `dromos catalog`, snarls from the graph's `.dist` (`--dist`) | 191.0 s | 1,737 s | 27.5 GB ² | the same records |
-| `dromos catalog` with no snarls: `vg chunk` (13.0 min), `vg snarls` (11.0 min), then the build | 27 min 5 s | 8,624 s | 22.6 GB ³ | the same records |
+| `dromos catalog` with no snarls: `vg chunk` (13.0 min), `vg snarls` (11.0 min), then the build | 27 min 5 s | 8,624 s | 22.6 GB ² | the same records |
 
-The three sources of snarls measured again later, back to back, twice each (a quiet machine, 10 threads):
+The two sources of snarls measured again later, back to back, twice each (a quiet machine, 10 threads):
 
 | Every contig, snarls | Wall (two runs) | CPU | Peak memory |
 |---|---|---|---|
 | **computed by dromos** (the default: no vg, no `.dist`) | **204.1 s, 201.2 s** | 1,845 s | 20.3 GB |
-| from the `.dist` | 195.4 s, 192.6 s | 1,737 s | 27.8 GB ² |
 | cached vg snarls | 187.5 s, 186.8 s | 1,734 s | 20.2 GB |
 
 Computing the snarls takes 12 to 14 s of the build, after the graph's load and before the first contig: the edges
 read from the GBWT's records (3.0 s), the components (1.6 s) and the snarls found (8.5 s, the largest component's,
-chr1's, 7.4 s on one thread, the others beside it). It costs about 9 s more than reading a `.dist` and 7.5 GB less
-memory, and needs no file the graph does not come with, so a `.dist` beside the graph is read only when named.
+chr1's, 7.4 s on one thread, the others beside it), and needs no file the graph does not come with. A distance index
+(giraffe's `.dist`) is no longer a source of the catalog's snarls: read in place, it saved about 9 s of the build for
+7.5 GB more memory (its pages count in the peak), its format changes from version to version, and it had to be
+checked against the graph. `dromos snarls --dist` reads one.
 
 The contigs are built three at a time, the biggest first, on one pool of workers, busy 98% of the build. On a busy
 machine (two of the ten cores taken by other work) the same build takes 239 s, the previous one 322 s. The catalog's
-view of every contig is pgcatalog view's text of pgcatalog's catalogs, and the catalogs from computed snarls and
-from the distance index are the one from vg snarls but for their header's `snarls.*` keys.
+view of every contig is pgcatalog view's text of pgcatalog's catalogs, and the catalog from computed snarls is the
+one from vg snarls but for its header's `snarls.*` keys.
 
-² The distance index (8.5 GB) is mapped and read as needed; its pages count in the peak.
-³ dromos's own; vg's processes come and go beside it, up to six `vg snarls` at a time within the memory available.
+² dromos's own; vg's processes come and go beside it, up to six `vg snarls` at a time within the memory available.
 
 A region query (`dromos view CATALOG chr20:START-END`, a process each) opens the catalog and reads its contig's
 index in 10 ms; 100 kb of chr6 takes 24 ms against `pgcatalog view`'s 41 ms. Regions whose records make tens of MB
@@ -170,14 +169,13 @@ dromos catalog-info graph.CHM13.sites                                  # the gra
   version, a truncated file or a damaged one (every block has a CRC).
 - **Snarls.** Computed by dromos from the graph itself, by default: the snarls `vg snarls` writes for the connected
   components the contigs' reference paths lie in (vg's IntegratedSnarlFinder and SnarlManager rules, orientation
-  included), from the same load of the graph the catalog reads; no vg, no distance index. Or from a distance index
-  (giraffe's `.dist`, `--dist`), read in place and checked against the graph (its node ids and count, and each
-  contig's chain against the graph's edges); its snarls are vg snarls' too. Or from vg (`--snarls-cache DIR`:
-  `vg chunk -C` for each contig's component, then `vg snarls`, for the contigs not already there), kept in that
-  folder, which records the graph it belongs to; a cache made by `pgcatalog build` serves as well. The three give the
-  same catalog; its header says which made it (`snarls.source`: `dromos`, `distance index` or `vg snarls`).
+  included), from the same load of the graph the catalog reads; no vg, no distance index. Or from vg
+  (`--snarls-cache DIR`: `vg chunk -C` for each contig's component, then `vg snarls`, for the contigs not already
+  there), kept in that folder, which records the graph it belongs to; a cache made by `pgcatalog build` serves as
+  well. The two give the same catalog; its header says which made it (`snarls.source`: `dromos` or `vg snarls`).
+  A distance index is not read (`--dist` is refused; `dromos snarls --dist` reads one).
 - **Options.** `--graph`, `--out`, `--reference-sample`, `--region` (repeatable), `-t`/`--threads`, `--level` (zstd,
-  9), `--dist`, `--snarls-cache`, `--vg`, `--snarls-jobs` (vg snarls runs at a time, 6).
+  9), `--snarls-cache`, `--vg`, `--snarls-jobs` (vg snarls runs at a time, 6).
 - **`dromos view CATALOG [CONTIG[:START-END]]`** prints, for a contig and a region of it, the text `pgcatalog view`
   printed of that contig's `.pgsites` catalog: its VCF header, then the records overlapping the region as tabix
   would return them. Without a contig, every contig, in one VCF.
@@ -188,6 +186,7 @@ dromos catalog-info graph.CHM13.sites                                  # the gra
 ```sh
 dromos snarls --graph graph.gbz -o graph.snarls.tsv        # every component's snarls, as vg snarls finds them
 dromos snarls --vg-file chr20.snarls -o chr20.vg.tsv       # a vg snarls file as the same columns, to compare
+dromos snarls --dist graph.dist --graph graph.gbz -o graph.dist.tsv   # a distance index's, checked against the graph
 ```
 
 A line per snarl: its component, start and end visits (`id << 1 | reverse`), its parent's, its chain, its rank in
@@ -332,21 +331,25 @@ dromos is checked byte for byte against the tools it replaces, on HG002 HiFi ali
   the one file prints pgcatalog view's text of each `.pgsites` catalog, byte for byte, for all 25 CHM13 contigs of
   the HPRC graph (43,494,146 records, 152 GB of VCF text, the largest record a 6.6 GB line on chr2), regions of
   them, and the small graph's catalogs pgphase's tests commit; the file is the same whatever the threads. Snarls
-  computed by dromos and snarls read from the graph's distance index give the same file as vg snarls but for the
-  header's `snarls.*` keys.
+  computed by dromos give the same file as vg snarls but for the header's `snarls.*` keys.
 - `snarls` computes the snarls `vg snarls` writes: on all 25 contigs of the HPRC graph, all 51,186,896 snarls with
   the same start and end visits, the same parents and the same chains; on 3,000 random graphs (inversions,
   duplications, self loops, tips, several components) every difference is a tie vg breaks by its hash tables' order;
-  and every snarl it writes is one of BubbleFinder's (its binary used as an oracle only).
+  and every snarl it writes is one of BubbleFinder's (its binary used as an oracle only). `snarls --dist` reads the
+  same snarls from the graph's distance index: on all 25 contigs, the same start and end visits and parents as vg
+  snarls' files, and as the computed snarls with their chains in the same order.
 - `tests/integration/edges.sh` covers odd and damaged inputs: empty files, multi-member gzip, lines across chunk
   boundaries, any thread count, stdin, and truncated or corrupt files, which fail instead of leaving a partial
   index; and the graph's cache made, reused, made again (a changed graph, a cache cut short or damaged, another
   version's), kept elsewhere, made by several runs at once, and refused (a read-only folder, a file that is not a
   cache, another graph's cache); site catalogs of odd snarls files, regions and thread counts (the same file on any),
-  and catalogs and distance indexes refused (truncated, damaged, another format version, another graph's).
+  catalogs refused (truncated, damaged, another format version, another graph's), and distance indexes refused by
+  `snarls --dist --graph` (truncated, version 5, another graph's).
 
 ```sh
-pixi run check ENV_FILE [--full]        # end-to-end checks; ENV_FILE names the data (see tests/integration/check.sh)
+pixi run check ENV_FILE [--full] [--only GROUP,...]  # end-to-end checks; ENV_FILE names the data
+                                                     # (see tests/integration/check.sh); groups: cache, catalog,
+                                                     # snarls, convert, index, surject
 tests/integration/edges.sh ENV_FILE     # odd and damaged inputs
 ```
 
