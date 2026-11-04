@@ -197,7 +197,8 @@ fails "surject: -l without -o" $D surject $DG -l 3 $G
 fails "surject -o: a folder that does not exist" $D surject $DG $G -o /nonexistent/x.bam
 # 8. catalog and view on the small graph (GBZ_SMALL, its committed snarls and distance index), against pgcatalog build
 # and view: odd snarls files, regions and contigs, threads (the same file whatever their number); a missing snarls
-# cache made with vg (VG, the vg binary pgcatalog runs); distance indexes refused; damaged catalogs refused.
+# cache made with vg (VG, the vg binary pgcatalog runs); distance indexes refused; snarls computed by dromos (the
+# default: any threads, a contig with no snarls, a tiny graph); damaged catalogs refused.
 S=$OLDPWD/tests/data/micb-kir3dl1.catalog/snarls
 [ -d "$S" ] || S=$HOME/dromos/tests/data/micb-kir3dl1.catalog/snarls
 SD=$(dirname $(dirname $S))/micb-kir3dl1.dist
@@ -257,17 +258,70 @@ fails "catalog: no graph" $D catalog --out cx
 fails "catalog: a graph that is not one" $D catalog --graph $SMALL_GAF --out cx --reference-sample CHM13
 fails "catalog: --dist and --snarls-cache" $D catalog --graph $GBZ_SMALL --reference-sample CHM13 --dist $SD \
   --snarls-cache $S --out cx
-# The distance index: beside the graph it is the default; vg snarls' records from it; another graph's refused.
+# The distance index (--dist): vg snarls' records from it; one beside the graph is not read unless named; another
+# graph's refused.
 rm -rf cb; mkdir -p cb; cp -r $S cb/snarls
 $PGCATALOG build --graph $GBZ_SMALL --reference-sample CHM13 --out cb --region chr6 --region chr19 > cb.err 2>&1
-mkdir -p dg; ln -sf $GBZ_SMALL dg/small.gbz; cp $SD dg/small.dist
-$D catalog --graph dg/small.gbz --reference-sample CHM13 --region chr6 --region chr19 -t 3 > dg.err 2>&1
-label="catalog: the .dist beside the graph, read by default"
-ok bash -c "test -s dg/small.CHM13.chr6+chr19.sites && $D catalog-info dg/small.CHM13.chr6+chr19.sites \
-  | grep -q '^snarls.source.distance index'"
-n=$(views_of dg/small.CHM13.chr6+chr19.sites cb)
+$D catalog --graph $GBZ_SMALL --reference-sample CHM13 --region chr6 --region chr19 -t 3 --dist $SD --out dist.sites \
+  > dist.err 2>&1
+n=$(views_of dist.sites cb)
 [ "$n" -gt 0 ] && echo "ok    catalog: from the distance index, vg snarls' records ($n contigs)" \
   || echo "FAIL  catalog: from the distance index ($n)"
+mkdir -p dg; ln -sf $GBZ_SMALL dg/small.gbz; cp $SD dg/small.dist
+$D catalog --graph dg/small.gbz --reference-sample CHM13 --region chr6 --region chr19 -t 3 > dg.err 2>&1
+label="catalog: a .dist beside the graph left alone, the snarls computed"
+ok bash -c "test -s dg/small.CHM13.chr6+chr19.sites && $D catalog-info dg/small.CHM13.chr6+chr19.sites \
+  | grep -q '^snarls.source.dromos'"
+# Snarls computed by dromos: pgcatalog's records from vg snarls, the same file on any threads.
+for t in 1 3 7; do
+  $D catalog --graph $GBZ_SMALL --reference-sample CHM13 --region chr6 --region chr19 -t $t --out computed$t.sites \
+    > computed$t.err 2>&1
+done
+n=$(views_of computed3.sites cb)
+[ "$n" -gt 0 ] && echo "ok    catalog: from computed snarls, vg snarls' records ($n contigs)" \
+  || echo "FAIL  catalog: from computed snarls ($n)"
+label="catalog: computed snarls, the same file on 1, 3 and 7 threads"
+ok bash -c "cmp -s computed1.sites computed3.sites && cmp -s computed1.sites computed7.sites"
+label="catalog: computed snarls named in the header"
+ok bash -c "$D catalog-info computed1.sites | grep -q '^snarls.ties' && $D catalog-info computed1.sites \
+  | grep -q '^snarls.orientation'"
+if [ -n "${VG:-}" ]; then
+  # Graphs made here (vg gbwt from GFA): computed snarls give the catalog vg chunk and vg snarls give.
+  computed_pair() {  # name, GFA, contig...: the catalog from computed snarls and from vg's, the same views
+    local name=$1 gfa=$2; shift 2
+    local regions=() c
+    for c in "$@"; do regions+=(--region "$c"); done
+    rm -rf tg; mkdir -p tg/snarls
+    $VG gbwt -G $gfa --set-reference CHM13 --gbz-format -g tg/g.gbz > tg/gbwt.err 2>&1 \
+      || { echo "??    $name: vg gbwt failed"; return; }
+    $D catalog --graph tg/g.gbz --reference-sample CHM13 "${regions[@]}" -t 3 --out tg/c.sites > tg/c.err 2>&1
+    local crc=$?
+    $D catalog --graph tg/g.gbz --reference-sample CHM13 "${regions[@]}" -t 3 --snarls-cache tg/snarls --vg $VG \
+      --out tg/v.sites > tg/v.err 2>&1
+    local vrc=$?
+    if [ $crc -ne 0 ] || [ $vrc -ne 0 ]; then
+      echo "FAIL  $name: computed rc=$crc, vg rc=$vrc ($(tail -1 tg/c.err))"; return
+    fi
+    local bad=0 records
+    for c in "$@"; do cmp -s <($D view tg/c.sites $c) <($D view tg/v.sites $c) || bad=1; done
+    records=$($D catalog-info tg/c.sites | awk -F'\t' '$1=="records" {print $2}')
+    [ $bad -eq 0 ] && echo "ok    $name ($records records)" || echo "FAIL  $name"
+  }
+  # A contig with no snarls: one linear path, a second haplotype along it.
+  { printf 'H\tVN:Z:1.1\nS\t1\tACGTACGTAC\nS\t2\tGGTTAACC\nS\t3\tTTGACA\n'
+    printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\n'
+    printf 'W\tCHM13\t0\tchrA\t0\t24\t>1>2>3\nW\tHG1\t1\tchrA\t0\t24\t>1>2>3\n'; } > nosnarls.gfa
+  computed_pair "catalog: computed snarls, a contig with no snarls" nosnarls.gfa chrA
+  label="catalog: computed snarls, a contig with no snarls has no records"
+  ok bash -c "$D catalog-info tg/c.sites | grep -qx 'records.0'"
+  # A tiny graph: a SNP and an insertion on chrA, a lone node on chrB (a second component).
+  { printf 'H\tVN:Z:1.1\nS\t1\tACGTAC\nS\t2\tA\nS\t3\tG\nS\t4\tTTGA\nS\t5\tCCC\nS\t6\tGATTACA\nS\t7\tAC\n'
+    printf 'L\t1\t+\t2\t+\t0M\nL\t1\t+\t3\t+\t0M\nL\t2\t+\t4\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
+    printf 'L\t4\t+\t5\t+\t0M\nL\t5\t+\t6\t+\t0M\nL\t4\t+\t6\t+\t0M\n'
+    printf 'W\tCHM13\t0\tchrA\t0\t18\t>1>2>4>6\nW\tHG1\t1\tchrA\t0\t21\t>1>3>4>5>6\n'
+    printf 'W\tCHM13\t0\tchrB\t0\t2\t>7\n'; } > tiny.gfa
+  computed_pair "catalog: computed snarls, a tiny graph" tiny.gfa chrA chrB
+fi
 fails "catalog: another graph's distance index (HPRC's .dist, the small graph)" $D catalog --graph $GBZ_SMALL \
   --reference-sample CHM13 --region chr6 --dist ${DIST:-/nonexistent.dist} --out cx
 fails "catalog: another graph's distance index (the small graph's, HPRC)" $D catalog $DG --region chrY --dist $SD \
@@ -286,7 +340,7 @@ open(sys.argv[2], 'wb').write(d)
 PY
 fails "catalog: a distance index of version 5" $D catalog --graph $GBZ_SMALL --reference-sample CHM13 --region chr6 \
   --dist v5.dist --out cx
-label="catalog: version 5 refused naming the vg fallback"; ok grep -q "snarls-cache" f.err
+label="catalog: version 5 refused, naming the way out"; ok grep -q "Leave out --dist" f.err
 # The catalog's views, against pgcatalog's catalog of chr6 (and of a region past chr6's end: no records).
 rm -rf cb; mkdir -p cb; cp -r $S cb/snarls
 $PGCATALOG build --graph $GBZ_SMALL --reference-sample CHM13 --out cb --region chr6 --region chr6:200000000-200000100 \

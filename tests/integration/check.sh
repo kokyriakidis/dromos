@@ -17,8 +17,9 @@
 #              reference map
 #   CATALOG_DIR pgcatalog's catalogs of the graph (<contig>.pgsites); SURJECT_CONTIG a contig the alignments lie on
 #              (chr10)
-#   SNARLS     the graph's snarls cache (<contig>.snarls and graph.id, as pgcatalog build keeps it), read, not changed
-#   DIST       the graph's distance index (giraffe's .dist; optional: without it the catalogs come from SNARLS alone)
+#   SNARLS     the graph's snarls cache (<contig>.snarls and graph.id, as pgcatalog build keeps it), read, not changed:
+#              vg snarls, the oracle dromos's computed snarls are checked against
+#   DIST       the graph's distance index (giraffe's .dist; optional: the catalog from it is checked with --full)
 #   WORK       a directory for outputs and the pgcat and pgcatalog references (made once, kept), and for the graph's
 #              cache: dromos reads GBZ through a link in WORK/graph, its cache made beside it
 #   SAMTOOLS   samtools (1.24; default: samtools), whose sort and index surject -o's BAM is checked against
@@ -95,8 +96,10 @@ cmp -s "$WORK/elsewhere.dromos" "$G.dromos" && pass "the cache made on first use
 rm -f "$WORK/elsewhere.dromos" "$WORK/d.graph.gz" "$WORK/d.graph.gz.tbi"
 
 # catalog and view: dromos view of dromos's one catalog prints, for each contig and region, what pgcatalog view prints
-# of pgcatalog build's catalog of it from the same snarls (the small graph from its committed snarls and from its
-# distance index; HPRC contigs, a region, and the whole genome); the same file whatever the threads.
+# of pgcatalog build's catalog of it from the same snarls (the small graph from its committed snarls, from its
+# distance index and from snarls dromos computes; HPRC contigs, a region, and the whole genome); the same file
+# whatever the threads. Computed snarls must give the catalog vg snarls give: the same bytes but for the header, whose
+# fields are the same but for its snarls.* keys.
 pgcatalog_catalog() {  # folder, region options...: pgcatalog's catalogs, made once
   local out=$1; shift
   [ -e "$out/done" ] || { rm -rf "$out"; mkdir -p "$out" && cp -r "$SNARLS_OF" "$out/snarls" \
@@ -123,6 +126,16 @@ same_views() {  # name, dromos catalog, pgcatalog folder: each pgcatalog catalog
   done
   [ $n -gt 0 ] && [ $bad -eq 0 ] && pass "$name ($n contigs)" || fail "$name ($bad of $n differ)"
 }
+same_catalog() {  # name, dromos catalog, dromos catalog: byte for byte the same but for the header (and the preamble
+  # that locates it), whose fields are the same but for the snarls.* keys
+  local a b ha hb
+  a=$("$DROMOS" catalog-info "$2" 2> /dev/null | grep -v '^snarls\.\|^file' | md5sum)
+  b=$("$DROMOS" catalog-info "$3" 2> /dev/null | grep -v '^snarls\.\|^file' | md5sum)
+  ha=$(od -An -t u8 -j 24 -N 8 "$2" | tr -d ' ')
+  hb=$(od -An -t u8 -j 24 -N 8 "$3" | tr -d ' ')
+  [ -n "$ha" ] && [ "$ha" == "$hb" ] && [ "$a" == "$b" ] \
+    && cmp -s <(head -c "$ha" "$2" | tail -c +65) <(head -c "$hb" "$3" | tail -c +65) && pass "$1" || fail "$1"
+}
 same_view() {  # name, dromos catalog, pgcatalog catalog, region...: dromos view prints what pgcatalog view prints
   local name=$1 cat=$2 pcat=$3; shift 3
   cmp -s <("$DROMOS" view "$cat" "$@" 2> /dev/null) <("$PGCATALOG" view "$pcat" "$@" 2> /dev/null) && pass "$name" \
@@ -141,6 +154,11 @@ done
 "$DROMOS" catalog --graph "$GBZ_SMALL" --reference-sample CHM13 --dist tests/data/micb-kir3dl1.dist --region chr6 \
   --region chr19 -t 2 --out "$WORK/dcat.small.dist.sites" 2> /dev/null
 same_views "catalog: the small graph, snarls from its distance index" "$WORK/dcat.small.dist.sites" "$WORK/pcat.small"
+"$DROMOS" catalog --graph "$GBZ_SMALL" --reference-sample CHM13 --region chr6 --region chr19 -t 2 \
+  --out "$WORK/dcat.small.computed.sites" 2> /dev/null
+same_views "catalog: the small graph, snarls computed" "$WORK/dcat.small.computed.sites" "$WORK/pcat.small"
+same_catalog "catalog: the small graph, computed snarls as vg snarls" "$WORK/dcat.small.computed.sites" \
+  "$WORK/dcat.small.sites"
 GRAPH_OF=$GBZ SNARLS_OF=$SNARLS
 for c in chr20 chr6 chr1 chrY "chr20:10,000,000-12,000,000"; do
   d=$(echo "$c" | tr ':,' '__')
@@ -148,6 +166,9 @@ for c in chr20 chr6 chr1 chrY "chr20:10,000,000-12,000,000"; do
   dromos_catalog "$WORK/dcat.$d.sites" --region "$c" -t 10
   same_views "catalog: $c" "$WORK/dcat.$d.sites" "$WORK/pcat.$d"
 done
+"$DROMOS" catalog --graph "$GBZ" --reference-sample CHM13 --region chr20 -t 10 --out "$WORK/dcat.chr20.computed.sites" \
+  2> /dev/null
+same_catalog "catalog: chr20, computed snarls as vg snarls" "$WORK/dcat.chr20.computed.sites" "$WORK/dcat.chr20.sites"
 dromos_catalog "$WORK/dcat.chr20_3.sites" --region chr20 -t 3
 cmp -s "$WORK/dcat.chr20_3.sites" "$WORK/dcat.chr20.sites" && pass "catalog: chr20, 3 threads, the same file" \
   || fail "catalog: chr20, 3 threads, the same file"
@@ -161,26 +182,34 @@ same_view "view: chr20, a region named by sample" "$WORK/dcat.chr20.sites" "$P20
 same_view "view: chr20, a contig named alone" "$WORK/dcat.chr20.sites" "$P20" chr20
 same_view "view: chr6, the MHC" "$WORK/dcat.chr6.sites" "$WORK/pcat.chr6/chr6.pgsites" chr6:29,000,000-34,000,000
 same_view "view: chr1, past its end" "$WORK/dcat.chr1.sites" "$WORK/pcat.chr1/chr1.pgsites" chr1:300000000-300000100
-# The whole genome, once: from the distance index when there is one (else vg snarls); with --full, also from vg
-# snarls, each contig's view against pgcatalog's catalogs.
+# The whole genome, once, from snarls dromos computes (the default); with --full, each contig's view against
+# pgcatalog's catalogs, the same catalog from vg snarls and from the distance index, and the computed snarls
+# themselves against vg snarls' files (tests/integration/compare_genome.sh: every contig EXACT).
 ALL=$WORK/dcat.all.sites
-if [ -n "${DIST:-}" ]; then
-  "$DROMOS" catalog --graph "$GBZ" --reference-sample CHM13 --dist "$DIST" -t 10 --out "$ALL" 2> "$ALL.err"
-else
-  dromos_catalog "$ALL" -t 10
-fi
+"$DROMOS" catalog --graph "$GBZ" --reference-sample CHM13 -t 10 --out "$ALL" 2> "$ALL.err"
 "$DROMOS" catalog-info "$ALL" | grep -q "^graph.fingerprint" && pass "catalog-info: the whole genome's header" \
   || fail "catalog-info: the whole genome's header"
+"$DROMOS" catalog-info "$ALL" | grep -q "^snarls.source.dromos" && pass "catalog-info: the snarls computed" \
+  || fail "catalog-info: the snarls computed"
 if [ "$FULL" == "--full" ]; then
-  same_views "catalog: the whole genome" "$ALL" "$CATALOG_DIR"
+  same_views "catalog: the whole genome, computed snarls" "$ALL" "$CATALOG_DIR"
   same_view "view: chr2, its giant record's region" "$ALL" "$CATALOG_DIR/chr2.pgsites" chr2:1-1000000000
+  dromos_catalog "$WORK/dcat.vg.sites" -t 10
+  same_catalog "catalog: the whole genome, computed snarls as vg snarls" "$ALL" "$WORK/dcat.vg.sites"
+  rm -rf "$WORK/dcat.vg.sites"*
   if [ -n "${DIST:-}" ]; then
-    dromos_catalog "$WORK/dcat.vg.sites" -t 10
-    cmp -s <("$DROMOS" view "$ALL") <("$DROMOS" view "$WORK/dcat.vg.sites") \
-      && pass "catalog: the whole genome, the distance index's snarls as vg snarls'" \
-      || fail "catalog: the whole genome, the distance index's snarls as vg snarls'"
-    rm -rf "$WORK/dcat.vg.sites"*
+    "$DROMOS" catalog --graph "$GBZ" --reference-sample CHM13 --dist "$DIST" -t 10 --out "$WORK/dcat.dist.sites" \
+      2> /dev/null
+    same_catalog "catalog: the whole genome, the distance index's snarls as computed snarls" "$ALL" \
+      "$WORK/dcat.dist.sites"
+    rm -rf "$WORK/dcat.dist.sites"*
   fi
+  rm -rf "$WORK/snarls.cmp"
+  "$HERE/compare_genome.sh" "$DROMOS" "$GBZ" "$SNARLS" "$WORK/snarls.cmp" > "$WORK/snarls.cmp.log" 2>&1
+  n=$(ls "$SNARLS" | grep -c '\.snarls$')
+  tail -1 "$WORK/snarls.cmp.log" | grep -qx "EXACT $n of $n" \
+    && pass "snarls: the whole genome's computed snarls as vg snarls' ($n contigs)" \
+    || fail "snarls: the whole genome's computed snarls as vg snarls' ($(tail -1 "$WORK/snarls.cmp.log"))"
 fi
 find "$WORK" -maxdepth 1 -name 'dcat.*' ! -name 'dcat.all.sites' -exec rm -rf {} +
 

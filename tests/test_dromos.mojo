@@ -40,7 +40,7 @@ from dromos.graph import (
 )
 from dromos.prepare import ReferenceSample, folder_of, make_cache, name_of, pack_letters, write_nodes, write_placements
 from dromos.bigraph import Bigraph, components, read_edges
-from dromos.build import check_dist, natural_less, parse_region, reference_md5
+from dromos.build import check_dist, compute_snarls, natural_less, parse_region, reference_md5
 from dromos.flat import Flat
 from dromos.snarlfind import NONE as NO_SNARL, as_snarls, find_snarls
 from dromos.catalog import Encoder, Graph, Placed as SitePlaced, Record, ReferencePath, Traversal, build_catalog
@@ -1924,6 +1924,18 @@ def test_snarlfind_small_graph_as_vg_snarls() raises:
         got.extend(Span(as_snarls(find_snarls(comps.graphs[k]))))
     assert_false(Bool(comps.of(0)))
     _same_snarls(got^, read_snarls("tests/data/micb-kir3dl1.vg.snarls", 2))
+
+
+def test_snarlfind_contigs_as_vg_chunk_and_snarls() raises:
+    """The catalog's computed snarls of each contig: vg chunk -C and vg snarls' of its component (the committed
+    snarls cache), the same on 1 and 3 threads."""
+    var graph = Graph(GBZ, 2)
+    var md = graph.parts.metadata()
+    var contigs: List[String] = ["chr6", "chr19"]
+    for threads in [1, 3]:
+        var got = compute_snarls(graph, md, "CHM13", contigs, threads)
+        for c in contigs:
+            _same_snarls(got[c].copy(), read_snarls("tests/data/micb-kir3dl1.catalog/snarls/" + c + ".snarls", 2))
 
 
 def main() raises:

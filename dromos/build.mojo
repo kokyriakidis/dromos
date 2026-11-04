@@ -2,14 +2,16 @@
 of chosen contigs, or of regions of them.
 
 0. The reference paths come from the GBZ's path metadata, read alone.
-1. Snarls come from the graph's distance index (dist.mojo; GRAPH.dist beside the graph unless told otherwise), checked
-   against the graph, or from vg snarls of each contig's connected component, cached: one `vg chunk -C` pass extracts
+1. Snarls are computed from the graph itself (snarlfind.mojo: vg snarls' decomposition of the components the
+   contigs' reference paths lie in), or come from a distance index (dist.mojo, `--dist`), checked against the graph,
+   or from vg snarls of each contig's connected component, cached (`--snarls-cache`): one `vg chunk -C` pass extracts
    the components of the contigs not yet in the snarls cache, and `vg snarls` runs on several at once (it uses about
-   one core each). Whole-genome snarls would make every contig pay for the genome: vg enumerates a snarl's haplotypes
-   before checking which contig it is on. `SnarlSource` is the one interface to both.
-2. The graph's parts are read once (the GBWT, and the node letters' pieces, unpacked as they are needed), then the
-   contigs are built CONTIGS_AT_ONCE at a time, the biggest first, their steps on one pool of workers (catalog.mojo),
-   and written into one file in their order (sites.mojo).
+   one core each). Whole-genome vg snarls would make every contig pay for the genome: vg enumerates a snarl's
+   haplotypes before checking which contig it is on. `SnarlSource` is the one interface to the three; each gives
+   the same snarls, so the same catalog but for its header's `snarls.*` keys.
+2. The graph's parts are read once (the GBWT, and the node letters' pieces, unpacked as they are needed; computed
+   snarls are found from the same load), then the contigs are built CONTIGS_AT_ONCE at a time, the biggest first,
+   their steps on one pool of workers (catalog.mojo), and written into one file in their order (sites.mojo).
 
 The snarls cache records the graph's fingerprint and refuses another graph's snarls.
 """
@@ -39,6 +41,7 @@ from dromos.sites import (
     SitesWriter,
     put_oriented,
 )
+from dromos.snarlfind import TIES, snarls_of_nodes
 from dromos.snarls import Snarl, read_snarls
 from dromos.parallel import Background, ParallelTask
 from dromos.pool import Pool
@@ -505,32 +508,48 @@ def catalog_path(o: BuildOptions, sample: String) -> String:
 
 comptime VG_SNARLS = 0
 comptime DIST_SNARLS = 1
+comptime COMPUTED_SNARLS = 2
 
 
 struct SnarlSource(Movable):
-    """Where a contig's snarls come from: vg snarls files (a folder of <contig>.snarls, made by vg chunk and vg
-    snarls when missing), or the graph's distance index (dist.mojo). A snarls source computed in dromos itself would
-    be a third kind here."""
+    """Where a contig's snarls come from: computed by dromos from the graph (snarlfind.mojo, every contig's at once),
+    vg snarls files (a folder of <contig>.snarls, made by vg chunk and vg snarls when missing), or a distance index
+    (dist.mojo)."""
 
     var kind: Int
     var cache: String
     var dist: Optional[DistIndex]
+    var computed: Dict[String, List[Snarl]]
+    """Computed snarls, by contig."""
 
     def __init__(out self, cache: String):
         self.kind = VG_SNARLS
         self.cache = cache
         self.dist = None
+        self.computed = Dict[String, List[Snarl]]()
 
     def __init__(out self, var dist: DistIndex):
         self.kind = DIST_SNARLS
         self.cache = String()
         self.dist = dist^
+        self.computed = Dict[String, List[Snarl]]()
 
-    def read(self, graph: Graph, r: ReferencePath, threads: Int) raises -> List[Snarl]:
-        """The snarls of `r`'s contig (its connected component)."""
+    def __init__(out self, var computed: Dict[String, List[Snarl]]):
+        self.kind = COMPUTED_SNARLS
+        self.cache = String()
+        self.dist = None
+        self.computed = computed^
+
+    def read(mut self, graph: Graph, r: ReferencePath, threads: Int) raises -> List[Snarl]:
+        """The snarls of `r`'s contig (its connected component). Computed snarls are handed over, once: drivers of
+        different contigs may call this at the same time."""
         var contig = String(r.chrom[byte = r.chrom.rfind("#") + 1 :])
         if self.kind == VG_SNARLS:
             return read_snarls(self.cache + "/" + contig + ".snarls", threads)
+        if self.kind == COMPUTED_SNARLS:
+            var out = List[Snarl]()
+            swap(out, self.computed[contig])
+            return out^
         ref d = self.dist.value()
         if len(r.steps) == 0:
             return List[Snarl]()
@@ -544,7 +563,12 @@ struct SnarlSource(Movable):
         return out^
 
     def props(self, mut out: List[Tuple[String, String]]):
-        if self.kind == DIST_SNARLS:
+        if self.kind == COMPUTED_SNARLS:
+            out.append(("snarls.source", "dromos"))
+            out.append(("snarls.dromos.version", DROMOS_VERSION))
+            out.append(("snarls.orientation", ORIENTATION))
+            out.append(("snarls.ties", TIES))
+        elif self.kind == DIST_SNARLS:
             ref d = self.dist.value()
             out.append(("snarls.source", "distance index"))
             out.append(("snarls.file", _base_name(d.path)))
@@ -673,18 +697,14 @@ def run_build(o: BuildOptions) raises:
                     whole = True
         regions.append(List[Tuple[Int, Int]]() if whole else rs^)
 
-    # The snarls: the graph's distance index, or vg snarls (cached, or made now).
-    var dist_path = o.dist
-    if not dist_path and not o.snarls_cache and isfile(graph_stem(o.graph) + ".dist"):
-        dist_path = graph_stem(o.graph) + ".dist"
-    var source: SnarlSource
-    if dist_path:
-        source = SnarlSource(DistIndex(dist_path.value()))
-        log(t"snarls from the distance index {dist_path.value()} (version {source.dist.value().version})")
-    else:
-        var cache = o.snarls_cache.value() if o.snarls_cache else graph_stem(folder + "/" + _base_name(o.graph))
-        if not o.snarls_cache:
-            cache += ".snarls"
+    # The snarls: computed once the graph is loaded (the default), a distance index, or vg snarls (cached, or made
+    # now).
+    var source = SnarlSource(Dict[String, List[Snarl]]())
+    if o.dist:
+        source = SnarlSource(DistIndex(o.dist.value()))
+        log(t"snarls from the distance index {o.dist.value()} (version {source.dist.value().version})")
+    elif o.snarls_cache:
+        var cache = o.snarls_cache.value()
         makedirs(cache, exist_ok=True)
         var id_file = cache + "/graph.id"
         var cached_id = _read_text(id_file)
@@ -709,6 +729,12 @@ def run_build(o: BuildOptions) raises:
     if source.kind == DIST_SNARLS:
         check_dist(source.dist.value(), graph)
     var md = graph.parts.metadata()
+    if source.kind == COMPUTED_SNARLS:
+        source = SnarlSource(compute_snarls(graph, md, sample, contigs, o.threads))
+        var total = 0
+        for c in contigs:
+            total += len(source.computed[c])
+        log(t"snarls computed: {total} for {len(contigs)} contig(s)")
     var props = List[Tuple[String, String]]()
     var nodes = graph.parts.node_range()
     props.append(("dromos.version", DROMOS_VERSION))
@@ -728,9 +754,7 @@ def run_build(o: BuildOptions) raises:
     var entries = List[ContigEntry]()
     for k in range(len(contigs)):
         entries.append(
-            ContigEntry(
-                contigs[k], String(t"{sample}#0#{contigs[k]}"), 0, List[UInt8](), regions[k].copy(), 0, 0, 0, 0
-            )
+            ContigEntry(contigs[k], String(t"{sample}#0#{contigs[k]}"), 0, List[UInt8](), regions[k].copy(), 0, 0, 0, 0)
         )
     var writer = OwnedPointer(SitesWriter(path, props^, entries^))
     run_contigs(log, graph, md, sample, contigs, regions, source, writer[], o.level, o.threads)
@@ -755,6 +779,33 @@ def reference_md5(graph: Graph, r: ReferencePath) raises -> List[UInt8]:
     return h.digest()
 
 
+def compute_snarls(
+    graph: Graph, md: Metadata, sample: String, contigs: List[String], threads: Int
+) raises -> Dict[String, List[Snarl]]:
+    """Each contig's snarls, computed from the graph: those of the components its reference paths (the sample's
+    phase-0 paths of the contig, every fragment) start in, as vg chunk -C and vg snarls give them."""
+    var sample_id = md.sample_id(sample)
+    var names = md.path_names()
+    var groups = List[List[Int]]()
+    for c in contigs:
+        var contig_id = md.contig_id(c)
+        var nodes = List[Int]()
+        if sample_id and contig_id:
+            for id in range(len(names)):
+                var p = names[id]
+                if p.sample == sample_id.value() and p.contig == contig_id.value() and p.phase == 0:
+                    var v = graph.parts.path_first(id)
+                    if v != 0:
+                        nodes.append(Int(v >> 1))
+        groups.append(nodes^)
+    var found = snarls_of_nodes(graph.parts, groups, threads, Bool(getenv("DROMOS_TIMING")))
+    var out = Dict[String, List[Snarl]]()
+    for k in range(len(contigs)):
+        out[contigs[k]] = List[Snarl]()
+        swap(out[contigs[k]], found[k])
+    return out^
+
+
 comptime CONTIGS_AT_ONCE = 3
 """Contigs built at a time ($DROMOS_CONTIGS_AT_ONCE to change): their steps share the pool's workers."""
 
@@ -764,6 +815,8 @@ def contig_weight(graph: Graph, md: Metadata, sample: String, contig: String, so
     its vg snarls file's size."""
     if source.kind == VG_SNARLS:
         return RawFile(source.cache + "/" + contig + ".snarls").size
+    if source.kind == COMPUTED_SNARLS:
+        return len(source.computed[contig])
     var sample_id = md.sample_id(sample)
     var contig_id = md.contig_id(contig)
     if not sample_id or not contig_id:
@@ -792,7 +845,7 @@ struct _Shared(Movable):
 
     var graph: ImmPointer[Graph, ImmUntrackedOrigin]
     var md: ImmPointer[Metadata, ImmUntrackedOrigin]
-    var source: ImmPointer[SnarlSource, ImmUntrackedOrigin]
+    var source: MutPointer[SnarlSource, MutUntrackedOrigin]
     var sample: String
     var contigs: List[String]
     var regions: List[List[Tuple[Int, Int]]]
@@ -812,7 +865,7 @@ struct _Shared(Movable):
         out self,
         graph: ImmPointer[Graph, ImmUntrackedOrigin],
         md: ImmPointer[Metadata, ImmUntrackedOrigin],
-        source: ImmPointer[SnarlSource, ImmUntrackedOrigin],
+        source: MutPointer[SnarlSource, MutUntrackedOrigin],
         sample: String,
         var contigs: List[String],
         var regions: List[List[Tuple[Int, Int]]],
@@ -902,7 +955,7 @@ def run_contigs(
     sample: String,
     contigs: List[String],
     regions: List[List[Tuple[Int, Int]]],
-    source: SnarlSource,
+    mut source: SnarlSource,
     mut writer: SitesWriter,
     level: Int,
     threads: Int,
@@ -931,7 +984,7 @@ def run_contigs(
         _Shared(
             untracked(Pointer(to=graph)),
             untracked(Pointer(to=md)),
-            untracked(Pointer(to=source)),
+            mut_untracked(Pointer(to=source)),
             sample,
             contigs.copy(),
             regions.copy(),

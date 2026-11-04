@@ -148,10 +148,11 @@ built from, and dromos refuses it with another graph.
   -t, --threads N           threads [the machine's cores]
   --level N                 zstd level, 1-22 [9]; higher is smaller and slower
 
-Snarls come from the graph's distance index (giraffe's .dist, read in place), else from vg snarls:
-  --dist FILE               the distance index [GRAPH.dist beside the graph, if there]
-  --snarls-cache DIR        vg snarls of each contig (<contig>.snarls), kept for later runs on the same graph; giving
-                            it uses vg snarls even when a .dist is there [GRAPH.snarls beside the catalog]
+Snarls are computed from the graph (vg snarls' decomposition of each contig's component: no vg, no distance index),
+unless one of these gives them:
+  --dist FILE               a distance index of the graph (giraffe's .dist, read in place)
+  --snarls-cache DIR        vg snarls of each contig (<contig>.snarls), kept for later runs on the same graph; vg chunk
+                            and vg snarls make those missing
   --vg PATH                 the vg binary, for vg chunk and vg snarls, run for contigs not in the cache [vg]
   --snarls-jobs N           vg snarls runs at a time [6, at most --threads]; fewer when memory is short (each needs
                             about 20 times its component's size)
