@@ -5,6 +5,7 @@ from std.time import perf_counter_ns
 
 from dromos.build import BuildOptions, run_build
 from dromos.convert import run_gam_to_gaf
+from dromos.distgraph import run_dist_snarls
 from dromos.graph import reference_samples
 from dromos.index import run_index
 from dromos.parallel import default_threads
@@ -26,7 +27,8 @@ comptime OVERVIEW = """dromos: pangenome graph alignments, fast
   dromos catalog            a GBZ graph's site catalog: every snarl on the reference, every contig, one file
   dromos view               a catalog as VCF (pgcatalog view's text), whole or a region of it
   dromos catalog-info       a catalog's header: the graph it belongs to, its contigs, its snarls' source
-  dromos snarls             a GBZ graph's snarls, the decomposition vg snarls makes, as a table
+  dromos snarls             a GBZ graph's snarls, the decomposition vg snarls makes, as a table (or a distance
+                            index's)
   dromos prepare            a GBZ graph's cache, made ahead of the commands that read it
   dromos reference-samples  the reference samples a GBZ graph declares
 
@@ -154,6 +156,7 @@ For a tabix-indexed VCF of one contig:
 """
 
 comptime SNARLS_USAGE = """dromos snarls --graph GRAPH.gbz -o OUT.tsv [options]
+dromos snarls --dist GRAPH.dist [--graph GRAPH.gbz] -o OUT.tsv [-t THREADS]
 dromos snarls --vg-file SNARLS -o OUT.tsv
 
 The snarls vg snarls writes for a GBZ graph, computed (vg's IntegratedSnarlFinder and SnarlManager rules, every
@@ -163,7 +166,13 @@ chain's kind (0 a cactus cycle, 1 a bridge path, 2 a pinched cycle, 3 the root c
 vote was tied (1). Each component's snarls come in vg snarls' order. With --vg-file, a vg snarls file's snarls as
 the first five columns (component 0), to compare with (tests/integration/compare.py).
 
+With --dist, a distance index's snarls (giraffe's .dist: libbdsg's SnarlDistanceIndex, versions 3 and 4, read in
+place), oriented as vg snarls writes them, as the same five columns (the component the index's). With --graph too,
+the index is checked against that graph first and refused if it is another graph's: its node ids and count, each
+reference path in one of its components, and its chains' steps the graph's edges.
+
   --graph FILE              the pangenome graph (GBZ)
+  --dist FILE               a distance index (.dist)
   -o FILE                   the table
   -t THREADS                threads [the machine's cores]
   --stats                   a line per component on stderr: sizes, each step's time, the ties met
@@ -446,18 +455,32 @@ def snarls_main() raises:
     var stats = args.flag("--stats")
     var out = args.value("-o")
     var vg_file = args.value("--vg-file")
+    var dist = args.value("--dist")
     var graph = args.value("--graph")
     _ = args.positional(0)
     if not out:
         _fail("-o OUT.tsv is needed", "snarls")
-    if vg_file and graph:
-        _fail("--graph or --vg-file, not both", "snarls")
+    if vg_file and (graph or dist):
+        _fail("--vg-file reads a vg snarls file alone: not with --graph or --dist", "snarls")
     if vg_file:
         write_records_tsv(out.value(), read_snarls(vg_file.value(), threads))
         return
-    if not graph:
-        _fail("--graph or --vg-file is needed", "snarls")
     var t0 = perf_counter_ns()
+    if dist:
+        if stats:
+            _fail("--stats is for snarls computed from the graph, not with --dist", "snarls")
+        var r = run_dist_snarls(dist.value(), graph, out.value(), threads)
+        var checked = String(t", checked against {graph.value()}") if graph else String()
+        print(
+            (
+                t"[dromos] {r[2]} snarls in {r[1]} component(s) of the distance index (version {r[0]}){checked},"
+                t" {Float64(perf_counter_ns() - t0) * 1e-9} s"
+            ),
+            file=stderr,
+        )
+        return
+    if not graph:
+        _fail("--graph, --dist or --vg-file is needed", "snarls")
     var trees = find_all_snarls(graph.value(), threads, stats)
     write_snarls_tsv(out.value(), trees, stats)
     var total = 0

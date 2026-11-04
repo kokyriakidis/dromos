@@ -16,9 +16,12 @@ single nodes) are listed at the offset in its entry +7; a simple snarl's childre
 
 Orientation follows vg's SnarlManager::regularize, as `vg snarls` writes it: per chain, every consecutive pair of chain
 nodes is one of vg's snarls (the edge-only ones too, which the index folds into its trivial-snarl records); when fewer
-than half of them ascend by node id the chain, and every snarl in it, is flipped (start and end swapped and reversed).
-Parents are named in their own chain's orientation. Checked against vg snarls on HPRC v2.1 (51,186,896 snarls, every
-one the same).
+than half of them ascend by node id the chain, and every snarl in it, is flipped (start and end swapped and reversed)
+and its snarls are listed from its other end. Parents are named in their own chain's orientation. Checked against vg
+snarls on HPRC v2.1 (51,186,896 snarls, every one the same).
+
+This module reads the index alone; distgraph.mojo checks it against its graph and writes `dromos snarls --dist`'s
+table.
 """
 
 from dromos.bgzf import MappedFile
@@ -223,6 +226,11 @@ struct DistIndex(Movable):
             return 0
         return self.at(6 + self.components + 2 * (id - self.min_id))
 
+    def root(self, i: Int) -> Int:
+        """The record of the root's child `i` (a connected component: a chain, a node or a root snarl), for `i` below
+        `components`."""
+        return self.at(6 + i)
+
     def node_count(self) -> Int:
         """How many node ids the index holds."""
         var n = 0
@@ -326,7 +334,10 @@ struct DistIndex(Movable):
             if words[len(words) - 1] >> 1 <= words[0] >> 1:
                 ascending += 1
         var flip = 2 * ascending < pairs
-        for i in range(len(snarl_at) // 2):
+        # A flipped chain's snarls are written from its other end, as vg snarls writes them.
+        var count = len(snarl_at) // 2
+        for j in range(count):
+            var i = count - 1 - j if flip else j
             var record = snarl_at[2 * i]
             var k = snarl_at[2 * i + 1]
             var s = words[k - 1]

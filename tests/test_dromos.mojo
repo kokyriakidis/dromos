@@ -40,12 +40,13 @@ from dromos.graph import (
 )
 from dromos.prepare import ReferenceSample, folder_of, make_cache, name_of, pack_letters, write_nodes, write_placements
 from dromos.bigraph import Bigraph, components, read_edges
-from dromos.build import check_dist, compute_snarls, natural_less, parse_region, reference_md5
+from dromos.build import compute_snarls, natural_less, parse_region, reference_md5
 from dromos.flat import Flat
 from dromos.snarlfind import NONE as NO_SNARL, as_snarls, find_snarls
 from dromos.catalog import Encoder, Graph, Placed as SitePlaced, Record, ReferencePath, Traversal, build_catalog
 from dromos.catalog import encode_block, traversals
 from dromos.dist import DistIndex
+from dromos.distgraph import check_graph, dist_snarls, run_dist_snarls
 from dromos.pool import Pool
 from dromos.sites import (
     COLUMNS,
@@ -1392,34 +1393,48 @@ def test_giant_record() raises:
 
 def test_snarls_from_the_distance_index() raises:
     """The small graph's distance index (vg 1.73's, version 4) gives vg snarls' snarls: the same start and end visits,
-    parents the same snarls."""
+    parents the same snarls; each contig's component's, and every component's (vg snarls of the whole graph)."""
     var d = DistIndex("tests/data/micb-kir3dl1.dist")
     assert_equal(d.version, 4)
+    check_graph(d, GBZ, 2)
     var graph = Graph(GBZ, 2)
-    check_dist(d, graph)
     var md = graph.parts.metadata()
     for c in ["chr6", "chr19"]:
         var r = ReferencePath(graph, md, "CHM13", c, 2)
         var got = List[Snarl]()
         d.snarls(d.top(Int(r.steps[0] >> 1)), got)
-        var want = read_snarls("tests/data/micb-kir3dl1.catalog/snarls/" + c + ".snarls", 2)
-        assert_equal(len(got), len(want))
+        _same_snarls(got^, read_snarls("tests/data/micb-kir3dl1.catalog/snarls/" + c + ".snarls", 2))
+    for threads in [1, 3]:
+        var comps = dist_snarls(d, threads)
+        assert_equal(len(comps), d.components)
+        var all = List[Snarl]()
+        for c in comps:
+            all.extend(Span(c))
+        _same_snarls(all^, read_snarls("tests/data/micb-kir3dl1.vg.snarls", 2))
 
-        def key(s: Snarl) -> Tuple[UInt64, UInt64, UInt64, UInt64]:
-            var p = canonical(s.parent_start, s.parent_end) if s.has_parent() else (NO_PARENT, NO_PARENT)
-            return (s.start, s.end, p[0], p[1])
 
-        def less(a: Snarl, b: Snarl) -> Bool:
-            var x = key(a)
-            var y = key(b)
-            return x[0] < y[0] or (x[0] == y[0] and x[1] < y[1])
-
-        sort(Span(got), less)
-        sort(Span(want), less)
-        for i in range(len(got)):
-            var x = key(got[i])
-            var y = key(want[i])
-            assert_true(x[0] == y[0] and x[1] == y[1] and x[2] == y[2] and x[3] == y[3])
+def test_distance_index_table() raises:
+    """`dromos snarls --dist`'s table: a line per snarl, its component the index's, its visits and parent's as
+    `dromos snarls --vg-file` writes them."""
+    var d = DistIndex("tests/data/micb-kir3dl1.dist")
+    var comps = dist_snarls(d, 2)
+    var path = String(_tmp("dromos_test_dist.tsv"))
+    var r = run_dist_snarls("tests/data/micb-kir3dl1.dist", String(GBZ), path, 2)
+    assert_equal(r[0], 4)
+    assert_equal(r[1], d.components)
+    var want = String()
+    var total = 0
+    for k in range(len(comps)):
+        for s in comps[k]:
+            want.write(k, "\t", s.start, "\t", s.end, "\t")
+            if s.has_parent():
+                want.write(s.parent_start, "\t", s.parent_end, "\n")
+            else:
+                want.write("-\t-\n")
+            total += 1
+    assert_equal(r[2], total)
+    assert_true(total > 900)
+    assert_equal(open(path, "r").read(), want)
 
 
 def test_distance_index_refused() raises:
@@ -1445,10 +1460,9 @@ def test_distance_index_refused() raises:
     except e:
         failed = String(e).find("not a distance index") >= 0
     assert_true(failed)
-    # The graph's own passes its checks.
+    # The graph's own passes its checks (another graph's is refused: tests/integration/edges.sh).
     var d = DistIndex("tests/data/micb-kir3dl1.dist")
-    var graph = Graph(GBZ, 2)
-    check_dist(d, graph)
+    check_graph(d, GBZ, 2)
     assert_true(d.node_count() > 1000)
 
 

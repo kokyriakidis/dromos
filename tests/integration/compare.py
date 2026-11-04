@@ -1,5 +1,6 @@
 """Compares dromos's computed snarls with vg snarls' (`dromos snarls --vg-file SNARLS -o VG.tsv` and
-`dromos snarls --graph G.gbz -o MINE.tsv`).
+`dromos snarls --graph G.gbz -o MINE.tsv`), or a distance index's (`dromos snarls --dist G.dist -o DIST.tsv`) with
+either: as VG.tsv against computed snarls, or as MINE.tsv against vg snarls.
 
     python3 -I compare.py VG.tsv MINE.tsv [--examples N] [--all]
 
@@ -10,7 +11,8 @@ Checks, for the snarls of the components vg's file touches:
 - the same parent, compared as a snarl in either orientation (vg writes the parent's unregularized orientation),
   and how often vg's parent orientation equals the parent's own written orientation;
 - chains: each of mine (its non-trivial snarls, in order) is a run of consecutive siblings in vg's file, in the same
-  order, and siblings with one parent split into exactly my chains.
+  order, and siblings with one parent split into exactly my chains (not when MINE.tsv has five columns, no chains:
+  a distance index's; VG.tsv may be one, its siblings then a chain's snarls in order, a parent's chains in any order).
 """
 
 import sys
@@ -38,7 +40,7 @@ def load(path, mine):
             s, e = int(p[1]), int(p[2])
             parent = None if p[3] == "-" else (int(p[3]), int(p[4]))
             row = {"comp": int(p[0]), "key": (s, e), "parent": parent}
-            if mine:
+            if mine and len(p) > 5:
                 row["chain"] = int(p[5])
                 row["rank"] = int(p[6])
                 row["kind"] = int(p[8]) if len(p) > 8 else 0
@@ -54,6 +56,7 @@ def main():
         examples = int(sys.argv[sys.argv.index("--examples") + 1])
     vg = load(vg_path, False)
     mine_all = load(mine_path, True)
+    chained = all("chain" in r for r in mine_all)
     # The components vg's snarls touch: those of my snarls sharing a canonical key with one of vg's.
     by_canon_mine = {canon(*r["key"]): r for r in mine_all}
     comps = set()
@@ -73,15 +76,15 @@ def main():
     only_mine = [k for k in mine_keys if k not in vg_keys]
     vg_canon = {canon(*k) for k in vg_keys}
     reversed_ = [k for k in only_mine if canon(*k) in vg_canon]
-    tied = [k for k in reversed_ if mine_keys[k]["tied"]]
+    tied = [k for k in reversed_ if mine_keys[k].get("tied")]
     print(f"  snarls: same {len(vg_keys) - len(only_vg)}, only vg {len(only_vg)}, only mine {len(only_mine)}"
           f" (of which reversed {len(reversed_)}, in chains with a tied vote {len(tied)})")
     for k in only_vg[:examples]:
         print(f"    only vg: {sname(k)} parent {sname(vg_keys[k]['parent']) if vg_keys[k]['parent'] else '-'}")
     for k in only_mine[:examples]:
         r = mine_keys[k]
-        print(f"    only mine: {sname(k)} parent {sname(r['parent']) if r['parent'] else '-'} chain {r['chain']}"
-              f" rank {r['rank']}")
+        print(f"    only mine: {sname(k)} parent {sname(r['parent']) if r['parent'] else '-'} chain"
+              f" {r.get('chain', '-')} rank {r.get('rank', '-')}")
     # Parents.
     same_parent = differ = oriented_same = 0
     bad = []
@@ -103,6 +106,10 @@ def main():
           f" {oriented_same} of {with_parent} with one")
     for k, a, b in bad:
         print(f"    {sname(k)}: vg parent {sname(a) if a else '-'}, mine {sname(b) if b else '-'}")
+    if not chained:
+        print("  chains: not compared (MINE.tsv has none: compare it as VG.tsv with computed snarls for them)")
+        print("EXACT" if not only_vg and not only_mine and differ == 0 else "DIFFERENT")
+        return
     # Chains: vg's siblings in file order.
     siblings = defaultdict(list)
     for r in vg:

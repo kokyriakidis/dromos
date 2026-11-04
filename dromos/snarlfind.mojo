@@ -1371,13 +1371,29 @@ def write_records_tsv(path: String, snarls: List[Snarl]) raises:
     var f = OutFile(path)
     var at = 0
     var buf = String()
+    _put_records(f, buf, at, 0, snarls)
+    _flush(f, buf, at)
+    f.close()
+
+
+def write_records_tsv(path: String, components: List[List[Snarl]]) raises:
+    """Each component's snarls records (a distance index's, `dromos.distgraph.dist_snarls`) as the first five
+    columns of `write_snarls_tsv`, the component its index in `components`."""
+    var f = OutFile(path)
+    var at = 0
+    var buf = String()
+    for k in range(len(components)):
+        _put_records(f, buf, at, k, components[k])
+    _flush(f, buf, at)
+    f.close()
+
+
+def _put_records(mut f: OutFile, mut buf: String, mut at: Int, component: Int, snarls: List[Snarl]) raises:
     for s in snarls:
-        buf.write("0\t", s.start, "\t", s.end, "\t")
+        buf.write(component, "\t", s.start, "\t", s.end, "\t")
         if s.parent_start == NO_PARENT:
             buf.write("-\t-\n")
         else:
             buf.write(s.parent_start, "\t", s.parent_end, "\n")
         if buf.byte_length() > (1 << 20):
             _flush(f, buf, at)
-    _flush(f, buf, at)
-    f.close()
