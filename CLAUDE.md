@@ -108,7 +108,9 @@ habits:
 - `dromos view` of a `dromos catalog` file must print, for each contig and region, pgcatalog view's text of
   pgcatalog build's catalog of it from the same snarls, byte for byte; the file must be the same for any threads.
   Check any change with `pixi run check` (its catalog and view cases; `--full` for the whole genome, against
-  pgcatalog's catalogs, and the distance index's snarls against vg snarls') and tests/integration/edges.sh.
+  pgcatalog's catalogs, and the distance index's snarls against vg snarls'; DIST in the env file names the graph's
+  .dist) and tests/integration/edges.sh. `DROMOS_CONTIGS_AT_ONCE` changes how many contigs a build runs at once
+  (3; the file is the same for any).
   Haplotype walks may be found in any order (they are sorted); a heavy snarl's haplotypes are searched in parts whose
   walks and counts add up.
 - Snarls from the distance index must be vg snarls' (the same start and end visits, the same parents): the
