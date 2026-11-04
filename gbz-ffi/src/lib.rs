@@ -26,7 +26,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 
 /// The interface's version: dromos checks it, so a library left from another build is not used by mistake.
-pub const ABI: u32 = 3;
+pub const ABI: u32 = 4;
 
 #[no_mangle]
 pub extern "C" fn dgbz_abi() -> u32 {
@@ -985,6 +985,89 @@ pub unsafe extern "C" fn dgbz_parts_edges(
         *counts.add(i) = ranks.len() as i64;
     }
     n
+}
+
+/// The node ids the GBWT's alphabet has room for, `min` to `max` (0, 0 for none): every node of the graph is among
+/// them, without finding which are (no scan of the records).
+#[no_mangle]
+pub unsafe extern "C" fn dgbz_parts_id_bounds(p: *const Parts, min: *mut usize, max: *mut usize) {
+    let p = &*p;
+    if p.gbwt.alphabet_size() <= p.gbwt.first_node() {
+        *min = 0;
+        *max = 0;
+        return;
+    }
+    *min = p.min_node();
+    *max = p.max_node();
+}
+
+/// For each node `first .. first + count`, the successors of its forward and then its reverse orientation (as
+/// GBZ::successors gives them: the record's edges but an endmarker), one record's after another into `out` (room for
+/// `cap`), how many into `counts`, two per node, and its sequence length into `lengths` (u32, cut as `as u32` cuts
+/// it). A node the graph lacks (outside the alphabet, or its forward record empty: GBZ's `real_nodes`) gets -1, -1
+/// and length u32::MAX. Every edge of the graph comes out twice, once from each end. Returns how many nodes were
+/// done: fewer than `count` when the next one's would not fit. Read straight from the records' adjacency lists,
+/// nothing allocated per record, and without the scan of every record `dgbz_parts_node_range` needs.
+#[no_mangle]
+pub unsafe extern "C" fn dgbz_parts_node_edges(
+    p: *const Parts,
+    first: usize,
+    count: usize,
+    out: *mut u64,
+    cap: usize,
+    counts: *mut i64,
+    lengths: *mut u32,
+) -> usize {
+    let p = &*p;
+    let bwt = p.gbwt.as_ref();
+    // The range's sequences: node first + at + j is sequence s0 + j.
+    let (at, s0, n) = p.sequences(first, count);
+    let mut starts = Vec::with_capacity(n + 1);
+    p.letters.starts(s0, n, &mut starts);
+    let mut written = 0;
+    for i in 0..count {
+        let node = first + i;
+        let fwd = if i >= at && i < at + n {
+            bwt.compressed_record(p.gbwt.node_to_record(gbz::support::encode_node(node, Orientation::Forward)))
+        } else {
+            None
+        };
+        if fwd.is_none() {
+            *counts.add(2 * i) = -1;
+            *counts.add(2 * i + 1) = -1;
+            *lengths.add(i) = u32::MAX;
+            continue;
+        }
+        *lengths.add(i) = (starts[i - at + 1] - starts[i - at]) as u32;
+        for o in 0..2usize {
+            let record = if o == 0 {
+                fwd
+            } else {
+                bwt.compressed_record(p.gbwt.node_to_record(gbz::support::encode_node(node, Orientation::Reverse)))
+            };
+            let mut k = 0i64;
+            if let Some((edges, _)) = record {
+                let mut it = gbz::support::ByteCodeIter::new(edges);
+                let sigma = it.next().unwrap_or(0);
+                if written + sigma > cap {
+                    return i;
+                }
+                let mut prev = 0;
+                for _ in 0..sigma {
+                    let succ = it.next().unwrap() + prev;
+                    prev = succ;
+                    let _ = it.next();
+                    if succ != ENDMARKER {
+                        *out.add(written) = succ as u64;
+                        written += 1;
+                        k += 1;
+                    }
+                }
+            }
+            *counts.add(2 * i + o) = k;
+        }
+    }
+    count
 }
 
 /// The search state of the haplotypes visiting (node, orientation) into `out` (GBZ::search_state): 1, or 0 when none

@@ -14,7 +14,7 @@ from std.sys.info import CompilationTarget
 
 from dromos.bgzf import RawFile
 
-comptime ABI = 3
+comptime ABI = 4
 """The C interface's version (gbz-ffi's `ABI`)."""
 comptime LIBRARY = "libdromos_gbz" + (".dylib" if CompilationTarget.is_macos() else ".so")
 comptime MAGIC = "GBZ "
@@ -385,6 +385,7 @@ struct GbzParts(Movable, NodeSource):
     var _follow: _DLCallable[Int, ImmUntrackedOrigin]
     var _edges: _DLCallable[Int, ImmUntrackedOrigin]
     var _search: _DLCallable[Int32, ImmUntrackedOrigin]
+    var _node_edges: _DLCallable[Int, ImmUntrackedOrigin]
     """The search's calls, looked up once (a lookup costs more than a small call's work, and takes a lock)."""
 
     def __init__(out self, path: String) raises:
@@ -393,6 +394,7 @@ struct GbzParts(Movable, NodeSource):
         self._follow = _call[Int](self.lib, "dgbz_parts_follow_forward")
         self._edges = _call[Int](self.lib, "dgbz_parts_edges")
         self._search = _call[Int32](self.lib, "dgbz_parts_search_state")
+        self._node_edges = _call[Int](self.lib, "dgbz_parts_node_edges")
         var status = self.lib.lib.get_function[Int32]("dgbz_parts_load")(
             path.unsafe_ptr(), path.byte_length(), Pointer(to=self.ptr)
         )
@@ -539,6 +541,44 @@ struct GbzParts(Movable, NodeSource):
                 written += max(Int(counts[i]), 0)
             done += got
             if done < n:
+                out.resize(unsafe_uninit_length=2 * len(out))
+        out.resize(unsafe_uninit_length=written)
+
+    def id_bounds(self) raises -> Tuple[Int, Int]:
+        """The node ids the GBWT's alphabet has room for (every node of the graph is among them), without finding
+        which are: (0, 0) for none."""
+        var lo = 0
+        var hi = 0
+        self.lib.lib.get_function[NoneType]("dgbz_parts_id_bounds")(self.ptr, Pointer(to=lo), Pointer(to=hi))
+        return (lo, hi)
+
+    def node_edges(
+        self, first: Int, count: Int, mut out: List[UInt64], mut counts: List[Int64], lengths: MutPointer[UInt32, _]
+    ) raises:
+        """The successors of both orientations of nodes `first ..< first + count`: for node `first + i`, those of its
+        forward orientation and then of its reverse, one record's after another into `out`, and how many into
+        `counts[2 * i]` and `counts[2 * i + 1]` (-1 for a node the graph lacks); its length into `lengths[i]`
+        (UInt32.MAX for a node the graph lacks). Every edge comes out twice, once from each end. Read from the GBWT's
+        records in one call for many nodes, without the scan `find_nodes` makes."""
+        counts.resize(unsafe_uninit_length=2 * count)
+        out.resize(unsafe_uninit_length=max(len(out), 4 * count + 16))
+        var call = self._node_edges
+        var done = 0
+        var written = 0
+        while done < count:
+            var got = call(
+                self.ptr,
+                first + done,
+                count - done,
+                out.unsafe_ptr().unsafe_offset(written),
+                len(out) - written,
+                counts.unsafe_ptr().unsafe_offset(2 * done),
+                lengths.unsafe_offset(done),
+            )
+            for i in range(2 * done, 2 * (done + got)):
+                written += max(Int(counts[i]), 0)
+            done += got
+            if done < count:
                 out.resize(unsafe_uninit_length=2 * len(out))
         out.resize(unsafe_uninit_length=written)
 
