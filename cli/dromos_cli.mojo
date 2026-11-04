@@ -18,6 +18,8 @@ from dromos.output import OutFile
 from dromos.parallel import default_threads
 from dromos.prepare import graph_cache
 from dromos.sites import Sites, info, load_all_windows, view
+from dromos.snarlfind import find_all_snarls, write_records_tsv, write_snarls_tsv
+from dromos.snarls import read_snarls
 from dromos.refmap import RefMap
 from dromos.stream import AUTO, GAF, GAM, stream_input
 from dromos.surject import SurjectSink, Surjector
@@ -32,6 +34,7 @@ comptime OVERVIEW = """dromos: pangenome graph alignments, fast
   dromos catalog            a GBZ graph's site catalog: every snarl on the reference, every contig, one file
   dromos view               a catalog as VCF (pgcatalog view's text), whole or a region of it
   dromos catalog-info       a catalog's header: the graph it belongs to, its contigs, its snarls' source
+  dromos snarls             a GBZ graph's snarls, the decomposition vg snarls makes, as a table
   dromos prepare            a GBZ graph's cache, made ahead of the commands that read it
   dromos reference-samples  the reference samples a GBZ graph declares
 
@@ -155,6 +158,22 @@ Snarls come from the graph's distance index (giraffe's .dist, read in place), el
 
 For a tabix-indexed VCF of one contig:
   dromos view GRAPH.CHM13.sites chr20 | bgzip > chr20.sites.vcf.gz && tabix -p vcf chr20.sites.vcf.gz
+"""
+
+comptime SNARLS_USAGE = """dromos snarls --graph GRAPH.gbz -o OUT.tsv [options]
+dromos snarls --vg-file SNARLS -o OUT.tsv
+
+The snarls vg snarls writes for a GBZ graph, computed (vg's IntegratedSnarlFinder and SnarlManager rules, every
+connected component of the graph), as a table, a line per snarl: component, start, end, parent start, parent end
+(visits as id << 1 | reverse; - for none), chain, rank in the chain, the chain's length (its trivial snarls too), the
+chain's kind (0 a cactus cycle, 1 a bridge path, 2 a pinched cycle, 3 the root cycle) and whether its orientation
+vote was tied (1). Each component's snarls come in vg snarls' order. With --vg-file, a vg snarls file's snarls as
+the first five columns (component 0), to compare with (tests/integration/compare.py).
+
+  --graph FILE              the pangenome graph (GBZ)
+  -o FILE                   the table
+  -t THREADS                threads [the machine's cores]
+  --stats                   a line per component on stderr: sizes, each step's time, the ties met
 """
 
 comptime VIEW_USAGE = """dromos view [-t THREADS] CATALOG [CONTIG[:START-END]]
@@ -558,6 +577,37 @@ def catalog_main() raises:
     run_build(o)
 
 
+def snarls_main() raises:
+    var args = _Args("snarls")
+    if args.help() or len(args.items) == 0:
+        print(SNARLS_USAGE, end="")
+        return
+    var threads = args.threads()
+    var stats = args.flag("--stats")
+    var out = args.value("-o")
+    var vg_file = args.value("--vg-file")
+    var graph = args.value("--graph")
+    _ = args.positional(0)
+    if not out:
+        _fail("-o OUT.tsv is needed", "snarls")
+    if vg_file and graph:
+        _fail("--graph or --vg-file, not both", "snarls")
+    if vg_file:
+        write_records_tsv(out.value(), read_snarls(vg_file.value(), threads))
+        return
+    if not graph:
+        _fail("--graph or --vg-file is needed", "snarls")
+    var t0 = perf_counter_ns()
+    var trees = find_all_snarls(graph.value(), threads, stats)
+    write_snarls_tsv(out.value(), trees, stats)
+    var total = 0
+    for k in range(len(trees)):
+        total += len(trees[k])
+    print(
+        t"[dromos] {total} snarls in {len(trees)} component(s), {Float64(perf_counter_ns() - t0) * 1e-9} s", file=stderr
+    )
+
+
 def view_main() raises:
     var args = _Args("view")
     if args.help() or len(args.items) == 0:
@@ -609,6 +659,8 @@ def main():
             view_main()
         elif command == "catalog-info":
             catalog_info_main()
+        elif command == "snarls":
+            snarls_main()
         elif command == "prepare":
             prepare_main()
         elif command == "reference-samples":

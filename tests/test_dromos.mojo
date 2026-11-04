@@ -2,8 +2,9 @@
 pgcat places alignments, tabix bins as htslib numbers them, surject's alignments as pgcatalog makes them, a GBZ read
 through the gbz crate (tests/data/micb-kir3dl1.gbz, two reference samples), snarls streams, site catalogs (their
 columns, node tables, index search and checks; tests/data/micb-kir3dl1.catalog: the small graph's vg snarls and
-pgcatalog view's text of pgcatalog's catalogs of it), and snarls from a distance index (tests/data/micb-kir3dl1.dist,
-vg 1.73's)."""
+pgcatalog view's text of pgcatalog's catalogs of it), snarls from a distance index (tests/data/micb-kir3dl1.dist,
+vg 1.73's), and snarls computed by dromos (hand-made graphs, and the small graph against vg snarls' file of it,
+tests/data/micb-kir3dl1.vg.snarls, vg 1.73, -t 1)."""
 
 from std.memory import OwnedPointer, bitcast
 from std.os import getenv
@@ -38,7 +39,10 @@ from dromos.graph import (
     resolve_reference_sample,
 )
 from dromos.prepare import ReferenceSample, folder_of, make_cache, name_of, pack_letters, write_nodes, write_placements
+from dromos.bigraph import Bigraph, components, read_edges
 from dromos.build import check_dist, natural_less, parse_region, reference_md5
+from dromos.flat import Flat
+from dromos.snarlfind import NONE as NO_SNARL, as_snarls, find_snarls
 from dromos.catalog import Encoder, Graph, Placed as SitePlaced, Record, ReferencePath, Traversal, build_catalog
 from dromos.catalog import encode_block, traversals
 from dromos.dist import DistIndex
@@ -103,11 +107,11 @@ from dromos.bam import BamIndex, RecordWriter, bam_header, csi_levels, needs_csi
 from dromos.bam_sort import BamStaging, write_bam
 
 
-
 def _tmp(name: String) -> String:
     """A scratch file's path: in $DROMOS_TEST_DIR, else /tmp."""
     var dir = getenv("DROMOS_TEST_DIR")
     return (dir if dir else String("/tmp")) + "/" + name
+
 
 def _varint(mut out: List[UInt8], value: Int):
     var v = value
@@ -209,7 +213,11 @@ def _nodes_file(width: Int = 4) raises -> String:
     """A graph cache of nodes 1 ACGTACGT, 2 GGG and 3 TTTTT (node 0 absent), no reference sample."""
     var lengths: List[UInt32] = [UInt32(NONE), 8, 3, 5]
     return _cache(
-        String(_tmp(String(t"dromos_test_nodes_{width}.bin"))), lengths^, "ACGTACGTGGGTTTTT", List[ReferenceSample](), width
+        String(_tmp(String(t"dromos_test_nodes_{width}.bin"))),
+        lengths^,
+        "ACGTACGTGGGTTTTT",
+        List[ReferenceSample](),
+        width,
     )
 
 
@@ -353,7 +361,10 @@ def _refmap_file(twice: Bool) raises -> String:
     samples.append(_sample("CHM13", walks^, fragments^, path_contig^, ["chrA", "chrB"]))
     var lengths: List[UInt32] = [UInt32(NONE), 10, 5, 10, 5]
     return _cache(
-        String(_tmp(String(t"dromos_test_refmap_{Int(twice)}.bin"))), lengths^, "AAAAAAAAAACCCCCGGGGGGGGGGTTTTT", samples^
+        String(_tmp(String(t"dromos_test_refmap_{Int(twice)}.bin"))),
+        lengths^,
+        "AAAAAAAAAACCCCCGGGGGGGGGGTTTTT",
+        samples^,
     )
 
 
@@ -1758,6 +1769,161 @@ def test_bam_sorted_through_spills() raises:
         assert_equal(order[k], want[k])
     with open(path + ".bai", "r") as f:
         assert_equal(String(unsafe_from_utf8=f.read_bytes()[0:4]), "BAI\x01")
+
+
+# --- snarls computed by dromos (snarlfind.mojo) ----------------------------------------------------------------------
+
+
+def _bigraph(ids: List[Int], lengths: List[Int], edges: List[Tuple[Int, Int]]) -> Bigraph:
+    """A Bigraph from node ids (ascending) and edges between visits (`id << 1 | reverse`), each given once."""
+    var n = len(ids)
+    var rank = Dict[Int, Int]()
+    for r in range(n):
+        rank[ids[r]] = r
+    var succ = List[List[UInt32]]()
+    for _ in range(2 * n):
+        succ.append(List[UInt32]())
+    for e in edges:
+        var a = UInt32(rank.get(e[0] >> 1).value() * 2 + (e[0] & 1))
+        var b = UInt32(rank.get(e[1] >> 1).value() * 2 + (e[1] & 1))
+        succ[Int(a)].append(b)
+        if b ^ 1 != a or a ^ 1 != b:
+            succ[Int(b ^ 1)].append(a ^ 1)
+    var g_ids = Flat[UInt64](unsafe_uninit_length=n)
+    var g_lengths = Flat[UInt32](unsafe_uninit_length=n)
+    for r in range(n):
+        g_ids[r] = UInt64(ids[r])
+        g_lengths[r] = UInt32(lengths[r])
+    var offsets = Flat[UInt32](unsafe_uninit_length=2 * n + 1)
+    var targets = Flat[UInt32]()
+    for h in range(2 * n):
+        offsets[h] = UInt32(len(targets))
+        for t in succ[h]:
+            targets.append(t)
+    offsets[2 * n] = UInt32(len(targets))
+    return Bigraph(g_ids^, g_lengths^, offsets^, targets^)
+
+
+def _fwd(id: Int) -> Int:
+    return id << 1
+
+
+def _rev(id: Int) -> Int:
+    return id << 1 | 1
+
+
+def test_snarlfind_bubble() raises:
+    """1 -> {2, 3} -> 4: one snarl, >1>4, at the top."""
+    var g = _bigraph(
+        [1, 2, 3, 4], [5, 1, 1, 5], [(_fwd(1), _fwd(2)), (_fwd(1), _fwd(3)), (_fwd(2), _fwd(4)), (_fwd(3), _fwd(4))]
+    )
+    var t = find_snarls(g)
+    assert_equal(len(t), 1)
+    assert_equal(t.start[0], UInt64(_fwd(1)))
+    assert_equal(t.end[0], UInt64(_fwd(4)))
+    assert_equal(t.parent[0], NO_SNARL)
+
+
+def test_snarlfind_nested_and_trivial() raises:
+    """1 -> {2 -> {3, 4} -> 5, 6} -> 7: >1>7 holds >2>5; the trivial snarls (single edges) are not written."""
+    var g = _bigraph(
+        [1, 2, 3, 4, 5, 6, 7],
+        [10, 2, 1, 1, 2, 3, 10],
+        [
+            (_fwd(1), _fwd(2)),
+            (_fwd(2), _fwd(3)),
+            (_fwd(2), _fwd(4)),
+            (_fwd(3), _fwd(5)),
+            (_fwd(4), _fwd(5)),
+            (_fwd(5), _fwd(7)),
+            (_fwd(1), _fwd(6)),
+            (_fwd(6), _fwd(7)),
+        ],
+    )
+    var t = find_snarls(g)
+    assert_equal(len(t), 2)
+    assert_equal(t.start[0], UInt64(_fwd(1)))
+    assert_equal(t.end[0], UInt64(_fwd(7)))
+    assert_equal(t.start[1], UInt64(_fwd(2)))
+    assert_equal(t.end[1], UInt64(_fwd(5)))
+    assert_equal(t.parent[1], UInt32(0))
+
+
+def test_snarlfind_reversed_ids() raises:
+    """A bubble whose chain runs from high ids to low: regularize turns it around (>1>4 rather than <4<1)."""
+    var g = _bigraph(
+        [1, 2, 3, 4], [5, 1, 1, 5], [(_rev(4), _rev(2)), (_rev(4), _rev(3)), (_rev(2), _rev(1)), (_rev(3), _rev(1))]
+    )
+    var t = find_snarls(g)
+    assert_equal(len(t), 1)
+    assert_equal(t.start[0], UInt64(_fwd(1)))
+    assert_equal(t.end[0], UInt64(_fwd(4)))
+
+
+def test_snarlfind_degenerate() raises:
+    """A lone node, a node whose only edge is a self loop, a cycle of three nodes: no snarl with a node inside."""
+    assert_equal(len(find_snarls(_bigraph([7], [3], []))), 0)
+    assert_equal(len(find_snarls(_bigraph([7], [3], [(_fwd(7), _fwd(7))]))), 0)
+    var cycle = _bigraph([1, 2, 3], [4, 5, 6], [(_fwd(1), _fwd(2)), (_fwd(2), _fwd(3)), (_fwd(3), _fwd(1))])
+    var t = find_snarls(cycle)
+    assert_equal(len(t), 0)
+    # Every snarl of the cycle's chain is trivial: three of them, in one chain.
+    assert_equal(len(t.chain_length), 1)
+    assert_equal(t.chain_length[0], UInt32(3))
+
+
+def test_snarlfind_root_cycle_with_bubble() raises:
+    """1 -> {2, 3} -> 4 -> 1: the cycle is the root; the bubble is a snarl of its (circular) chain."""
+    var g = _bigraph(
+        [1, 2, 3, 4],
+        [5, 1, 1, 5],
+        [(_fwd(1), _fwd(2)), (_fwd(1), _fwd(3)), (_fwd(2), _fwd(4)), (_fwd(3), _fwd(4)), (_fwd(4), _fwd(1))],
+    )
+    var t = find_snarls(g)
+    assert_equal(len(t), 1)
+    assert_equal(t.start[0], UInt64(_fwd(1)))
+    assert_equal(t.end[0], UInt64(_fwd(4)))
+    assert_equal(t.chain_kind[Int(t.chain[0])], UInt8(3))
+
+
+def test_snarlfind_empty() raises:
+    assert_equal(len(find_snarls(Bigraph())), 0)
+
+
+def _same_snarls(var got: List[Snarl], var want: List[Snarl]) raises:
+    """The same snarls (start and end visits, exactly) with the same parents (as snarls, in either direction)."""
+    assert_equal(len(got), len(want))
+
+    def key(s: Snarl) -> Tuple[UInt64, UInt64, UInt64, UInt64]:
+        var p = canonical(s.parent_start, s.parent_end) if s.has_parent() else (NO_PARENT, NO_PARENT)
+        return (s.start, s.end, p[0], p[1])
+
+    def less(a: Snarl, b: Snarl) -> Bool:
+        var x = key(a)
+        var y = key(b)
+        return x[0] < y[0] or (x[0] == y[0] and x[1] < y[1])
+
+    sort(Span(got), less)
+    sort(Span(want), less)
+    for i in range(len(got)):
+        var x = key(got[i])
+        var y = key(want[i])
+        assert_true(x[0] == y[0] and x[1] == y[1] and x[2] == y[2] and x[3] == y[3])
+
+
+def test_snarlfind_small_graph_as_vg_snarls() raises:
+    """Every component of the small graph: the snarls vg snarls writes for it, and nothing else; each component's
+    node ids are its own."""
+    var parts = GbzParts(GBZ)
+    var comps = components(read_edges(parts, 2), 2)
+    assert_true(len(comps) > 1)
+    var got = List[Snarl]()
+    for k in range(len(comps)):
+        var g = comps.graphs[k].ids[0]
+        assert_equal(comps.of(Int(g)).value(), k)
+        got.extend(Span(as_snarls(find_snarls(comps.graphs[k]))))
+    assert_false(Bool(comps.of(0)))
+    _same_snarls(got^, read_snarls("tests/data/micb-kir3dl1.vg.snarls", 2))
 
 
 def main() raises:
